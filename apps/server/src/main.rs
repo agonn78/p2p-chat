@@ -1,3 +1,6 @@
+mod auth;
+mod models;
+mod routes;
 mod state;
 
 use axum::{
@@ -12,34 +15,104 @@ use tokio::sync::mpsc;
 use shared_proto::signaling::SignalingMessage;
 use crate::state::AppState;
 use sqlx::postgres::PgPoolOptions;
+use tower_http::cors::{Any, CorsLayer};
 
 #[tokio::main]
 async fn main() {
     // initialize tracing
     tracing_subscriber::fmt::init();
 
-    let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://user:password@p2p-chat-db:5432/p2p_chat".to_string());
+    let database_url = env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://user:password@p2p-chat-db:5432/p2p_chat".to_string());
     
-    // Connect to DB (Retry loop could be added here for robustness in docker-compose)
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
+    tracing::info!("Connecting to database...");
+    
+    // Connect to DB with retry
+    let pool = loop {
+        match PgPoolOptions::new()
+            .max_connections(10)
+            .connect(&database_url)
+            .await
+        {
+            Ok(pool) => break pool,
+            Err(e) => {
+                tracing::warn!("Failed to connect to database: {}. Retrying in 2s...", e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            }
+        }
+    };
+
+    tracing::info!("Connected to database!");
+
+    // Run migrations
+    tracing::info!("Running migrations...");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
         .await
-        .expect("Failed to connect to Postgres");
+        .expect("Failed to run migrations");
+    tracing::info!("Migrations complete!");
+
+    // Seed test users if they don't exist
+    seed_test_users(&pool).await;
 
     // Initialize state
-    let state = AppState::new(pool);
+    let app_state = AppState::new(pool.clone());
 
-    // build our application with a route
+    // CORS configuration
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    // Build router
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/ws", get(ws_handler))
-        .with_state(state);
+        .nest("/auth", routes::auth::router())
+        .nest("/friends", routes::friends::router())
+        .nest("/users", routes::users::router())
+        .layer(cors)
+        .with_state(app_state);
 
-    // run our app with hyper, listening globally on port 3000
+    // Run server
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    tracing::info!("listening on {}", listener.local_addr().unwrap());
+    tracing::info!("🚀 Server listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Seed test users for Mac and Windows clients
+async fn seed_test_users(pool: &sqlx::PgPool) {
+    let users = [
+        ("User_Mac", "mac@test.com", "password123"),
+        ("User_Windows", "windows@test.com", "password123"),
+    ];
+
+    for (username, email, password) in users {
+        let existing = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE username = $1")
+            .bind(username)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+
+        if existing == 0 {
+            let password_hash = auth::hash_password(password).expect("Failed to hash password");
+            let result = sqlx::query(
+                "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3)"
+            )
+            .bind(username)
+            .bind(email)
+            .bind(&password_hash)
+            .execute(pool)
+            .await;
+
+            match result {
+                Ok(_) => tracing::info!("✅ Created test user: {}", username),
+                Err(e) => tracing::warn!("Failed to create test user {}: {}", username, e),
+            }
+        } else {
+            tracing::info!("Test user {} already exists", username);
+        }
+    }
 }
 
 async fn health_check() -> &'static str {
@@ -101,3 +174,4 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         tracing::info!("User disconnected: {}", id);
     }
 }
+
