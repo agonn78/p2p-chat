@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "apps/desktop",
+    "apps/desktop/src-tauri",
     "apps/server",
     "libs/shared-proto",
     "libs/media",

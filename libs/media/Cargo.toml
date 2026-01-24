@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+cpal = "0.15"
+# audiopus = "0.3" # Commented out to avoid link errors in this environment if libopus is missing, will behave as mock if needed or uncomment.
+# For now, let's include it but be aware of system deps.
+# audiopus = "0.3.0-rc.0" # Requires cmake and libopus 
+# webrtc = "0.10" # Heavy build, but required.
+webrtc = { version = "0.11", features = [] }
+xcap = "0.0.9"

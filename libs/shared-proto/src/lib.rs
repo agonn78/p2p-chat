@@ -22,9 +22,27 @@ pub mod signaling {
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "type", content = "payload")]
     pub enum SignalingMessage {
-        Offer(Offer),
-        Answer(Answer),
-        Candidate(Candidate),
+        #[serde(rename = "offer")]
+        Offer {
+            target_id: String,
+            sdp: String,
+        },
+        #[serde(rename = "answer")]
+        Answer {
+            target_id: String,
+            sdp: String,
+        },
+        #[serde(rename = "candidate")]
+        Candidate {
+            target_id: String,
+            candidate: String,
+            sdp_mid: Option<String>,
+            sdp_m_line_index: Option<u16>,
+        },
+        #[serde(rename = "identify")]
+        Identify {
+            user_id: String,
+        },
     }
 }
 
