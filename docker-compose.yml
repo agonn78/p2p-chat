@@ -13,6 +13,7 @@ services:
       - db
 
   db:
+    container_name: p2p-chat-db
     image: postgres:15-alpine
     environment:
       POSTGRES_USER: user
