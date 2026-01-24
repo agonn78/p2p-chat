@@ -18,7 +18,7 @@ async fn main() {
     // initialize tracing
     tracing_subscriber::fmt::init();
 
-    let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://user:password@localhost:5432/p2p_chat".to_string());
+    let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://user:password@db:5432/p2p_chat".to_string());
     
     // Connect to DB (Retry loop could be added here for robustness in docker-compose)
     let pool = PgPoolOptions::new()
