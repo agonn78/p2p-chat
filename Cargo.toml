@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "apps/desktop",
+    "apps/server",
+    "libs/shared-proto",
+    "libs/media",
+]
+resolver = "2"
