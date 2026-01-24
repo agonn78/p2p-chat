@@ -1,0 +1,13 @@
+# Exclude desktop app (requires GTK on Linux, not needed for server)
+apps/desktop/
+
+# Exclude libs/media (requires system deps like cpal/xcap that server doesn't need)
+libs/media/
+
+# Standard excludes
+target/
+node_modules/
+.git/
+.gitignore
+*.md
+!README.md
