@@ -23,6 +23,7 @@ function App() {
     const sendMessage = useAppStore((s) => s.sendMessage);
     const addMessage = useAppStore((s) => s.addMessage);
     const getUnreadCount = useAppStore((s) => s.getUnreadCount);
+    const decryptMessageContent = useAppStore((s) => s.decryptMessageContent);
 
     const [activeDM, setActiveDM] = useState<string | null>(null);
     const [msgInput, setMsgInput] = useState('');
@@ -244,8 +245,15 @@ function App() {
                                                     <span className="ml-2 text-xs text-gray-500">
                                                         {new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                                                     </span>
+                                                    {msg.nonce && (
+                                                        <span className="ml-2 text-xs text-green-500" title="End-to-end encrypted">
+                                                            🔒
+                                                        </span>
+                                                    )}
                                                 </div>
-                                                <p className="text-gray-300">{msg.content}</p>
+                                                <p className="text-gray-300">
+                                                    {msg._decryptedContent || decryptMessageContent(msg)}
+                                                </p>
                                             </div>
                                         </div>
                                     ))}

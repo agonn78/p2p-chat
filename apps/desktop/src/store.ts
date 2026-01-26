@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { User, Friend, Room, CallState, Message } from './types';
+import * as crypto from './crypto';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://192.168.0.52:3000';
 
@@ -10,6 +11,10 @@ interface AppState {
     user: User | null;
     isAuthenticated: boolean;
 
+    // E2EE Keys
+    keyPair: crypto.KeyPair | null;
+    friendPublicKeys: Record<string, string>; // friendId -> base64 public key
+
     // Social
     friends: Friend[];
     pendingRequests: Friend[];
@@ -18,8 +23,9 @@ interface AppState {
     // Rooms & Messages
     rooms: Room[];
     activeRoom: string | null;
+    activeFriendId: string | null; // Track which friend's DM is active
     messages: Message[];
-    unreadCounts: Record<string, number>; // friendId -> unread count
+    unreadCounts: Record<string, number>;
 
     // Call
     activeCall: CallState | null;
@@ -43,6 +49,11 @@ interface AppState {
     addMessage: (message: Message) => void;
     markAsRead: (friendId: string) => void;
     getUnreadCount: (friendId: string) => number;
+
+    // E2EE Actions
+    initializeKeys: () => Promise<void>;
+    fetchFriendPublicKey: (friendId: string) => Promise<string | null>;
+    decryptMessageContent: (message: Message) => string;
 }
 
 export const useAppStore = create<AppState>()(
@@ -52,11 +63,14 @@ export const useAppStore = create<AppState>()(
             token: null,
             user: null,
             isAuthenticated: false,
+            keyPair: null,
+            friendPublicKeys: {},
             friends: [],
             pendingRequests: [],
             onlineFriends: [],
             rooms: [],
             activeRoom: null,
+            activeFriendId: null,
             activeCall: null,
             messages: [],
             unreadCounts: {},
@@ -91,6 +105,9 @@ export const useAppStore = create<AppState>()(
                     } catch (e) {
                         console.error('[Store] Failed to identify on WebSocket:', e);
                     }
+
+                    // Initialize E2EE keys after login
+                    await get().initializeKeys();
                 } catch (e) {
                     console.error('[Store] Login exception:', e);
                     throw e;
@@ -116,6 +133,9 @@ export const useAppStore = create<AppState>()(
                     const data = await res.json();
                     console.log('[Store] Register success, received token');
                     set({ token: data.token, user: data.user, isAuthenticated: true });
+
+                    // Initialize E2EE keys after registration
+                    await get().initializeKeys();
                 } catch (e) {
                     console.error('[Store] Register exception:', e);
                     throw e;
@@ -123,7 +143,122 @@ export const useAppStore = create<AppState>()(
             },
 
             logout: () => {
-                set({ token: null, user: null, isAuthenticated: false, friends: [], rooms: [], messages: [] });
+                crypto.clearSecretCache();
+                set({
+                    token: null,
+                    user: null,
+                    isAuthenticated: false,
+                    friends: [],
+                    rooms: [],
+                    messages: [],
+                    keyPair: null,
+                    friendPublicKeys: {},
+                });
+            },
+
+            // E2EE Actions
+            initializeKeys: async () => {
+                const { token } = get();
+                if (!token) return;
+
+                // Get or create keypair
+                const keyPair = crypto.getOrCreateKeyPair();
+                set({ keyPair });
+
+                console.log('[Store] 🔐 Uploading public key to server...');
+                try {
+                    const res = await fetch(`${API_URL}/users/me/public-key`, {
+                        method: 'PUT',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            Authorization: `Bearer ${token}`
+                        },
+                        body: JSON.stringify({ public_key: keyPair.publicKey }),
+                    });
+
+                    if (res.ok) {
+                        console.log('[Store] 🔐 Public key uploaded successfully');
+                    } else {
+                        console.error('[Store] Failed to upload public key:', await res.text());
+                    }
+                } catch (e) {
+                    console.error('[Store] initializeKeys exception:', e);
+                }
+            },
+
+            fetchFriendPublicKey: async (friendId) => {
+                const { token, friendPublicKeys } = get();
+                if (!token) return null;
+
+                // Check cache first
+                if (friendPublicKeys[friendId]) {
+                    return friendPublicKeys[friendId];
+                }
+
+                console.log(`[Store] 🔐 Fetching public key for friend ${friendId}`);
+                try {
+                    const res = await fetch(`${API_URL}/users/${friendId}/public-key`, {
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (data.public_key) {
+                            set({
+                                friendPublicKeys: {
+                                    ...get().friendPublicKeys,
+                                    [friendId]: data.public_key
+                                }
+                            });
+                            console.log(`[Store] 🔐 Got public key for friend ${friendId}`);
+                            return data.public_key;
+                        }
+                    }
+                } catch (e) {
+                    console.error('[Store] fetchFriendPublicKey exception:', e);
+                }
+                return null;
+            },
+
+            decryptMessageContent: (message) => {
+                const { keyPair, activeFriendId, user } = get();
+
+                // If no encryption (legacy message or our own message)
+                if (!message.nonce || !keyPair || !activeFriendId) {
+                    return message.content;
+                }
+
+                // Determine whose public key to use for decryption
+                // If we sent it, we encrypted with friend's public key
+                // If friend sent it, they encrypted with our public key
+                // In both cases, we use the shared secret (which is symmetric)
+                const friendPublicKey = get().friendPublicKeys[activeFriendId];
+                if (!friendPublicKey) {
+                    console.warn('[Store] No public key for decryption');
+                    return message.content; // Fallback to raw content
+                }
+
+                try {
+                    const sharedSecret = crypto.getSharedSecret(
+                        activeFriendId,
+                        keyPair.secretKey,
+                        friendPublicKey
+                    );
+
+                    const decrypted = crypto.decryptMessage(
+                        message.content,
+                        message.nonce,
+                        sharedSecret
+                    );
+
+                    if (decrypted) {
+                        return decrypted;
+                    }
+                } catch (e) {
+                    console.error('[Store] Decryption failed:', e);
+                }
+
+                return '[Encrypted message]';
             },
 
             // Social actions
@@ -192,10 +327,14 @@ export const useAppStore = create<AppState>()(
 
             // Chat actions
             createOrGetDm: async (friendId) => {
-                const { token, markAsRead } = get();
+                const { token, markAsRead, fetchFriendPublicKey } = get();
                 if (!token) return;
 
                 console.log(`[Store] Creating/Getting DM with friend: ${friendId}`);
+
+                // Pre-fetch friend's public key for encryption
+                await fetchFriendPublicKey(friendId);
+
                 try {
                     const res = await fetch(`${API_URL}/chat/dm`, {
                         method: 'POST',
@@ -210,8 +349,8 @@ export const useAppStore = create<AppState>()(
                         const room = await res.json();
                         console.log(`[Store] Got room:`, room);
 
-                        // Clear messages before switching room
-                        set({ messages: [], activeRoom: room.id });
+                        // Clear messages and set active room + friend
+                        set({ messages: [], activeRoom: room.id, activeFriendId: friendId });
 
                         // Mark messages as read
                         markAsRead(friendId);
@@ -249,10 +388,30 @@ export const useAppStore = create<AppState>()(
             },
 
             sendMessage: async (roomId, content) => {
-                const { token } = get();
+                const { token, keyPair, activeFriendId, friendPublicKeys } = get();
                 if (!token) return;
 
-                console.log(`[Store] Sending message to room ${roomId}: "${content}"`);
+                let encryptedContent = content;
+                let nonce: string | null = null;
+
+                // Encrypt if we have keys
+                if (keyPair && activeFriendId && friendPublicKeys[activeFriendId]) {
+                    console.log('[Store] 🔐 Encrypting message...');
+                    const sharedSecret = crypto.getSharedSecret(
+                        activeFriendId,
+                        keyPair.secretKey,
+                        friendPublicKeys[activeFriendId]
+                    );
+
+                    const encrypted = crypto.encryptMessage(content, sharedSecret);
+                    encryptedContent = encrypted.ciphertext;
+                    nonce = encrypted.nonce;
+                    console.log('[Store] 🔐 Message encrypted');
+                } else {
+                    console.warn('[Store] ⚠️ Sending unencrypted message (no keys available)');
+                }
+
+                console.log(`[Store] Sending message to room ${roomId}`);
                 try {
                     const res = await fetch(`${API_URL}/chat/${roomId}/messages`, {
                         method: 'POST',
@@ -260,12 +419,14 @@ export const useAppStore = create<AppState>()(
                             'Content-Type': 'application/json',
                             Authorization: `Bearer ${token}`
                         },
-                        body: JSON.stringify({ content }),
+                        body: JSON.stringify({ content: encryptedContent, nonce }),
                     });
 
                     if (res.ok) {
                         const message = await res.json();
-                        console.log('[Store] Message sent, adding to list');
+                        console.log('[Store] Message sent');
+                        // Store original content for our own display
+                        message._decryptedContent = content;
                         get().addMessage(message);
                     } else {
                         console.error('[Store] Failed to send message:', await res.text());
@@ -279,17 +440,13 @@ export const useAppStore = create<AppState>()(
                 const { messages, activeRoom, user, friends, unreadCounts } = get();
                 console.log(`[Store] addMessage called for room ${message.room_id}, active room: ${activeRoom}`);
 
-                // Always add if not duplicate (regardless of active room for notification purposes)
                 if (!messages.find(m => m.id === message.id)) {
-                    // If this is the active room, add to messages
                     if (activeRoom === message.room_id) {
                         console.log('[Store] Adding message to active conversation');
                         set({ messages: [...messages, message] });
                     } else {
-                        // Message for a different room - increment unread count
                         console.log('[Store] Message for different room, incrementing unread');
 
-                        // Find which friend this message is from by checking sender_id
                         const senderId = message.sender_id;
                         if (senderId && senderId !== user?.id) {
                             const friend = friends.find(f => f.id === senderId);
@@ -344,7 +501,12 @@ export const useAppStore = create<AppState>()(
         }),
         {
             name: 'p2p-nitro-store',
-            partialize: (state) => ({ token: state.token, user: state.user }),
+            partialize: (state) => ({
+                token: state.token,
+                user: state.user,
+                keyPair: state.keyPair,
+                friendPublicKeys: state.friendPublicKeys,
+            }),
         }
     )
 );

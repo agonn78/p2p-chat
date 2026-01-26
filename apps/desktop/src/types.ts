@@ -25,7 +25,9 @@ export interface Message {
     room_id: string;
     sender_id?: string;
     content: string;
+    nonce?: string | null;  // For E2EE - if present, content is encrypted
     created_at: string;
+    _decryptedContent?: string;  // Client-side only - cached decrypted content
 }
 
 export interface CallState {
