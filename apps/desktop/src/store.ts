@@ -19,6 +19,7 @@ interface AppState {
     rooms: Room[];
     activeRoom: string | null;
     messages: Message[];
+    unreadCounts: Record<string, number>; // friendId -> unread count
 
     // Call
     activeCall: CallState | null;
@@ -40,6 +41,8 @@ interface AppState {
     fetchMessages: (roomId: string) => Promise<void>;
     sendMessage: (roomId: string, content: string) => Promise<void>;
     addMessage: (message: Message) => void;
+    markAsRead: (friendId: string) => void;
+    getUnreadCount: (friendId: string) => number;
 }
 
 export const useAppStore = create<AppState>()(
@@ -56,6 +59,7 @@ export const useAppStore = create<AppState>()(
             activeRoom: null,
             activeCall: null,
             messages: [],
+            unreadCounts: {},
 
             // Auth actions
             login: async (email, password) => {
@@ -188,7 +192,7 @@ export const useAppStore = create<AppState>()(
 
             // Chat actions
             createOrGetDm: async (friendId) => {
-                const { token } = get();
+                const { token, markAsRead } = get();
                 if (!token) return;
 
                 console.log(`[Store] Creating/Getting DM with friend: ${friendId}`);
@@ -205,7 +209,13 @@ export const useAppStore = create<AppState>()(
                     if (res.ok) {
                         const room = await res.json();
                         console.log(`[Store] Got room:`, room);
-                        set({ activeRoom: room.id });
+
+                        // Clear messages before switching room
+                        set({ messages: [], activeRoom: room.id });
+
+                        // Mark messages as read
+                        markAsRead(friendId);
+
                         // Fetch messages for this room
                         await get().fetchMessages(room.id);
                     } else {
@@ -266,15 +276,52 @@ export const useAppStore = create<AppState>()(
             },
 
             addMessage: (message) => {
-                const { messages, activeRoom } = get();
+                const { messages, activeRoom, user, friends, unreadCounts } = get();
                 console.log(`[Store] addMessage called for room ${message.room_id}, active room: ${activeRoom}`);
-                // Only add if it belongs to active room and not already there
-                if (activeRoom === message.room_id && !messages.find(m => m.id === message.id)) {
-                    console.log('[Store] Adding message to list');
-                    set({ messages: [...messages, message] });
+
+                // Always add if not duplicate (regardless of active room for notification purposes)
+                if (!messages.find(m => m.id === message.id)) {
+                    // If this is the active room, add to messages
+                    if (activeRoom === message.room_id) {
+                        console.log('[Store] Adding message to active conversation');
+                        set({ messages: [...messages, message] });
+                    } else {
+                        // Message for a different room - increment unread count
+                        console.log('[Store] Message for different room, incrementing unread');
+
+                        // Find which friend this message is from by checking sender_id
+                        const senderId = message.sender_id;
+                        if (senderId && senderId !== user?.id) {
+                            const friend = friends.find(f => f.id === senderId);
+                            if (friend) {
+                                const currentCount = unreadCounts[friend.id] || 0;
+                                set({
+                                    unreadCounts: {
+                                        ...unreadCounts,
+                                        [friend.id]: currentCount + 1
+                                    }
+                                });
+                                console.log(`[Store] Unread count for ${friend.username}: ${currentCount + 1}`);
+                            }
+                        }
+                    }
                 } else {
-                    console.log('[Store] Message not added (wrong room or duplicate)');
+                    console.log('[Store] Message not added (duplicate)');
                 }
+            },
+
+            markAsRead: (friendId) => {
+                const { unreadCounts } = get();
+                if (unreadCounts[friendId]) {
+                    const newCounts = { ...unreadCounts };
+                    delete newCounts[friendId];
+                    set({ unreadCounts: newCounts });
+                    console.log(`[Store] Marked messages from ${friendId} as read`);
+                }
+            },
+
+            getUnreadCount: (friendId) => {
+                return get().unreadCounts[friendId] || 0;
             },
 
             // Room actions

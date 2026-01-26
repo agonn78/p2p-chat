@@ -1,10 +1,10 @@
-import { useState, useEffect } from 'react';
-import { Mic, Video, Settings, Hash, Send, UserPlus, Phone, LogOut, MicOff } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { Mic, Video, Settings, Hash, Send, UserPlus, Phone, LogOut, MicOff, UserCircle, Calendar, Users } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from './store';
 import { AuthScreen } from './components/AuthScreen';
-import { FriendsList, AddFriendModal } from './components/FriendsList';
+import { AddFriendModal } from './components/FriendsList';
 
 function App() {
     const isAuthenticated = useAppStore((s) => s.isAuthenticated);
@@ -22,12 +22,15 @@ function App() {
     const createOrGetDm = useAppStore((s) => s.createOrGetDm);
     const sendMessage = useAppStore((s) => s.sendMessage);
     const addMessage = useAppStore((s) => s.addMessage);
+    const getUnreadCount = useAppStore((s) => s.getUnreadCount);
 
-    const [activeView, setActiveView] = useState<'friends' | 'dm'>('friends');
     const [activeDM, setActiveDM] = useState<string | null>(null);
     const [msgInput, setMsgInput] = useState('');
     const [showAddFriend, setShowAddFriend] = useState(false);
     const [isMuted, setIsMuted] = useState(false);
+
+    // Ref for auto-scrolling to bottom
+    const messagesEndRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
         if (isAuthenticated) {
@@ -84,7 +87,14 @@ function App() {
                 unlistenFn();
             }
         };
-    }, [isAuthenticated]); // Remove addMessage from dependencies to prevent re-creation
+    }, [isAuthenticated]);
+
+    // Auto-scroll to bottom when messages change
+    useEffect(() => {
+        if (messagesEndRef.current) {
+            messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+        }
+    }, [messages]);
 
     const handleJoinCall = async (friendId: string) => {
         startCall(friendId);
@@ -98,7 +108,6 @@ function App() {
 
     const handleFriendClick = async (friendId: string) => {
         setActiveDM(friendId);
-        setActiveView('dm');
         await createOrGetDm(friendId);
     };
 
@@ -112,7 +121,8 @@ function App() {
         }
     };
 
-    const getSenderName = (senderId: string) => {
+    const getSenderName = (senderId: string | undefined) => {
+        if (!senderId) return 'Unknown';
         if (senderId === user?.id) return 'Me';
         const friend = friends.find(f => f.id === senderId);
         return friend ? friend.username : 'Unknown';
@@ -126,7 +136,7 @@ function App() {
 
     return (
         <div className="flex h-screen w-full bg-background text-white overflow-hidden font-sans">
-            {/* Sidebar */}
+            {/* Left Sidebar - Friends List */}
             <div className="w-72 bg-surface flex flex-col border-r border-white/5 relative z-10 glass-panel">
                 <div className="p-4 border-b border-white/5 flex items-center justify-between">
                     <h1 className="text-xl font-bold bg-gradient-to-r from-primary to-secondary bg-clip-text text-transparent">
@@ -141,47 +151,39 @@ function App() {
                     </button>
                 </div>
 
-                {/* Navigation */}
-                <div className="flex border-b border-white/5">
-                    <button
-                        onClick={() => setActiveView('friends')}
-                        className={`flex-1 py-3 text-sm font-medium transition ${activeView === 'friends'
-                            ? 'text-primary border-b-2 border-primary'
-                            : 'text-gray-400 hover:text-white'
-                            }`}
-                    >
-                        Friends
-                    </button>
-                    <button
-                        onClick={() => setActiveView('dm')}
-                        className={`flex-1 py-3 text-sm font-medium transition ${activeView === 'dm'
-                            ? 'text-primary border-b-2 border-primary'
-                            : 'text-gray-400 hover:text-white'
-                            }`}
-                    >
-                        Messages
-                    </button>
-                </div>
+                {/* Friends List */}
+                <div className="flex-1 overflow-y-auto p-2 space-y-1">
+                    {friends.map((friend) => {
+                        const unreadCount = getUnreadCount(friend.id);
+                        const isActive = activeDM === friend.id;
+                        return (
+                            <button
+                                key={friend.id}
+                                onClick={() => handleFriendClick(friend.id)}
+                                className={`w-full flex items-center gap-3 p-3 rounded-lg transition relative ${isActive ? 'bg-primary/20 border border-primary/30' : 'hover:bg-white/5'
+                                    }`}
+                            >
+                                {/* Avatar with online indicator */}
+                                <div className="relative flex-shrink-0">
+                                    <div className="w-12 h-12 rounded-full bg-gradient-to-br from-primary to-secondary" />
+                                    <div className="absolute bottom-0 right-0 w-3.5 h-3.5 bg-green-500 rounded-full border-2 border-surface" />
+                                </div>
 
-                {/* Content */}
-                <div className="flex-1 overflow-hidden">
-                    {activeView === 'friends' ? (
-                        <FriendsList />
-                    ) : (
-                        <div className="p-2 space-y-1">
-                            {friends.map((friend) => (
-                                <button
-                                    key={friend.id}
-                                    onClick={() => handleFriendClick(friend.id)}
-                                    className={`w-full flex items-center gap-3 p-2 rounded-lg transition ${activeDM === friend.id ? 'bg-primary/20' : 'hover:bg-white/5'
-                                        }`}
-                                >
-                                    <div className="w-10 h-10 rounded-full bg-gradient-to-br from-primary to-secondary" />
-                                    <span className="font-medium text-sm">{friend.username}</span>
-                                </button>
-                            ))}
-                        </div>
-                    )}
+                                {/* Username */}
+                                <div className="flex-1 text-left">
+                                    <div className="font-medium text-sm">{friend.username}</div>
+                                    <div className="text-xs text-gray-400">Online</div>
+                                </div>
+
+                                {/* Unread badge */}
+                                {unreadCount > 0 && (
+                                    <div className="bg-red-500 text-white text-xs font-bold rounded-full min-w-[20px] h-5 flex items-center justify-center px-1.5">
+                                        {unreadCount > 99 ? '99+' : unreadCount}
+                                    </div>
+                                )}
+                            </button>
+                        );
+                    })}
                 </div>
 
                 {/* User Status */}
@@ -209,28 +211,15 @@ function App() {
                 </div>
             </div>
 
-            {/* Main Content */}
+            {/* Center - Chat Area */}
             <div className="flex-1 flex flex-col relative bg-background/50">
                 {activeDM && activeFriend ? (
                     <>
-                        {/* Header */}
-                        <div className="h-14 border-b border-white/5 flex items-center justify-between px-4 bg-surface/50 backdrop-blur-sm">
+                        {/* Chat Header */}
+                        <div className="h-14 border-b border-white/5 flex items-center px-4 bg-surface/50 backdrop-blur-sm flex-shrink-0">
                             <div className="flex items-center text-gray-200">
-                                <div className="w-8 h-8 rounded-full bg-gradient-to-br from-primary to-secondary mr-3" />
+                                <Hash className="w-5 h-5 text-gray-400 mr-2" />
                                 <span className="font-semibold">{activeFriend.username}</span>
-                            </div>
-                            <div className="flex items-center space-x-2">
-                                <button
-                                    onClick={() => handleJoinCall(activeFriend.id)}
-                                    className="flex items-center px-4 py-2 bg-green-600 hover:bg-green-500 text-white text-sm rounded-lg transition shadow-lg shadow-green-900/20"
-                                >
-                                    <Phone className="w-4 h-4 mr-2" />
-                                    Call
-                                </button>
-                                <button className="flex items-center px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition">
-                                    <Video className="w-4 h-4 mr-2" />
-                                    Video
-                                </button>
                             </div>
                         </div>
 
@@ -245,33 +234,36 @@ function App() {
                                     <p className="text-sm">Send a message to {activeFriend.username}</p>
                                 </div>
                             ) : (
-                                messages.map((msg) => (
-                                    <div key={msg.id} className="flex group hover:bg-white/[0.02] -mx-4 px-4 py-1 transition">
-                                        <div className="w-10 h-10 rounded-full bg-gray-700 mt-1 flex-shrink-0" />
-                                        <div className="ml-3">
-                                            <div className="flex items-baseline">
-                                                <span className="font-medium text-gray-200">{getSenderName(msg.sender_id)}</span>
-                                                <span className="ml-2 text-xs text-gray-500">
-                                                    {new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                                                </span>
+                                <>
+                                    {messages.map((msg) => (
+                                        <div key={msg.id} className="flex group hover:bg-white/[0.02] -mx-4 px-4 py-1 transition">
+                                            <div className="w-10 h-10 rounded-full bg-gray-700 mt-1 flex-shrink-0" />
+                                            <div className="ml-3">
+                                                <div className="flex items-baseline">
+                                                    <span className="font-medium text-gray-200">{getSenderName(msg.sender_id)}</span>
+                                                    <span className="ml-2 text-xs text-gray-500">
+                                                        {new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                                    </span>
+                                                </div>
+                                                <p className="text-gray-300">{msg.content}</p>
                                             </div>
-                                            <p className="text-gray-300">{msg.content}</p>
                                         </div>
-                                    </div>
-                                ))
+                                    ))}
+                                    <div ref={messagesEndRef} />
+                                </>
                             )}
                         </div>
 
                         {/* Input */}
-                        <div className="p-4 pt-2">
+                        <div className="p-4 pt-2 flex-shrink-0 border-t border-white/5">
                             <div className="relative bg-surface rounded-lg flex items-center p-1 ring-1 ring-white/10 focus-within:ring-primary/50 transition">
                                 <input
                                     type="text"
                                     value={msgInput}
                                     onChange={(e) => setMsgInput(e.target.value)}
-                                    // onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
                                     onKeyDown={(e) => {
-                                        if (e.key === 'Enter') {
+                                        if (e.key === 'Enter' && !e.shiftKey) {
+                                            e.preventDefault();
                                             handleSendMessage();
                                         }
                                     }}
@@ -280,7 +272,9 @@ function App() {
                                 />
                                 <button
                                     onClick={handleSendMessage}
-                                    className="p-2 text-primary hover:text-primary/80">
+                                    className="p-2 text-primary hover:text-primary/80 disabled:opacity-50 disabled:cursor-not-allowed"
+                                    disabled={!msgInput.trim()}
+                                >
                                     <Send className="w-5 h-5" />
                                 </button>
                             </div>
@@ -289,6 +283,9 @@ function App() {
                 ) : (
                     <div className="flex-1 flex items-center justify-center">
                         <div className="text-center text-gray-500">
+                            <div className="w-32 h-32 rounded-full bg-gradient-to-br from-primary/20 to-secondary/20 flex items-center justify-center mx-auto mb-6">
+                                <UserCircle className="w-16 h-16 text-primary/50" />
+                            </div>
                             <p className="text-xl font-medium mb-2">Welcome back, {user?.username}!</p>
                             <p>Select a friend to start chatting</p>
                         </div>
@@ -318,6 +315,80 @@ function App() {
                     </div>
                 )}
             </div>
+
+            {/* Right Sidebar - Friend Info Panel */}
+            {activeFriend && (
+                <div className="w-80 bg-surface border-l border-white/5 flex flex-col animate-slide-in">
+                    {/* Friend Profile Header */}
+                    <div className="p-6 border-b border-white/5">
+                        <div className="flex flex-col items-center text-center">
+                            <div className="w-24 h-24 rounded-full bg-gradient-to-br from-primary to-secondary mb-4 relative">
+                                <div className="absolute bottom-1 right-1 w-6 h-6 bg-green-500 rounded-full border-4 border-surface" />
+                            </div>
+                            <h2 className="text-xl font-bold mb-1">{activeFriend.username}</h2>
+                            <p className="text-sm text-green-400 flex items-center gap-1">
+                                <span className="w-2 h-2 bg-green-500 rounded-full" />
+                                Online
+                            </p>
+                        </div>
+                    </div>
+
+                    {/* Action Buttons */}
+                    <div className="p-4 border-b border-white/5 space-y-2">
+                        <button
+                            onClick={() => handleJoinCall(activeFriend.id)}
+                            className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-green-600 hover:bg-green-500 text-white font-medium rounded-lg transition"
+                        >
+                            <Phone className="w-5 h-5" />
+                            Voice Call
+                        </button>
+                        <button className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition">
+                            <Video className="w-5 h-5" />
+                            Video Call
+                        </button>
+                    </div>
+
+                    {/* Friend Info */}
+                    <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                        {/* About Section */}
+                        <div className="bg-black/20 rounded-lg p-4">
+                            <h3 className="text-sm font-bold text-gray-400 uppercase mb-3">About</h3>
+                            <div className="space-y-3">
+                                <div className="flex items-center gap-3 text-sm">
+                                    <Calendar className="w-4 h-4 text-gray-400" />
+                                    <div>
+                                        <div className="text-gray-400 text-xs">Member since</div>
+                                        <div className="text-white">
+                                            {activeFriend.last_seen ? new Date(activeFriend.last_seen).toLocaleDateString() : 'Recently'}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="flex items-center gap-3 text-sm">
+                                    <UserCircle className="w-4 h-4 text-gray-400" />
+                                    <div>
+                                        <div className="text-gray-400 text-xs">User ID</div>
+                                        <div className="text-white text-xs font-mono">{activeFriend.id.slice(0, 8)}...</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Placeholder for future features */}
+                        <div className="bg-black/20 rounded-lg p-4">
+                            <h3 className="text-sm font-bold text-gray-400 uppercase mb-3">Mutual Friends</h3>
+                            <p className="text-sm text-gray-500">Coming soon...</p>
+                        </div>
+                    </div>
+
+                    {/* Settings at bottom */}
+                    <div className="p-4 border-t border-white/5">
+                        <button className="w-full flex items-center justify-center gap-2 px-4 py-2 hover:bg-white/5 rounded-lg transition text-gray-400">
+                            <Settings className="w-4 h-4" />
+                            <span className="text-sm">More Options</span>
+                        </button>
+                    </div>
+                </div>
+            )}
 
             {/* Add Friend Modal */}
             <AddFriendModal isOpen={showAddFriend} onClose={() => setShowAddFriend(false)} />
