@@ -148,10 +148,17 @@ async fn send_message(
         "message": message
     });
     let ws_text = serde_json::to_string(&ws_payload).unwrap();
-
+    
+    println!("📢 Broadcasting message to {} room members", members.len());
     for member_id in members {
+        println!("  → Checking member: {}", member_id);
         if let Some(peer_tx) = state.peers.get(&member_id.to_string()) {
-            let _ = peer_tx.send(WsMessage::Text(ws_text.clone()));
+            match peer_tx.send(WsMessage::Text(ws_text.clone())) {
+                Ok(_) => println!("    ✅ Sent to {}", member_id),
+                Err(e) => eprintln!("    ❌ Failed to send to {}: {}", member_id, e),
+            }
+        } else {
+            println!("    ⚠️  Member {} not connected to WebSocket", member_id);
         }
     }
 

@@ -153,8 +153,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             if let Ok(signal) = serde_json::from_str::<SignalingMessage>(&text) {
                 match signal {
                     SignalingMessage::Identify { user_id } => {
-                        tracing::info!("User identified: {}", user_id);
+                        println!("🆔 User {} identified on WebSocket", user_id);
                         state.peers.insert(user_id.clone(), tx.clone());
+                        let peer_count = state.peers.len();
+                        println!("📊 Current connected peers: {} total", peer_count);
                         my_id = Some(user_id);
                     }
                     SignalingMessage::Offer { target_id, sdp: _ } |

@@ -27,43 +27,46 @@ pub async fn connect(server_url: &str, app_handle: tauri::AppHandle) -> Result<W
     
     // Spawn task to handle incoming messages
     tokio::spawn(async move {
+        println!("📡 WebSocket message handler started");
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    println!("Received from server: {}", text);
+                    println!("📨 [WS] Received from server: {}", text);
                     
                     // Emit to frontend for chat messages
-                    if let Err(e) = app_handle.emit("ws-message", text.clone()) {
-                        eprintln!("Failed to emit ws-message event: {}", e);
+                    match app_handle.emit("ws-message", text.clone()) {
+                        Ok(_) => println!("✅ [WS] Emitted 'ws-message' event to frontend"),
+                        Err(e) => eprintln!("❌ [WS] Failed to emit ws-message event: {}", e),
                     }
                     
                     // Also handle WebRTC signaling
                     if let Ok(signal) = serde_json::from_str::<SignalingMessage>(&text) {
                         match signal {
                             SignalingMessage::Offer { target_id: _, sdp } => {
-                                println!("Received Offer SDP: {}...", &sdp[..50.min(sdp.len())]);
+                                println!("🎯 Received Offer SDP: {}...", &sdp[..50.min(sdp.len())]);
                             }
                             SignalingMessage::Answer { target_id: _, sdp } => {
-                                println!("Received Answer SDP: {}...", &sdp[..50.min(sdp.len())]);
+                                println!("🎯 Received Answer SDP: {}...", &sdp[..50.min(sdp.len())]);
                             }
                             SignalingMessage::Candidate { target_id: _, candidate, .. } => {
-                                println!("Received ICE Candidate: {}", candidate);
+                                println!("🎯 Received ICE Candidate: {}", candidate);
                             }
                             _ => {}
                         }
                     }
                 }
                 Ok(Message::Close(_)) => {
-                    println!("Server closed connection");
+                    println!("🔌 Server closed connection");
                     break;
                 }
                 Err(e) => {
-                    eprintln!("WebSocket error: {}", e);
+                    eprintln!("❌ WebSocket error: {}", e);
                     break;
                 }
                 _ => {}
             }
         }
+        println!("📡 WebSocket message handler stopped");
     });
     
     Ok(sender_clone)

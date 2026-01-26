@@ -37,26 +37,54 @@ function App() {
 
     // WebSocket Listener
     useEffect(() => {
-        if (!isAuthenticated) return;
+        if (!isAuthenticated) {
+            console.log('[App] Not authenticated, skipping WS listener setup');
+            return;
+        }
 
-        console.log("Setting up WS listener");
-        const unlistenPromise = listen<string>('ws-message', (event) => {
-            console.log("WS Event received:", event);
+        console.log('[App] 🔌 Setting up WebSocket listener...');
+
+        const setupListener = async () => {
             try {
-                const payload = JSON.parse(event.payload);
-                if (payload.type === 'NEW_MESSAGE') {
-                    console.log('[App] New message received:', payload.message);
-                    addMessage(payload.message);
-                }
-            } catch (e) {
-                console.error('Failed to parse WS message:', e);
+                const unlisten = await listen<string>('ws-message', (event) => {
+                    console.log('[App] 📨 WS Event received, raw payload:', event.payload);
+                    try {
+                        const payload = JSON.parse(event.payload);
+                        console.log('[App] 📦 Parsed payload:', payload);
+
+                        if (payload.type === 'NEW_MESSAGE') {
+                            console.log('[App] ✉️ NEW_MESSAGE detected, calling addMessage with:', payload.message);
+                            addMessage(payload.message);
+                        } else {
+                            console.log('[App] ℹ️ Non-message payload type:', payload.type);
+                        }
+                    } catch (e) {
+                        console.error('[App] ❌ Failed to parse WS message:', e, 'Payload:', event.payload);
+                    }
+                });
+
+                console.log('[App] ✅ WebSocket listener attached successfully');
+
+                return unlisten;
+            } catch (error) {
+                console.error('[App] ❌ Failed to setup WS listener:', error);
+                return () => { };
             }
+        };
+
+        let unlistenFn: (() => void) | null = null;
+
+        setupListener().then(fn => {
+            unlistenFn = fn;
         });
 
         return () => {
-            unlistenPromise.then((unlisten) => unlisten());
+            console.log('[App] 🔌 Cleaning up WebSocket listener');
+            if (unlistenFn) {
+                unlistenFn();
+            }
         };
-    }, [isAuthenticated, addMessage]);
+    }, [isAuthenticated]); // Remove addMessage from dependencies to prevent re-creation
 
     const handleJoinCall = async (friendId: string) => {
         startCall(friendId);
