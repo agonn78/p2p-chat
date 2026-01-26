@@ -3,10 +3,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 use axum::extract::ws::Message as WsMessage;
-use std::collections::HashSet;
 
 use crate::auth::{AuthError, AuthUser};
 use crate::models::{Message, Room};
@@ -26,6 +25,7 @@ struct CreateDmRequest {
 #[derive(Deserialize)]
 struct SendMessageRequest {
     content: String,
+    nonce: Option<String>,  // E2EE nonce
 }
 
 /// Create or get existing DM room with a friend
@@ -128,19 +128,25 @@ async fn send_message(
         return Err(AuthError::InvalidToken);
     }
 
-    // Insert message
+    // Insert message with nonce for E2EE
     let message = sqlx::query_as::<_, Message>(
         r#"
-        INSERT INTO messages (room_id, sender_id, content)
-        VALUES ($1, $2, $3)
+        INSERT INTO messages (room_id, sender_id, content, nonce)
+        VALUES ($1, $2, $3, $4)
         RETURNING *
         "#
     )
     .bind(room_id)
     .bind(user.id)
     .bind(&req.content)
+    .bind(&req.nonce)
     .fetch_one(&state.db)
     .await?;
+
+    // Log if message is encrypted
+    if req.nonce.is_some() {
+        println!("🔐 Encrypted message sent (nonce present)");
+    }
 
     // Broadcast via WebSocket
     let ws_payload = serde_json::json!({
@@ -151,16 +157,14 @@ async fn send_message(
     
     println!("📢 Broadcasting message to {} room members", members.len());
     for member_id in members {
-        println!("  → Checking member: {}", member_id);
         if let Some(peer_tx) = state.peers.get(&member_id.to_string()) {
             match peer_tx.send(WsMessage::Text(ws_text.clone())) {
                 Ok(_) => println!("    ✅ Sent to {}", member_id),
                 Err(e) => eprintln!("    ❌ Failed to send to {}: {}", member_id, e),
             }
-        } else {
-            println!("    ⚠️  Member {} not connected to WebSocket", member_id);
         }
     }
 
     Ok(Json(message))
 }
+

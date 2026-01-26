@@ -10,27 +10,6 @@ pub type WsSender = Arc<Mutex<Option<futures_util::stream::SplitSink<
     Message
 >>>>;
 
-/// Track WebSocket connection state
-pub struct WsState {
-    pub connected: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl WsState {
-    pub fn new() -> Self {
-        Self {
-            connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
-    }
-    
-    pub fn set_connected(&self, connected: bool) {
-        self.connected.store(connected, std::sync::atomic::Ordering::SeqCst);
-    }
-    
-    pub fn is_connected(&self) -> bool {
-        self.connected.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
 /// Connect to the signaling server (without identifying)
 pub async fn connect(server_url: &str, app_handle: tauri::AppHandle) -> Result<WsSender, String> {
     let url = url::Url::parse(server_url).map_err(|e| e.to_string())?;
