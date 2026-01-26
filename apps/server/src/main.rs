@@ -74,7 +74,6 @@ async fn main() {
         .nest("/auth", routes::auth::router())
         .nest("/friends", routes::friends::router())
         .nest("/users", routes::users::router())
-        .nest("/users", routes::users::router())
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(app_state);
