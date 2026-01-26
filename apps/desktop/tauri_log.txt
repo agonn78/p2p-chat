@@ -1,0 +1,22 @@
+
+> p2p-chat-desktop@0.0.0 tauri
+> tauri dev
+
+     Running BeforeDevCommand (`npm run dev`)
+
+> p2p-chat-desktop@0.0.0 dev
+> vite
+
+
+  VITE v5.4.21  ready in 123 ms
+
+  ➜  Local:   http://localhost:1420/
+  ➜  Network: use --host to expose
+     Running DevCommand (`cargo  run --no-default-features --color always --`)
+        Info Watching /Users/ewan/Projets/p2p-nitro/apps/desktop/src-tauri for changes...
+        Info Watching /Users/ewan/Projets/p2p-nitro/apps/desktop/src-tauri for changes...
+        Info Watching /Users/ewan/Projets/p2p-nitro/apps/server for changes...
+        Info Watching /Users/ewan/Projets/p2p-nitro/libs/shared-proto for changes...
+        Info Watching /Users/ewan/Projets/p2p-nitro/libs/media for changes...
+[1m[92m   Compiling[0m desktop v0.1.0 (/Users/ewan/Projets/p2p-nitro/apps/desktop/src-tauri)
+[1m[96m    Building[0m [=======================> ] 667/669: desktop(build)              [1m[96m    Building[0m [=======================> ] 668/669: desktop(bin)                

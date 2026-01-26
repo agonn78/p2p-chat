@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { User, Friend, Room, CallState } from './types';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+const API_URL = import.meta.env.VITE_API_URL || 'http://192.168.0.52:3000';
 
 interface AppState {
     // Auth
@@ -51,28 +51,54 @@ export const useAppStore = create<AppState>()(
 
             // Auth actions
             login: async (email, password) => {
-                const res = await fetch(`${API_URL}/auth/login`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email, password }),
-                });
-                if (!res.ok) throw new Error('Login failed');
-                const data = await res.json();
-                set({ token: data.token, user: data.user, isAuthenticated: true });
+                console.log(`[Store] Attempting login to ${API_URL}/auth/login with email: ${email}`);
+                try {
+                    const res = await fetch(`${API_URL}/auth/login`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ email, password }),
+                    });
+
+                    console.log(`[Store] Login response status: ${res.status}`);
+
+                    if (!res.ok) {
+                        const errorText = await res.text();
+                        console.error('[Store] Login failed body:', errorText);
+                        throw new Error(`Login failed: ${res.status} ${errorText}`);
+                    }
+
+                    const data = await res.json();
+                    console.log('[Store] Login success, received token');
+                    set({ token: data.token, user: data.user, isAuthenticated: true });
+                } catch (e) {
+                    console.error('[Store] Login exception:', e);
+                    throw e;
+                }
             },
 
             register: async (username, email, password) => {
-                const res = await fetch(`${API_URL}/auth/register`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, email, password }),
-                });
-                if (!res.ok) {
-                    const error = await res.json();
-                    throw new Error(error.error || 'Registration failed');
+                console.log(`[Store] Attempting register to ${API_URL}/auth/register with user: ${username}`);
+                try {
+                    const res = await fetch(`${API_URL}/auth/register`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username, email, password }),
+                    });
+
+                    console.log(`[Store] Register response status: ${res.status}`);
+
+                    if (!res.ok) {
+                        const error = await res.json();
+                        console.error('[Store] Register failed:', error);
+                        throw new Error(error.error || 'Registration failed');
+                    }
+                    const data = await res.json();
+                    console.log('[Store] Register success, received token');
+                    set({ token: data.token, user: data.user, isAuthenticated: true });
+                } catch (e) {
+                    console.error('[Store] Register exception:', e);
+                    throw e;
                 }
-                const data = await res.json();
-                set({ token: data.token, user: data.user, isAuthenticated: true });
             },
 
             logout: () => {

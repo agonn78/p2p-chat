@@ -109,16 +109,16 @@ async fn send_request(
 async fn accept_request(
     State(state): State<AppState>,
     user: AuthUser,
-    Path(friendship_id): Path<Uuid>,
+    Path(sender_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
     let result = sqlx::query(
         r#"
         UPDATE friendships 
         SET status = 'accepted' 
-        WHERE id = $1 AND friend_id = $2 AND status = 'pending'
+        WHERE user_id = $1 AND friend_id = $2 AND status = 'pending'
         "#,
     )
-    .bind(friendship_id)
+    .bind(sender_id)
     .bind(user.id)
     .execute(&state.db)
     .await?;
@@ -134,12 +134,12 @@ async fn accept_request(
 async fn reject_request(
     State(state): State<AppState>,
     user: AuthUser,
-    Path(friendship_id): Path<Uuid>,
+    Path(sender_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
     sqlx::query(
-        "DELETE FROM friendships WHERE id = $1 AND friend_id = $2 AND status = 'pending'"
+        "DELETE FROM friendships WHERE user_id = $1 AND friend_id = $2 AND status = 'pending'"
     )
-    .bind(friendship_id)
+    .bind(sender_id)
     .bind(user.id)
     .execute(&state.db)
     .await?;
