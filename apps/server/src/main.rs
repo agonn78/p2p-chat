@@ -15,7 +15,10 @@ use tokio::sync::mpsc;
 use shared_proto::signaling::SignalingMessage;
 use crate::state::AppState;
 use sqlx::postgres::PgPoolOptions;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
 
 #[tokio::main]
 async fn main() {
@@ -71,7 +74,9 @@ async fn main() {
         .nest("/auth", routes::auth::router())
         .nest("/friends", routes::friends::router())
         .nest("/users", routes::users::router())
+        .nest("/users", routes::users::router())
         .layer(cors)
+        .layer(TraceLayer::new_for_http())
         .with_state(app_state);
 
     // Run server
