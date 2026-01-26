@@ -143,15 +143,30 @@ export const useAppStore = create<AppState>()(
                 });
             },
 
-            acceptFriend: async (friendshipId) => {
+            acceptFriend: async (friendId) => {
                 const { token, fetchFriends, fetchPendingRequests } = get();
                 if (!token) return;
-                await fetch(`${API_URL}/friends/accept/${friendshipId}`, {
-                    method: 'POST',
-                    headers: { Authorization: `Bearer ${token}` },
-                });
-                await fetchFriends();
-                await fetchPendingRequests();
+                console.log(`[Store] Accepting friend request from user ID: ${friendId}`);
+                try {
+                    const res = await fetch(`${API_URL}/friends/accept/${friendId}`, {
+                        method: 'POST',
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+
+                    console.log(`[Store] Accept response status: ${res.status}`);
+
+                    if (!res.ok) {
+                        const errorText = await res.text();
+                        console.error('[Store] Accept failed body:', errorText);
+                        throw new Error(`Accept failed: ${res.status} ${errorText}`);
+                    }
+
+                    console.log('[Store] Friend accepted successfully. Refreshing lists...');
+                    await fetchFriends();
+                    await fetchPendingRequests();
+                } catch (e) {
+                    console.error('[Store] Accept exception:', e);
+                }
             },
 
             // Room actions

@@ -111,6 +111,8 @@ async fn accept_request(
     user: AuthUser,
     Path(sender_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
+    tracing::info!("Received accept request for sender_id: {} from user: {}", sender_id, user.id);
+    
     let result = sqlx::query(
         r#"
         UPDATE friendships 
