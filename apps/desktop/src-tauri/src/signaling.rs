@@ -10,8 +10,8 @@ pub type WsSender = Arc<Mutex<Option<futures_util::stream::SplitSink<
     Message
 >>>>;
 
-/// Connect to the signaling server
-pub async fn connect(server_url: &str, user_id: &str, app_handle: tauri::AppHandle) -> Result<WsSender, String> {
+/// Connect to the signaling server (without identifying)
+pub async fn connect(server_url: &str, app_handle: tauri::AppHandle) -> Result<WsSender, String> {
     let url = url::Url::parse(server_url).map_err(|e| e.to_string())?;
     
     let (ws_stream, _) = connect_async(url)
@@ -20,13 +20,7 @@ pub async fn connect(server_url: &str, user_id: &str, app_handle: tauri::AppHand
     
     println!("Connected to signaling server: {}", server_url);
     
-    let (mut write, mut read) = ws_stream.split();
-    
-    // Send identify message
-    let identify = SignalingMessage::Identify { user_id: user_id.to_string() };
-    let msg = serde_json::to_string(&identify).map_err(|e| e.to_string())?;
-    write.send(Message::Text(msg)).await.map_err(|e| e.to_string())?;
-    println!("Identified as: {}", user_id);
+    let (write, mut read) = ws_stream.split();
     
     let sender = Arc::new(Mutex::new(Some(write)));
     let sender_clone = sender.clone();
@@ -86,4 +80,10 @@ pub async fn send_signal(sender: &WsSender, message: SignalingMessage) -> Result
     } else {
         Err("WebSocket not connected".to_string())
     }
+}
+
+/// Send identification message to server
+pub async fn send_identify(sender: &WsSender, user_id: &str) -> Result<(), String> {
+    let identify = SignalingMessage::Identify { user_id: user_id.to_string() };
+    send_signal(sender, identify).await
 }

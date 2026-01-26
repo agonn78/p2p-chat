@@ -78,6 +78,15 @@ export const useAppStore = create<AppState>()(
                     const data = await res.json();
                     console.log('[Store] Login success, received token');
                     set({ token: data.token, user: data.user, isAuthenticated: true });
+
+                    // Identify user on WebSocket for real-time messaging
+                    try {
+                        const { invoke } = await import('@tauri-apps/api/core');
+                        await invoke('identify_user', { userId: data.user.id });
+                        console.log('[Store] WebSocket identified with user ID:', data.user.id);
+                    } catch (e) {
+                        console.error('[Store] Failed to identify on WebSocket:', e);
+                    }
                 } catch (e) {
                     console.error('[Store] Login exception:', e);
                     throw e;

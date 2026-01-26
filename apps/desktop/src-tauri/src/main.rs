@@ -9,12 +9,10 @@ use media::MediaEngine;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use signaling::WsSender;
-use uuid::Uuid;
 
 struct AppState {
     media: Arc<std::sync::Mutex<MediaEngine>>,
     ws_sender: WsSender,
-    user_id: String,
 }
 
 #[tauri::command]
@@ -33,12 +31,14 @@ async fn join_call(state: State<'_, AppState>, channel: String) -> Result<String
         });
     });
 
-    Ok(format!("Joined channel {} as {}", channel, state.user_id))
+    Ok(format!("Joined channel {}", channel))
 }
 
 #[tauri::command]
-async fn get_user_id(state: State<'_, AppState>) -> Result<String, String> {
-    Ok(state.user_id.clone())
+async fn identify_user(state: State<'_, AppState>, user_id: String) -> Result<(), String> {
+    println!("Identifying user: {}", user_id);
+    signaling::send_identify(&state.ws_sender, &user_id).await?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -54,27 +54,23 @@ async fn send_answer(state: State<'_, AppState>, target_id: String, sdp: String)
 }
 
 fn main() {
-    let user_id = Uuid::new_v4().to_string();
-    let user_id_clone = user_id.clone();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let app_handle = app.handle().clone();
-            let user_id_for_connect = user_id_clone.clone();
             
-            // Connect to signaling server with AppHandle
+            // Connect to signaling server (without identifying yet)
             tauri::async_runtime::spawn(async move {
-                match signaling::connect(config::SERVER_URL, &user_id_for_connect, app_handle.clone()).await {
+                match signaling::connect(config::SERVER_URL, app_handle.clone()).await {
                     Ok(sender) => {
                         // Store the sender in app state
                         let state = AppState {
                             media: Arc::new(std::sync::Mutex::new(MediaEngine::new())),
                             ws_sender: sender,
-                            user_id: user_id_for_connect.clone(),
                         };
                         app_handle.manage(state);
+                        println!("WebSocket connected. Waiting for user login to identify...");
                     }
                     Err(e) => {
                         eprintln!("Warning: Could not connect to signaling server: {}", e);
@@ -83,7 +79,6 @@ fn main() {
                         let state = AppState {
                             media: Arc::new(std::sync::Mutex::new(MediaEngine::new())),
                             ws_sender: Arc::new(Mutex::new(None)),
-                            user_id: user_id_for_connect,
                         };
                         app_handle.manage(state);
                     }
@@ -92,7 +87,7 @@ fn main() {
             
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![join_call, get_user_id, send_offer, send_answer])
+        .invoke_handler(tauri::generate_handler![join_call, send_offer, send_answer, identify_user])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
