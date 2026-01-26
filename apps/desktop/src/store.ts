@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { User, Friend, Room, CallState } from './types';
+import type { User, Friend, Room, CallState, Message } from './types';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://192.168.0.52:3000';
 
@@ -18,6 +18,7 @@ interface AppState {
     // Rooms & Messages
     rooms: Room[];
     activeRoom: string | null;
+    messages: Message[];
 
     // Call
     activeCall: CallState | null;
@@ -29,10 +30,16 @@ interface AppState {
     fetchFriends: () => Promise<void>;
     fetchPendingRequests: () => Promise<void>;
     sendFriendRequest: (username: string) => Promise<void>;
-    acceptFriend: (friendshipId: string) => Promise<void>;
+    acceptFriend: (friendId: string) => Promise<void>;
     setActiveRoom: (roomId: string | null) => void;
     startCall: (peerId: string) => void;
     endCall: () => void;
+
+    // Chat Actions
+    createOrGetDm: (friendId: string) => Promise<void>;
+    fetchMessages: (roomId: string) => Promise<void>;
+    sendMessage: (roomId: string, content: string) => Promise<void>;
+    addMessage: (message: Message) => void;
 }
 
 export const useAppStore = create<AppState>()(
@@ -48,6 +55,7 @@ export const useAppStore = create<AppState>()(
             rooms: [],
             activeRoom: null,
             activeCall: null,
+            messages: [],
 
             // Auth actions
             login: async (email, password) => {
@@ -102,7 +110,7 @@ export const useAppStore = create<AppState>()(
             },
 
             logout: () => {
-                set({ token: null, user: null, isAuthenticated: false, friends: [], rooms: [] });
+                set({ token: null, user: null, isAuthenticated: false, friends: [], rooms: [], messages: [] });
             },
 
             // Social actions
@@ -166,6 +174,97 @@ export const useAppStore = create<AppState>()(
                     await fetchPendingRequests();
                 } catch (e) {
                     console.error('[Store] Accept exception:', e);
+                }
+            },
+
+            // Chat actions
+            createOrGetDm: async (friendId) => {
+                const { token } = get();
+                if (!token) return;
+
+                console.log(`[Store] Creating/Getting DM with friend: ${friendId}`);
+                try {
+                    const res = await fetch(`${API_URL}/chat/dm`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            Authorization: `Bearer ${token}`
+                        },
+                        body: JSON.stringify({ friend_id: friendId }),
+                    });
+
+                    if (res.ok) {
+                        const room = await res.json();
+                        console.log(`[Store] Got room:`, room);
+                        set({ activeRoom: room.id });
+                        // Fetch messages for this room
+                        await get().fetchMessages(room.id);
+                    } else {
+                        console.error('[Store] Failed to create DM:', await res.text());
+                    }
+                } catch (e) {
+                    console.error('[Store] createOrGetDm exception:', e);
+                }
+            },
+
+            fetchMessages: async (roomId) => {
+                const { token } = get();
+                if (!token) return;
+
+                console.log(`[Store] Fetching messages for room: ${roomId}`);
+                try {
+                    const res = await fetch(`${API_URL}/chat/${roomId}/messages`, {
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+
+                    if (res.ok) {
+                        const messages = await res.json();
+                        console.log(`[Store] Fetched ${messages.length} messages`);
+                        set({ messages });
+                    } else {
+                        console.error('[Store] Failed to fetch messages:', await res.text());
+                    }
+                } catch (e) {
+                    console.error('[Store] fetchMessages exception:', e);
+                }
+            },
+
+            sendMessage: async (roomId, content) => {
+                const { token } = get();
+                if (!token) return;
+
+                console.log(`[Store] Sending message to room ${roomId}: "${content}"`);
+                try {
+                    const res = await fetch(`${API_URL}/chat/${roomId}/messages`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            Authorization: `Bearer ${token}`
+                        },
+                        body: JSON.stringify({ content }),
+                    });
+
+                    if (res.ok) {
+                        const message = await res.json();
+                        console.log('[Store] Message sent, adding to list');
+                        get().addMessage(message);
+                    } else {
+                        console.error('[Store] Failed to send message:', await res.text());
+                    }
+                } catch (e) {
+                    console.error('[Store] sendMessage exception:', e);
+                }
+            },
+
+            addMessage: (message) => {
+                const { messages, activeRoom } = get();
+                console.log(`[Store] addMessage called for room ${message.room_id}, active room: ${activeRoom}`);
+                // Only add if it belongs to active room and not already there
+                if (activeRoom === message.room_id && !messages.find(m => m.id === message.id)) {
+                    console.log('[Store] Adding message to list');
+                    set({ messages: [...messages, message] });
+                } else {
+                    console.log('[Store] Message not added (wrong room or duplicate)');
                 }
             },
 

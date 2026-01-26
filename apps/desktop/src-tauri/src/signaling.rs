@@ -3,6 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use shared_proto::signaling::SignalingMessage;
+use tauri::Emitter;
 
 pub type WsSender = Arc<Mutex<Option<futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -10,7 +11,7 @@ pub type WsSender = Arc<Mutex<Option<futures_util::stream::SplitSink<
 >>>>;
 
 /// Connect to the signaling server
-pub async fn connect(server_url: &str, user_id: &str) -> Result<WsSender, String> {
+pub async fn connect(server_url: &str, user_id: &str, app_handle: tauri::AppHandle) -> Result<WsSender, String> {
     let url = url::Url::parse(server_url).map_err(|e| e.to_string())?;
     
     let (ws_stream, _) = connect_async(url)
@@ -36,7 +37,13 @@ pub async fn connect(server_url: &str, user_id: &str) -> Result<WsSender, String
             match msg {
                 Ok(Message::Text(text)) => {
                     println!("Received from server: {}", text);
-                    // TODO: Handle incoming signaling messages (Offer/Answer/Candidate)
+                    
+                    // Emit to frontend for chat messages
+                    if let Err(e) = app_handle.emit("ws-message", text.clone()) {
+                        eprintln!("Failed to emit ws-message event: {}", e);
+                    }
+                    
+                    // Also handle WebRTC signaling
                     if let Ok(signal) = serde_json::from_str::<SignalingMessage>(&text) {
                         match signal {
                             SignalingMessage::Offer { target_id: _, sdp } => {

@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Mic, Video, Settings, Hash, Send, UserPlus, Phone, LogOut, MicOff } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from './store';
 import { AuthScreen } from './components/AuthScreen';
 import { FriendsList, AddFriendModal } from './components/FriendsList';
@@ -15,18 +16,47 @@ function App() {
     const startCall = useAppStore((s) => s.startCall);
     const fetchFriends = useAppStore((s) => s.fetchFriends);
 
+    // Chat Store
+    const activeRoom = useAppStore((s) => s.activeRoom);
+    const messages = useAppStore((s) => s.messages);
+    const createOrGetDm = useAppStore((s) => s.createOrGetDm);
+    const sendMessage = useAppStore((s) => s.sendMessage);
+    const addMessage = useAppStore((s) => s.addMessage);
+
     const [activeView, setActiveView] = useState<'friends' | 'dm'>('friends');
     const [activeDM, setActiveDM] = useState<string | null>(null);
     const [msgInput, setMsgInput] = useState('');
     const [showAddFriend, setShowAddFriend] = useState(false);
     const [isMuted, setIsMuted] = useState(false);
-    const [messages, setMessages] = useState<Array<{ id: number; user: string; content: string; time: string }>>([]);
 
     useEffect(() => {
         if (isAuthenticated) {
             fetchFriends();
         }
     }, [isAuthenticated, fetchFriends]);
+
+    // WebSocket Listener
+    useEffect(() => {
+        if (!isAuthenticated) return;
+
+        console.log("Setting up WS listener");
+        const unlistenPromise = listen<string>('ws-message', (event) => {
+            console.log("WS Event received:", event);
+            try {
+                const payload = JSON.parse(event.payload);
+                if (payload.type === 'NEW_MESSAGE') {
+                    console.log('[App] New message received:', payload.message);
+                    addMessage(payload.message);
+                }
+            } catch (e) {
+                console.error('Failed to parse WS message:', e);
+            }
+        });
+
+        return () => {
+            unlistenPromise.then((unlisten) => unlisten());
+        };
+    }, [isAuthenticated, addMessage]);
 
     const handleJoinCall = async (friendId: string) => {
         startCall(friendId);
@@ -36,6 +66,28 @@ function App() {
         } catch (e) {
             console.error('Failed to start call:', e);
         }
+    };
+
+    const handleFriendClick = async (friendId: string) => {
+        setActiveDM(friendId);
+        setActiveView('dm');
+        await createOrGetDm(friendId);
+    };
+
+    const handleSendMessage = async () => {
+        if (!msgInput.trim() || !activeRoom) return;
+        try {
+            await sendMessage(activeRoom, msgInput);
+            setMsgInput('');
+        } catch (e) {
+            console.error('Failed to send messages:', e);
+        }
+    };
+
+    const getSenderName = (senderId: string) => {
+        if (senderId === user?.id) return 'Me';
+        const friend = friends.find(f => f.id === senderId);
+        return friend ? friend.username : 'Unknown';
     };
 
     if (!isAuthenticated) {
@@ -66,8 +118,8 @@ function App() {
                     <button
                         onClick={() => setActiveView('friends')}
                         className={`flex-1 py-3 text-sm font-medium transition ${activeView === 'friends'
-                                ? 'text-primary border-b-2 border-primary'
-                                : 'text-gray-400 hover:text-white'
+                            ? 'text-primary border-b-2 border-primary'
+                            : 'text-gray-400 hover:text-white'
                             }`}
                     >
                         Friends
@@ -75,8 +127,8 @@ function App() {
                     <button
                         onClick={() => setActiveView('dm')}
                         className={`flex-1 py-3 text-sm font-medium transition ${activeView === 'dm'
-                                ? 'text-primary border-b-2 border-primary'
-                                : 'text-gray-400 hover:text-white'
+                            ? 'text-primary border-b-2 border-primary'
+                            : 'text-gray-400 hover:text-white'
                             }`}
                     >
                         Messages
@@ -92,7 +144,7 @@ function App() {
                             {friends.map((friend) => (
                                 <button
                                     key={friend.id}
-                                    onClick={() => setActiveDM(friend.id)}
+                                    onClick={() => handleFriendClick(friend.id)}
                                     className={`w-full flex items-center gap-3 p-2 rounded-lg transition ${activeDM === friend.id ? 'bg-primary/20' : 'hover:bg-white/5'
                                         }`}
                                 >
@@ -170,8 +222,10 @@ function App() {
                                         <div className="w-10 h-10 rounded-full bg-gray-700 mt-1 flex-shrink-0" />
                                         <div className="ml-3">
                                             <div className="flex items-baseline">
-                                                <span className="font-medium text-gray-200">{msg.user}</span>
-                                                <span className="ml-2 text-xs text-gray-500">{msg.time}</span>
+                                                <span className="font-medium text-gray-200">{getSenderName(msg.sender_id)}</span>
+                                                <span className="ml-2 text-xs text-gray-500">
+                                                    {new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                                </span>
                                             </div>
                                             <p className="text-gray-300">{msg.content}</p>
                                         </div>
@@ -187,10 +241,18 @@ function App() {
                                     type="text"
                                     value={msgInput}
                                     onChange={(e) => setMsgInput(e.target.value)}
+                                    // onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter') {
+                                            handleSendMessage();
+                                        }
+                                    }}
                                     placeholder={`Message ${activeFriend.username}`}
                                     className="bg-transparent flex-1 px-3 py-2 outline-none text-sm"
                                 />
-                                <button className="p-2 text-primary hover:text-primary/80">
+                                <button
+                                    onClick={handleSendMessage}
+                                    className="p-2 text-primary hover:text-primary/80">
                                     <Send className="w-5 h-5" />
                                 </button>
                             </div>
@@ -224,23 +286,6 @@ function App() {
                                     {activeCall.isConnected ? 'Connected' : 'Connecting...'}
                                 </span>
                             </div>
-                            <div className="flex justify-between text-xs">
-                                <span className="text-gray-500">Ping</span>
-                                <span className="text-green-400">24ms</span>
-                            </div>
-                            <div className="flex justify-between text-xs">
-                                <span className="text-gray-500">Encryption</span>
-                                <span className="text-blue-400">E2EE Active</span>
-                            </div>
-                            {/* VU Meter */}
-                            <div className="mt-2">
-                                <div className="flex justify-between text-[10px] text-gray-500 mb-1">
-                                    <span>MIC LEVEL</span>
-                                </div>
-                                <div className="w-full h-1.5 bg-gray-700 rounded-full overflow-hidden">
-                                    <div className="h-full bg-gradient-to-r from-green-500 via-yellow-500 to-red-500 w-[60%] animate-pulse" />
-                                </div>
-                            </div>
                         </div>
                     </div>
                 )}
@@ -253,4 +298,3 @@ function App() {
 }
 
 export default App;
-

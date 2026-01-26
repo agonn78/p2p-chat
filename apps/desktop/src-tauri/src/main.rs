@@ -4,7 +4,7 @@
 mod config;
 mod signaling;
 
-use tauri::State;
+use tauri::{State, Manager};
 use media::MediaEngine;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -54,31 +54,43 @@ async fn send_answer(state: State<'_, AppState>, target_id: String, sdp: String)
 }
 
 fn main() {
-    let media_engine = MediaEngine::new();
     let user_id = Uuid::new_v4().to_string();
-    
-    // Create a runtime for async initialization
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-    
-    // Connect to signaling server
-    let ws_sender = rt.block_on(async {
-        match signaling::connect(config::SERVER_URL, &user_id).await {
-            Ok(sender) => sender,
-            Err(e) => {
-                eprintln!("Warning: Could not connect to signaling server: {}", e);
-                eprintln!("Server URL: {}", config::SERVER_URL);
-                Arc::new(Mutex::new(None))
-            }
-        }
-    });
+    let user_id_clone = user_id.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState {
-            media: Arc::new(std::sync::Mutex::new(media_engine)),
-            ws_sender,
-            user_id,
+        .setup(move |app| {
+            let app_handle = app.handle().clone();
+            let user_id_for_connect = user_id_clone.clone();
+            
+            // Connect to signaling server with AppHandle
+            tauri::async_runtime::spawn(async move {
+                match signaling::connect(config::SERVER_URL, &user_id_for_connect, app_handle.clone()).await {
+                    Ok(sender) => {
+                        // Store the sender in app state
+                        let state = AppState {
+                            media: Arc::new(std::sync::Mutex::new(MediaEngine::new())),
+                            ws_sender: sender,
+                            user_id: user_id_for_connect.clone(),
+                        };
+                        app_handle.manage(state);
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Could not connect to signaling server: {}", e);
+                        eprintln!("Server URL: {}", config::SERVER_URL);
+                        // Manage with empty sender
+                        let state = AppState {
+                            media: Arc::new(std::sync::Mutex::new(MediaEngine::new())),
+                            ws_sender: Arc::new(Mutex::new(None)),
+                            user_id: user_id_for_connect,
+                        };
+                        app_handle.manage(state);
+                    }
+                }
+            });
+            
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![join_call, get_user_id, send_offer, send_answer])
         .run(tauri::generate_context!())
