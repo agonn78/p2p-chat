@@ -5,6 +5,10 @@ import * as crypto from './crypto';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://192.168.0.52:3000';
 
+// Polling configuration
+const POLL_INTERVAL_MS = 5000;  // Poll every 5 seconds when WS is down
+const WS_RECONNECT_INTERVAL_MS = 10000;  // Try to reconnect WS every 10 seconds
+
 interface AppState {
     // Auth
     token: string | null;
@@ -23,9 +27,13 @@ interface AppState {
     // Rooms & Messages
     rooms: Room[];
     activeRoom: string | null;
-    activeFriendId: string | null; // Track which friend's DM is active
+    activeFriendId: string | null;
     messages: Message[];
     unreadCounts: Record<string, number>;
+
+    // Connection state
+    wsConnected: boolean;
+    lastMessageTimestamp: string | null;
 
     // Call
     activeCall: CallState | null;
@@ -49,11 +57,15 @@ interface AppState {
     addMessage: (message: Message) => void;
     markAsRead: (friendId: string) => void;
     getUnreadCount: (friendId: string) => number;
+    pollForNewMessages: () => Promise<void>;
 
     // E2EE Actions
     initializeKeys: () => Promise<void>;
     fetchFriendPublicKey: (friendId: string) => Promise<string | null>;
     decryptMessageContent: (message: Message) => string;
+
+    // Connection Actions
+    setWsConnected: (connected: boolean) => void;
 }
 
 export const useAppStore = create<AppState>()(
@@ -74,6 +86,14 @@ export const useAppStore = create<AppState>()(
             activeCall: null,
             messages: [],
             unreadCounts: {},
+            wsConnected: false,
+            lastMessageTimestamp: null,
+
+            // Connection Actions
+            setWsConnected: (connected) => {
+                set({ wsConnected: connected });
+                console.log(`[Store] WebSocket ${connected ? '🟢 connected' : '🔴 disconnected'}`);
+            },
 
             // Auth actions
             login: async (email, password) => {
@@ -153,6 +173,9 @@ export const useAppStore = create<AppState>()(
                     messages: [],
                     keyPair: null,
                     friendPublicKeys: {},
+                    activeRoom: null,
+                    activeFriendId: null,
+                    wsConnected: false,
                 });
             },
 
@@ -221,26 +244,41 @@ export const useAppStore = create<AppState>()(
             },
 
             decryptMessageContent: (message) => {
-                const { keyPair, activeFriendId, user } = get();
+                const { keyPair, user, friendPublicKeys, friends, activeFriendId, fetchFriendPublicKey } = get();
 
-                // If no encryption (legacy message or our own message)
-                if (!message.nonce || !keyPair || !activeFriendId) {
+                // If no encryption (legacy message)
+                if (!message.nonce || !keyPair) {
                     return message.content;
                 }
 
-                // Determine whose public key to use for decryption
-                // If we sent it, we encrypted with friend's public key
-                // If friend sent it, they encrypted with our public key
-                // In both cases, we use the shared secret (which is symmetric)
-                const friendPublicKey = get().friendPublicKeys[activeFriendId];
+                // Determine whose public key to use based on sender
+                // If I sent it, I need the friend's public key (use activeFriendId)
+                // If friend sent it, I need their public key (use sender_id)
+                let friendId: string | null = null;
+
+                if (message.sender_id === user?.id) {
+                    // I sent this message - use the active friend's key
+                    friendId = activeFriendId;
+                } else {
+                    // Friend sent this message - use sender's key
+                    friendId = message.sender_id || null;
+                }
+
+                if (!friendId) {
+                    console.warn('[Store] Cannot determine friend ID for decryption');
+                    return '[Encrypted]';
+                }
+
+                const friendPublicKey = friendPublicKeys[friendId];
                 if (!friendPublicKey) {
-                    console.warn('[Store] No public key for decryption');
-                    return message.content; // Fallback to raw content
+                    // Try to fetch the key asynchronously
+                    fetchFriendPublicKey(friendId);
+                    return '[Decrypting...]';
                 }
 
                 try {
                     const sharedSecret = crypto.getSharedSecret(
-                        activeFriendId,
+                        friendId,
                         keyPair.secretKey,
                         friendPublicKey
                     );
@@ -258,7 +296,7 @@ export const useAppStore = create<AppState>()(
                     console.error('[Store] Decryption failed:', e);
                 }
 
-                return '[Encrypted message]';
+                return '[Encrypted]';
             },
 
             // Social actions
@@ -271,6 +309,11 @@ export const useAppStore = create<AppState>()(
                 if (res.ok) {
                     const friends = await res.json();
                     set({ friends });
+
+                    // Pre-fetch public keys for all friends
+                    for (const friend of friends) {
+                        get().fetchFriendPublicKey(friend.id);
+                    }
                 }
             },
 
@@ -379,11 +422,44 @@ export const useAppStore = create<AppState>()(
                         const messages = await res.json();
                         console.log(`[Store] Fetched ${messages.length} messages`);
                         set({ messages });
+
+                        // Update last message timestamp for polling
+                        if (messages.length > 0) {
+                            const lastMsg = messages[messages.length - 1];
+                            set({ lastMessageTimestamp: lastMsg.created_at });
+                        }
                     } else {
                         console.error('[Store] Failed to fetch messages:', await res.text());
                     }
                 } catch (e) {
                     console.error('[Store] fetchMessages exception:', e);
+                }
+            },
+
+            // Polling fallback for new messages
+            pollForNewMessages: async () => {
+                const { token, activeRoom, messages, addMessage } = get();
+                if (!token || !activeRoom) return;
+
+                try {
+                    const res = await fetch(`${API_URL}/chat/${activeRoom}/messages`, {
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+
+                    if (res.ok) {
+                        const serverMessages: Message[] = await res.json();
+                        const currentIds = new Set(messages.map(m => m.id));
+
+                        // Add any new messages
+                        for (const msg of serverMessages) {
+                            if (!currentIds.has(msg.id)) {
+                                console.log('[Store] 📬 Polling found new message:', msg.id);
+                                addMessage(msg);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.error('[Store] pollForNewMessages exception:', e);
                 }
             },
 
@@ -443,7 +519,10 @@ export const useAppStore = create<AppState>()(
                 if (!messages.find(m => m.id === message.id)) {
                     if (activeRoom === message.room_id) {
                         console.log('[Store] Adding message to active conversation');
-                        set({ messages: [...messages, message] });
+                        set({
+                            messages: [...messages, message],
+                            lastMessageTimestamp: message.created_at
+                        });
                     } else {
                         console.log('[Store] Message for different room, incrementing unread');
 
@@ -510,3 +589,6 @@ export const useAppStore = create<AppState>()(
         }
     )
 );
+
+// Export polling interval for use in App.tsx
+export { POLL_INTERVAL_MS, WS_RECONNECT_INTERVAL_MS };

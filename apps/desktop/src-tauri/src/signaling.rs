@@ -10,6 +10,27 @@ pub type WsSender = Arc<Mutex<Option<futures_util::stream::SplitSink<
     Message
 >>>>;
 
+/// Track WebSocket connection state
+pub struct WsState {
+    pub connected: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl WsState {
+    pub fn new() -> Self {
+        Self {
+            connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+    
+    pub fn set_connected(&self, connected: bool) {
+        self.connected.store(connected, std::sync::atomic::Ordering::SeqCst);
+    }
+    
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// Connect to the signaling server (without identifying)
 pub async fn connect(server_url: &str, app_handle: tauri::AppHandle) -> Result<WsSender, String> {
     let url = url::Url::parse(server_url).map_err(|e| e.to_string())?;
@@ -25,16 +46,21 @@ pub async fn connect(server_url: &str, app_handle: tauri::AppHandle) -> Result<W
     let sender = Arc::new(Mutex::new(Some(write)));
     let sender_clone = sender.clone();
     
+    // Emit connected status
+    let _ = app_handle.emit("ws-status", true);
+    
     // Spawn task to handle incoming messages
+    let app_handle_clone = app_handle.clone();
     tokio::spawn(async move {
         println!("📡 WebSocket message handler started");
+        
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
                     println!("📨 [WS] Received from server: {}", text);
                     
                     // Emit to frontend for chat messages
-                    match app_handle.emit("ws-message", text.clone()) {
+                    match app_handle_clone.emit("ws-message", text.clone()) {
                         Ok(_) => println!("✅ [WS] Emitted 'ws-message' event to frontend"),
                         Err(e) => eprintln!("❌ [WS] Failed to emit ws-message event: {}", e),
                     }
@@ -55,18 +81,26 @@ pub async fn connect(server_url: &str, app_handle: tauri::AppHandle) -> Result<W
                         }
                     }
                 }
+                Ok(Message::Ping(data)) => {
+                    println!("🏓 Received ping, connection is alive");
+                    // Pong is handled automatically by tungstenite
+                }
                 Ok(Message::Close(_)) => {
                     println!("🔌 Server closed connection");
+                    let _ = app_handle_clone.emit("ws-status", false);
                     break;
                 }
                 Err(e) => {
                     eprintln!("❌ WebSocket error: {}", e);
+                    let _ = app_handle_clone.emit("ws-status", false);
                     break;
                 }
                 _ => {}
             }
         }
+        
         println!("📡 WebSocket message handler stopped");
+        let _ = app_handle_clone.emit("ws-status", false);
     });
     
     Ok(sender_clone)

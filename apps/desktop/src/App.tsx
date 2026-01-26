@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
-import { Mic, Video, Settings, Hash, Send, UserPlus, Phone, LogOut, MicOff, UserCircle, Calendar, Users } from 'lucide-react';
+import { Mic, Video, Settings, Hash, Send, UserPlus, Phone, LogOut, MicOff, UserCircle, Calendar, Wifi, WifiOff } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { useAppStore } from './store';
+import { useAppStore, POLL_INTERVAL_MS } from './store';
 import { AuthScreen } from './components/AuthScreen';
 import { AddFriendModal } from './components/FriendsList';
 
@@ -24,6 +24,11 @@ function App() {
     const addMessage = useAppStore((s) => s.addMessage);
     const getUnreadCount = useAppStore((s) => s.getUnreadCount);
     const decryptMessageContent = useAppStore((s) => s.decryptMessageContent);
+    const pollForNewMessages = useAppStore((s) => s.pollForNewMessages);
+
+    // Connection state
+    const wsConnected = useAppStore((s) => s.wsConnected);
+    const setWsConnected = useAppStore((s) => s.setWsConnected);
 
     const [activeDM, setActiveDM] = useState<string | null>(null);
     const [msgInput, setMsgInput] = useState('');
@@ -39,7 +44,7 @@ function App() {
         }
     }, [isAuthenticated, fetchFriends]);
 
-    // WebSocket Listener
+    // WebSocket Listener with connection tracking
     useEffect(() => {
         if (!isAuthenticated) {
             console.log('[App] Not authenticated, skipping WS listener setup');
@@ -47,48 +52,84 @@ function App() {
         }
 
         console.log('[App] 🔌 Setting up WebSocket listener...');
+        let lastMessageTime = Date.now();
 
         const setupListener = async () => {
             try {
                 const unlisten = await listen<string>('ws-message', (event) => {
-                    console.log('[App] 📨 WS Event received, raw payload:', event.payload);
+                    lastMessageTime = Date.now();
+
+                    // Mark WebSocket as connected when we receive messages
+                    if (!wsConnected) {
+                        setWsConnected(true);
+                    }
+
+                    console.log('[App] 📨 WS Event received');
                     try {
                         const payload = JSON.parse(event.payload);
-                        console.log('[App] 📦 Parsed payload:', payload);
 
                         if (payload.type === 'NEW_MESSAGE') {
-                            console.log('[App] ✉️ NEW_MESSAGE detected, calling addMessage with:', payload.message);
+                            console.log('[App] ✉️ NEW_MESSAGE via WebSocket');
                             addMessage(payload.message);
-                        } else {
-                            console.log('[App] ℹ️ Non-message payload type:', payload.type);
                         }
                     } catch (e) {
-                        console.error('[App] ❌ Failed to parse WS message:', e, 'Payload:', event.payload);
+                        console.error('[App] ❌ Failed to parse WS message:', e);
                     }
                 });
 
-                console.log('[App] ✅ WebSocket listener attached successfully');
+                // Also listen for WS connection status
+                const unlistenStatus = await listen<boolean>('ws-status', (event) => {
+                    console.log('[App] 📡 WS Status changed:', event.payload);
+                    setWsConnected(event.payload);
+                });
 
-                return unlisten;
+                console.log('[App] ✅ WebSocket listeners attached');
+                setWsConnected(true);
+
+                return () => {
+                    unlisten();
+                    unlistenStatus();
+                };
             } catch (error) {
                 console.error('[App] ❌ Failed to setup WS listener:', error);
+                setWsConnected(false);
                 return () => { };
             }
         };
 
-        let unlistenFn: (() => void) | null = null;
+        let cleanup: (() => void) | null = null;
 
         setupListener().then(fn => {
-            unlistenFn = fn;
+            cleanup = fn;
         });
 
         return () => {
             console.log('[App] 🔌 Cleaning up WebSocket listener');
-            if (unlistenFn) {
-                unlistenFn();
-            }
+            if (cleanup) cleanup();
         };
     }, [isAuthenticated]);
+
+    // Polling fallback - only active when WebSocket is disconnected OR as backup
+    useEffect(() => {
+        if (!isAuthenticated || !activeRoom) {
+            return;
+        }
+
+        console.log(`[App] 📊 Starting polling (interval: ${POLL_INTERVAL_MS}ms, WS: ${wsConnected ? 'connected' : 'disconnected'})`);
+
+        const pollInterval = setInterval(() => {
+            // Always poll as backup, but log differently
+            if (!wsConnected) {
+                console.log('[App] 📬 Polling for messages (WS disconnected)...');
+            }
+            pollForNewMessages();
+        }, POLL_INTERVAL_MS);
+
+        return () => {
+            console.log('[App] 📊 Stopping polling');
+            clearInterval(pollInterval);
+        };
+    }, [isAuthenticated, activeRoom, wsConnected, pollForNewMessages]);
 
     // Auto-scroll to bottom when messages change
     useEffect(() => {
@@ -143,13 +184,22 @@ function App() {
                     <h1 className="text-xl font-bold bg-gradient-to-r from-primary to-secondary bg-clip-text text-transparent">
                         P2P Nitro
                     </h1>
-                    <button
-                        onClick={() => setShowAddFriend(true)}
-                        className="p-2 hover:bg-white/10 rounded-lg transition"
-                        title="Add Friend"
-                    >
-                        <UserPlus className="w-5 h-5 text-gray-400" />
-                    </button>
+                    <div className="flex items-center gap-2">
+                        {/* Connection indicator */}
+                        <div
+                            className={`p-1.5 rounded ${wsConnected ? 'text-green-400' : 'text-yellow-400'}`}
+                            title={wsConnected ? 'Real-time connected' : 'Polling mode (5s)'}
+                        >
+                            {wsConnected ? <Wifi className="w-4 h-4" /> : <WifiOff className="w-4 h-4" />}
+                        </div>
+                        <button
+                            onClick={() => setShowAddFriend(true)}
+                            className="p-2 hover:bg-white/10 rounded-lg transition"
+                            title="Add Friend"
+                        >
+                            <UserPlus className="w-5 h-5 text-gray-400" />
+                        </button>
+                    </div>
                 </div>
 
                 {/* Friends List */}
@@ -236,27 +286,28 @@ function App() {
                                 </div>
                             ) : (
                                 <>
-                                    {messages.map((msg) => (
-                                        <div key={msg.id} className="flex group hover:bg-white/[0.02] -mx-4 px-4 py-1 transition">
-                                            <div className="w-10 h-10 rounded-full bg-gray-700 mt-1 flex-shrink-0" />
-                                            <div className="ml-3">
-                                                <div className="flex items-baseline">
-                                                    <span className="font-medium text-gray-200">{getSenderName(msg.sender_id)}</span>
-                                                    <span className="ml-2 text-xs text-gray-500">
-                                                        {new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                                                    </span>
-                                                    {msg.nonce && (
-                                                        <span className="ml-2 text-xs text-green-500" title="End-to-end encrypted">
-                                                            🔒
+                                    {messages.map((msg) => {
+                                        const displayContent = msg._decryptedContent || decryptMessageContent(msg);
+                                        return (
+                                            <div key={msg.id} className="flex group hover:bg-white/[0.02] -mx-4 px-4 py-1 transition">
+                                                <div className="w-10 h-10 rounded-full bg-gray-700 mt-1 flex-shrink-0" />
+                                                <div className="ml-3">
+                                                    <div className="flex items-baseline">
+                                                        <span className="font-medium text-gray-200">{getSenderName(msg.sender_id)}</span>
+                                                        <span className="ml-2 text-xs text-gray-500">
+                                                            {new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                                                         </span>
-                                                    )}
+                                                        {msg.nonce && (
+                                                            <span className="ml-2 text-xs text-green-500" title="End-to-end encrypted">
+                                                                🔒
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    <p className="text-gray-300">{displayContent}</p>
                                                 </div>
-                                                <p className="text-gray-300">
-                                                    {msg._decryptedContent || decryptMessageContent(msg)}
-                                                </p>
                                             </div>
-                                        </div>
-                                    ))}
+                                        );
+                                    })}
                                     <div ref={messagesEndRef} />
                                 </>
                             )}
@@ -381,10 +432,16 @@ function App() {
                             </div>
                         </div>
 
-                        {/* Placeholder for future features */}
+                        {/* E2EE Status */}
                         <div className="bg-black/20 rounded-lg p-4">
-                            <h3 className="text-sm font-bold text-gray-400 uppercase mb-3">Mutual Friends</h3>
-                            <p className="text-sm text-gray-500">Coming soon...</p>
+                            <h3 className="text-sm font-bold text-gray-400 uppercase mb-3">Security</h3>
+                            <div className="flex items-center gap-2 text-green-400 text-sm">
+                                <span>🔒</span>
+                                <span>End-to-end encrypted</span>
+                            </div>
+                            <p className="text-xs text-gray-500 mt-2">
+                                Messages are encrypted on your device. Only you and {activeFriend.username} can read them.
+                            </p>
                         </div>
                     </div>
 
