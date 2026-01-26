@@ -55,6 +55,10 @@ interface AppState {
     fetchMessages: (roomId: string) => Promise<void>;
     sendMessage: (roomId: string, content: string) => Promise<void>;
     addMessage: (message: Message) => void;
+    removeMessage: (messageId: string) => void;
+    deleteMessage: (messageId: string) => Promise<void>;
+    deleteAllMessages: () => Promise<void>;
+    clearMessages: () => void;
     markAsRead: (friendId: string) => void;
     getUnreadCount: (friendId: string) => number;
     pollForNewMessages: () => Promise<void>;
@@ -558,6 +562,62 @@ export const useAppStore = create<AppState>()(
 
             getUnreadCount: (friendId) => {
                 return get().unreadCounts[friendId] || 0;
+            },
+
+            // Delete actions
+            removeMessage: (messageId) => {
+                const { messages } = get();
+                set({ messages: messages.filter(m => m.id !== messageId) });
+                console.log(`[Store] Removed message ${messageId} from view`);
+            },
+
+            deleteMessage: async (messageId) => {
+                const { token, activeRoom, messages } = get();
+                if (!token || !activeRoom) return;
+
+                console.log(`[Store] 🗑️ Deleting message ${messageId}`);
+                try {
+                    const res = await fetch(`${API_URL}/chat/${activeRoom}/messages/${messageId}`, {
+                        method: 'DELETE',
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+
+                    if (res.ok) {
+                        set({ messages: messages.filter(m => m.id !== messageId) });
+                        console.log('[Store] Message deleted successfully');
+                    } else {
+                        console.error('[Store] Failed to delete message:', await res.text());
+                    }
+                } catch (e) {
+                    console.error('[Store] deleteMessage exception:', e);
+                }
+            },
+
+            deleteAllMessages: async () => {
+                const { token, activeRoom } = get();
+                if (!token || !activeRoom) return;
+
+                console.log(`[Store] 🗑️ Deleting ALL messages in room ${activeRoom}`);
+                try {
+                    const res = await fetch(`${API_URL}/chat/${activeRoom}/messages`, {
+                        method: 'DELETE',
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+
+                    if (res.ok) {
+                        set({ messages: [] });
+                        console.log('[Store] All messages deleted successfully');
+                    } else {
+                        console.error('[Store] Failed to delete all messages:', await res.text());
+                    }
+                } catch (e) {
+                    console.error('[Store] deleteAllMessages exception:', e);
+                }
+            },
+
+            clearMessages: () => {
+                set({ messages: [] });
+                console.log('[Store] Cleared messages from view (local only)');
             },
 
             // Room actions

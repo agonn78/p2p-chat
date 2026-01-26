@@ -1,7 +1,8 @@
 use axum::{
     extract::{Path, State},
-    routing::{get, post},
+    routing::{get, post, delete},
     Json, Router,
+    http::StatusCode,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -14,7 +15,8 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/dm", post(create_or_get_dm))
-        .route("/:room_id/messages", get(get_messages).post(send_message))
+        .route("/:room_id/messages", get(get_messages).post(send_message).delete(delete_all_messages))
+        .route("/:room_id/messages/:message_id", delete(delete_message))
 }
 
 #[derive(Deserialize)]
@@ -96,11 +98,11 @@ async fn get_messages(
     .await? > 0;
 
     if !is_member {
-        return Err(AuthError::InvalidToken); // Or forbidden
+        return Err(AuthError::InvalidToken);
     }
 
     let messages = sqlx::query_as::<_, Message>(
-        "SELECT * FROM messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT 50"
+        "SELECT * FROM messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT 100"
     )
     .bind(room_id)
     .fetch_all(&state.db)
@@ -168,3 +170,113 @@ async fn send_message(
     Ok(Json(message))
 }
 
+/// Delete a single message (own messages only)
+async fn delete_message(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((room_id, message_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AuthError> {
+    // Verify membership
+    let is_member = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM room_members WHERE room_id = $1 AND user_id = $2"
+    )
+    .bind(room_id)
+    .bind(user.id)
+    .fetch_one(&state.db)
+    .await? > 0;
+
+    if !is_member {
+        return Err(AuthError::InvalidToken);
+    }
+
+    // Delete only if user is the sender
+    let result = sqlx::query(
+        "DELETE FROM messages WHERE id = $1 AND room_id = $2 AND sender_id = $3"
+    )
+    .bind(message_id)
+    .bind(room_id)
+    .bind(user.id)
+    .execute(&state.db)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        println!("⚠️ Delete failed: message not found or not owned by user");
+        return Err(AuthError::InvalidToken);
+    }
+
+    println!("🗑️ Message {} deleted by user {}", message_id, user.id);
+
+    // Broadcast deletion via WebSocket
+    let members = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM room_members WHERE room_id = $1"
+    )
+    .bind(room_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let ws_payload = serde_json::json!({
+        "type": "MESSAGE_DELETED",
+        "message_id": message_id,
+        "room_id": room_id
+    });
+    let ws_text = serde_json::to_string(&ws_payload).unwrap();
+    
+    for member_id in members {
+        if let Some(peer_tx) = state.peers.get(&member_id.to_string()) {
+            let _ = peer_tx.send(WsMessage::Text(ws_text.clone()));
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Delete all messages in a room (for /deleteall command)
+async fn delete_all_messages(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(room_id): Path<Uuid>,
+) -> Result<StatusCode, AuthError> {
+    // Verify membership
+    let is_member = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM room_members WHERE room_id = $1 AND user_id = $2"
+    )
+    .bind(room_id)
+    .bind(user.id)
+    .fetch_one(&state.db)
+    .await? > 0;
+
+    if !is_member {
+        return Err(AuthError::InvalidToken);
+    }
+
+    // Delete all messages in the room
+    let result = sqlx::query("DELETE FROM messages WHERE room_id = $1")
+        .bind(room_id)
+        .execute(&state.db)
+        .await?;
+
+    println!("🗑️ Deleted {} messages from room {} (by user {})", 
+             result.rows_affected(), room_id, user.id);
+
+    // Broadcast deletion via WebSocket
+    let members = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM room_members WHERE room_id = $1"
+    )
+    .bind(room_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let ws_payload = serde_json::json!({
+        "type": "ALL_MESSAGES_DELETED",
+        "room_id": room_id
+    });
+    let ws_text = serde_json::to_string(&ws_payload).unwrap();
+    
+    for member_id in members {
+        if let Some(peer_tx) = state.peers.get(&member_id.to_string()) {
+            let _ = peer_tx.send(WsMessage::Text(ws_text.clone()));
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}

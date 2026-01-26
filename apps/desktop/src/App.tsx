@@ -1,10 +1,22 @@
 import { useState, useEffect, useRef } from 'react';
-import { Mic, Video, Settings, Hash, Send, UserPlus, Phone, LogOut, MicOff, UserCircle, Calendar, Wifi, WifiOff } from 'lucide-react';
+import { Mic, Video, Settings, Hash, Send, UserPlus, Phone, LogOut, MicOff, UserCircle, Calendar, Wifi, WifiOff, Trash2, Copy, Pencil } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore, POLL_INTERVAL_MS } from './store';
 import { AuthScreen } from './components/AuthScreen';
 import { AddFriendModal } from './components/FriendsList';
+import { MessageContent } from './components/MessageContent';
+
+// Slash commands
+const SLASH_COMMANDS: Record<string, { description: string; replacement?: string }> = {
+    '/shrug': { description: 'Sends ¯\\_(ツ)_/¯', replacement: '¯\\_(ツ)_/¯' },
+    '/tableflip': { description: 'Sends (╯°□°)╯︵ ┻━┻', replacement: '(╯°□°)╯︵ ┻━┻' },
+    '/unflip': { description: 'Sends ┬─┬ノ( º _ ºノ)', replacement: '┬─┬ノ( º _ ºノ)' },
+    '/lenny': { description: 'Sends ( ͡° ͜ʖ ͡°)', replacement: '( ͡° ͜ʖ ͡°)' },
+    '/disapprove': { description: 'Sends ಠ_ಠ', replacement: 'ಠ_ಠ' },
+    '/clear': { description: 'Clear local chat view' },
+    '/deleteall': { description: 'Delete entire conversation (server)' },
+};
 
 function App() {
     const isAuthenticated = useAppStore((s) => s.isAuthenticated);
@@ -22,6 +34,10 @@ function App() {
     const createOrGetDm = useAppStore((s) => s.createOrGetDm);
     const sendMessage = useAppStore((s) => s.sendMessage);
     const addMessage = useAppStore((s) => s.addMessage);
+    const removeMessage = useAppStore((s) => s.removeMessage);
+    const deleteMessage = useAppStore((s) => s.deleteMessage);
+    const deleteAllMessages = useAppStore((s) => s.deleteAllMessages);
+    const clearMessages = useAppStore((s) => s.clearMessages);
     const getUnreadCount = useAppStore((s) => s.getUnreadCount);
     const decryptMessageContent = useAppStore((s) => s.decryptMessageContent);
     const pollForNewMessages = useAppStore((s) => s.pollForNewMessages);
@@ -34,6 +50,8 @@ function App() {
     const [msgInput, setMsgInput] = useState('');
     const [showAddFriend, setShowAddFriend] = useState(false);
     const [isMuted, setIsMuted] = useState(false);
+    const [hoveredMessageId, setHoveredMessageId] = useState<string | null>(null);
+    const [showCommandHint, setShowCommandHint] = useState(false);
 
     // Ref for auto-scrolling to bottom
     const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -52,13 +70,10 @@ function App() {
         }
 
         console.log('[App] 🔌 Setting up WebSocket listener...');
-        let lastMessageTime = Date.now();
 
         const setupListener = async () => {
             try {
                 const unlisten = await listen<string>('ws-message', (event) => {
-                    lastMessageTime = Date.now();
-
                     // Mark WebSocket as connected when we receive messages
                     if (!wsConnected) {
                         setWsConnected(true);
@@ -71,6 +86,14 @@ function App() {
                         if (payload.type === 'NEW_MESSAGE') {
                             console.log('[App] ✉️ NEW_MESSAGE via WebSocket');
                             addMessage(payload.message);
+                        } else if (payload.type === 'MESSAGE_DELETED') {
+                            console.log('[App] 🗑️ MESSAGE_DELETED via WebSocket');
+                            removeMessage(payload.message_id);
+                        } else if (payload.type === 'ALL_MESSAGES_DELETED') {
+                            console.log('[App] 🗑️ ALL_MESSAGES_DELETED via WebSocket');
+                            if (payload.room_id === activeRoom) {
+                                clearMessages();
+                            }
                         }
                     } catch (e) {
                         console.error('[App] ❌ Failed to parse WS message:', e);
@@ -107,18 +130,17 @@ function App() {
             console.log('[App] 🔌 Cleaning up WebSocket listener');
             if (cleanup) cleanup();
         };
-    }, [isAuthenticated]);
+    }, [isAuthenticated, activeRoom]);
 
-    // Polling fallback - only active when WebSocket is disconnected OR as backup
+    // Polling fallback
     useEffect(() => {
         if (!isAuthenticated || !activeRoom) {
             return;
         }
 
-        console.log(`[App] 📊 Starting polling (interval: ${POLL_INTERVAL_MS}ms, WS: ${wsConnected ? 'connected' : 'disconnected'})`);
+        console.log(`[App] 📊 Starting polling (interval: ${POLL_INTERVAL_MS}ms)`);
 
         const pollInterval = setInterval(() => {
-            // Always poll as backup, but log differently
             if (!wsConnected) {
                 console.log('[App] 📬 Polling for messages (WS disconnected)...');
             }
@@ -138,6 +160,11 @@ function App() {
         }
     }, [messages]);
 
+    // Command hint visibility
+    useEffect(() => {
+        setShowCommandHint(msgInput.startsWith('/') && msgInput.length > 1);
+    }, [msgInput]);
+
     const handleJoinCall = async (friendId: string) => {
         startCall(friendId);
         try {
@@ -155,12 +182,53 @@ function App() {
 
     const handleSendMessage = async () => {
         if (!msgInput.trim() || !activeRoom) return;
+
+        const input = msgInput.trim();
+
+        // Handle slash commands
+        if (input.startsWith('/')) {
+            const command = input.split(' ')[0].toLowerCase();
+
+            if (command === '/clear') {
+                clearMessages();
+                setMsgInput('');
+                return;
+            }
+
+            if (command === '/deleteall') {
+                if (confirm('Delete ALL messages in this conversation? This cannot be undone.')) {
+                    await deleteAllMessages();
+                }
+                setMsgInput('');
+                return;
+            }
+
+            // Text replacement commands
+            const cmd = SLASH_COMMANDS[command];
+            if (cmd?.replacement) {
+                await sendMessage(activeRoom, cmd.replacement);
+                setMsgInput('');
+                return;
+            }
+        }
+
+        // Normal message
         try {
-            await sendMessage(activeRoom, msgInput);
+            await sendMessage(activeRoom, input);
             setMsgInput('');
         } catch (e) {
-            console.error('Failed to send messages:', e);
+            console.error('Failed to send message:', e);
         }
+    };
+
+    const handleDeleteMessage = async (messageId: string) => {
+        if (confirm('Delete this message?')) {
+            await deleteMessage(messageId);
+        }
+    };
+
+    const handleCopyMessage = (content: string) => {
+        navigator.clipboard.writeText(content);
     };
 
     const getSenderName = (senderId: string | undefined) => {
@@ -168,6 +236,14 @@ function App() {
         if (senderId === user?.id) return 'Me';
         const friend = friends.find(f => f.id === senderId);
         return friend ? friend.username : 'Unknown';
+    };
+
+    // Get matching commands for hint
+    const getMatchingCommands = () => {
+        if (!msgInput.startsWith('/')) return [];
+        return Object.entries(SLASH_COMMANDS)
+            .filter(([cmd]) => cmd.startsWith(msgInput.toLowerCase()))
+            .slice(0, 5);
     };
 
     if (!isAuthenticated) {
@@ -185,7 +261,6 @@ function App() {
                         P2P Nitro
                     </h1>
                     <div className="flex items-center gap-2">
-                        {/* Connection indicator */}
                         <div
                             className={`p-1.5 rounded ${wsConnected ? 'text-green-400' : 'text-yellow-400'}`}
                             title={wsConnected ? 'Real-time connected' : 'Polling mode (5s)'}
@@ -214,19 +289,16 @@ function App() {
                                 className={`w-full flex items-center gap-3 p-3 rounded-lg transition relative ${isActive ? 'bg-primary/20 border border-primary/30' : 'hover:bg-white/5'
                                     }`}
                             >
-                                {/* Avatar with online indicator */}
                                 <div className="relative flex-shrink-0">
                                     <div className="w-12 h-12 rounded-full bg-gradient-to-br from-primary to-secondary" />
                                     <div className="absolute bottom-0 right-0 w-3.5 h-3.5 bg-green-500 rounded-full border-2 border-surface" />
                                 </div>
 
-                                {/* Username */}
                                 <div className="flex-1 text-left">
                                     <div className="font-medium text-sm">{friend.username}</div>
                                     <div className="text-xs text-gray-400">Online</div>
                                 </div>
 
-                                {/* Unread badge */}
                                 {unreadCount > 0 && (
                                     <div className="bg-red-500 text-white text-xs font-bold rounded-full min-w-[20px] h-5 flex items-center justify-center px-1.5">
                                         {unreadCount > 99 ? '99+' : unreadCount}
@@ -275,7 +347,7 @@ function App() {
                         </div>
 
                         {/* Messages */}
-                        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                        <div className="flex-1 overflow-y-auto p-4 space-y-2">
                             {messages.length === 0 ? (
                                 <div className="flex flex-col items-center justify-center h-full text-gray-500">
                                     <div className="w-24 h-24 rounded-full bg-gradient-to-br from-primary/20 to-secondary/20 flex items-center justify-center mb-4">
@@ -283,28 +355,63 @@ function App() {
                                     </div>
                                     <p className="text-lg font-medium">Start the conversation!</p>
                                     <p className="text-sm">Send a message to {activeFriend.username}</p>
+                                    <p className="text-xs text-gray-600 mt-4">💡 Try /shrug, /tableflip, or **bold text**</p>
                                 </div>
                             ) : (
                                 <>
                                     {messages.map((msg) => {
                                         const displayContent = msg._decryptedContent || decryptMessageContent(msg);
+                                        const isOwn = msg.sender_id === user?.id;
+                                        const isHovered = hoveredMessageId === msg.id;
+
                                         return (
-                                            <div key={msg.id} className="flex group hover:bg-white/[0.02] -mx-4 px-4 py-1 transition">
+                                            <div
+                                                key={msg.id}
+                                                className="flex group hover:bg-white/[0.02] -mx-4 px-4 py-1.5 transition relative"
+                                                onMouseEnter={() => setHoveredMessageId(msg.id)}
+                                                onMouseLeave={() => setHoveredMessageId(null)}
+                                            >
                                                 <div className="w-10 h-10 rounded-full bg-gray-700 mt-1 flex-shrink-0" />
-                                                <div className="ml-3">
-                                                    <div className="flex items-baseline">
-                                                        <span className="font-medium text-gray-200">{getSenderName(msg.sender_id)}</span>
-                                                        <span className="ml-2 text-xs text-gray-500">
+                                                <div className="ml-3 flex-1 min-w-0">
+                                                    <div className="flex items-baseline gap-2">
+                                                        <span className={`font-medium ${isOwn ? 'text-primary' : 'text-gray-200'}`}>
+                                                            {getSenderName(msg.sender_id)}
+                                                        </span>
+                                                        <span className="text-xs text-gray-500">
                                                             {new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                                                         </span>
                                                         {msg.nonce && (
-                                                            <span className="ml-2 text-xs text-green-500" title="End-to-end encrypted">
+                                                            <span className="text-xs text-green-500" title="End-to-end encrypted">
                                                                 🔒
                                                             </span>
                                                         )}
                                                     </div>
-                                                    <p className="text-gray-300">{displayContent}</p>
+                                                    <div className="text-gray-300">
+                                                        <MessageContent content={displayContent} isEncrypted={!!msg.nonce} />
+                                                    </div>
                                                 </div>
+
+                                                {/* Action buttons on hover */}
+                                                {isHovered && (
+                                                    <div className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center gap-1 bg-surface/90 backdrop-blur-sm rounded-lg p-1 border border-white/10">
+                                                        <button
+                                                            onClick={() => handleCopyMessage(displayContent)}
+                                                            className="p-1.5 hover:bg-white/10 rounded text-gray-400 hover:text-white transition"
+                                                            title="Copy message"
+                                                        >
+                                                            <Copy className="w-4 h-4" />
+                                                        </button>
+                                                        {isOwn && (
+                                                            <button
+                                                                onClick={() => handleDeleteMessage(msg.id)}
+                                                                className="p-1.5 hover:bg-red-500/20 rounded text-gray-400 hover:text-red-400 transition"
+                                                                title="Delete message"
+                                                            >
+                                                                <Trash2 className="w-4 h-4" />
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                )}
                                             </div>
                                         );
                                     })}
@@ -312,6 +419,22 @@ function App() {
                                 </>
                             )}
                         </div>
+
+                        {/* Command hints */}
+                        {showCommandHint && getMatchingCommands().length > 0 && (
+                            <div className="mx-4 mb-2 bg-surface rounded-lg border border-white/10 overflow-hidden">
+                                {getMatchingCommands().map(([cmd, info]) => (
+                                    <button
+                                        key={cmd}
+                                        onClick={() => setMsgInput(cmd)}
+                                        className="w-full flex items-center justify-between px-4 py-2 hover:bg-white/5 transition text-left"
+                                    >
+                                        <span className="text-primary font-mono">{cmd}</span>
+                                        <span className="text-gray-500 text-sm">{info.description}</span>
+                                    </button>
+                                ))}
+                            </div>
+                        )}
 
                         {/* Input */}
                         <div className="p-4 pt-2 flex-shrink-0 border-t border-white/5">
@@ -326,7 +449,7 @@ function App() {
                                             handleSendMessage();
                                         }
                                     }}
-                                    placeholder={`Message ${activeFriend.username}`}
+                                    placeholder={`Message ${activeFriend.username} • Markdown supported`}
                                     className="bg-transparent flex-1 px-3 py-2 outline-none text-sm"
                                 />
                                 <button
@@ -378,7 +501,6 @@ function App() {
             {/* Right Sidebar - Friend Info Panel */}
             {activeFriend && (
                 <div className="w-80 bg-surface border-l border-white/5 flex flex-col animate-slide-in">
-                    {/* Friend Profile Header */}
                     <div className="p-6 border-b border-white/5">
                         <div className="flex flex-col items-center text-center">
                             <div className="w-24 h-24 rounded-full bg-gradient-to-br from-primary to-secondary mb-4 relative">
@@ -392,7 +514,6 @@ function App() {
                         </div>
                     </div>
 
-                    {/* Action Buttons */}
                     <div className="p-4 border-b border-white/5 space-y-2">
                         <button
                             onClick={() => handleJoinCall(activeFriend.id)}
@@ -407,9 +528,7 @@ function App() {
                         </button>
                     </div>
 
-                    {/* Friend Info */}
                     <div className="flex-1 overflow-y-auto p-4 space-y-4">
-                        {/* About Section */}
                         <div className="bg-black/20 rounded-lg p-4">
                             <h3 className="text-sm font-bold text-gray-400 uppercase mb-3">About</h3>
                             <div className="space-y-3">
@@ -432,7 +551,6 @@ function App() {
                             </div>
                         </div>
 
-                        {/* E2EE Status */}
                         <div className="bg-black/20 rounded-lg p-4">
                             <h3 className="text-sm font-bold text-gray-400 uppercase mb-3">Security</h3>
                             <div className="flex items-center gap-2 text-green-400 text-sm">
@@ -443,9 +561,26 @@ function App() {
                                 Messages are encrypted on your device. Only you and {activeFriend.username} can read them.
                             </p>
                         </div>
+
+                        <div className="bg-black/20 rounded-lg p-4">
+                            <h3 className="text-sm font-bold text-gray-400 uppercase mb-3">Quick Commands</h3>
+                            <div className="space-y-2 text-xs">
+                                <div className="flex justify-between">
+                                    <span className="text-primary font-mono">/clear</span>
+                                    <span className="text-gray-500">Clear local view</span>
+                                </div>
+                                <div className="flex justify-between">
+                                    <span className="text-primary font-mono">/deleteall</span>
+                                    <span className="text-gray-500">Delete all messages</span>
+                                </div>
+                                <div className="flex justify-between">
+                                    <span className="text-primary font-mono">/shrug</span>
+                                    <span className="text-gray-500">¯\_(ツ)_/¯</span>
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
-                    {/* Settings at bottom */}
                     <div className="p-4 border-t border-white/5">
                         <button className="w-full flex items-center justify-center gap-2 px-4 py-2 hover:bg-white/5 rounded-lg transition text-gray-400">
                             <Settings className="w-4 h-4" />
@@ -455,7 +590,6 @@ function App() {
                 </div>
             )}
 
-            {/* Add Friend Modal */}
             <AddFriendModal isOpen={showAddFriend} onClose={() => setShowAddFriend(false)} />
         </div>
     );

@@ -16,6 +16,8 @@
         "lucide-react": "^0.300.0",
         "react": "^18.2.0",
         "react-dom": "^18.2.0",
+        "react-markdown": "^10.1.0",
+        "remark-gfm": "^4.0.1",
         "tailwind-merge": "^2.2.0",
         "tweetnacl": "^1.0.3",
         "tweetnacl-util": "^0.15.1",
