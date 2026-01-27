@@ -29,7 +29,6 @@ CREATE TABLE server_members (
 
 -- Add channel_id to messages for server channel messages
 ALTER TABLE messages ADD COLUMN channel_id UUID REFERENCES channels(id) ON DELETE CASCADE;
-ALTER TABLE messages ALTER COLUMN room_id DROP NOT NULL;
 
 -- Indexes
 CREATE INDEX idx_servers_owner ON servers(owner_id);
