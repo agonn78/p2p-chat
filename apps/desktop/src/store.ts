@@ -3,7 +3,7 @@ import { persist } from 'zustand/middleware';
 import type { User, Friend, Room, CallState, Message, Server, Channel, ServerMember, ChannelMessage } from './types';
 import * as crypto from './crypto';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://192.168.0.52:3000';
+const API_URL = import.meta.env.VITE_API_URL || 'http://live.ewanhomelab.fr';
 
 // Polling configuration
 const POLL_INTERVAL_MS = 5000;  // Poll every 5 seconds when WS is down

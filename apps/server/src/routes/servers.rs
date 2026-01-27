@@ -14,12 +14,12 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_servers).post(create_server))
-        .route("/{id}", get(get_server))
-        .route("/{id}/members", get(get_members))
-        .route("/{id}/channels", post(create_channel))
-        .route("/{id}/channels/{channel_id}/messages", get(get_channel_messages).post(send_channel_message))
-        .route("/join/{code}", post(join_server))
-        .route("/{id}/leave", post(leave_server))
+        .route("/:id", get(get_server))
+        .route("/:id/members", get(get_members))
+        .route("/:id/channels", post(create_channel))
+        .route("/:id/channels/:channel_id/messages", get(get_channel_messages).post(send_channel_message))
+        .route("/join/:code", post(join_server))
+        .route("/:id/leave", post(leave_server))
 }
 
 // Generate random invite code using UUID
