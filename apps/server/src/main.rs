@@ -147,6 +147,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     });
 
     let mut my_id: Option<String> = None;
+    let mut my_username: Option<String> = None;
 
     while let Some(Ok(msg)) = receiver.next().await {
         if let Message::Text(text) = msg {
@@ -158,26 +159,147 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         state.peers.insert(user_id.clone(), tx.clone());
                         let peer_count = state.peers.len();
                         println!("📊 Current connected peers: {} total", peer_count);
+                        
+                        // Fetch username from DB for call notifications
+                        if let Ok(row) = sqlx::query_scalar::<_, String>(
+                            "SELECT username FROM users WHERE id = $1::uuid"
+                        )
+                        .bind(&user_id)
+                        .fetch_optional(&state.db)
+                        .await {
+                            my_username = row;
+                        }
+                        
                         my_id = Some(user_id);
                     }
+                    
+                    // === WebRTC Signaling (forward to target) ===
                     SignalingMessage::Offer { target_id, sdp: _ } |
                     SignalingMessage::Answer { target_id, sdp: _ } |
                     SignalingMessage::Candidate { target_id, .. } => {
-                        // Route to target
                         if let Some(peer_tx) = state.peers.get(&target_id) {
-                            // Forward the original text message to preserve format
                             let _ = peer_tx.send(Message::Text(text));
                         } else {
                             tracing::warn!("Target peer {} not found", target_id);
                         }
                     }
+                    
+                    // === Call Signaling ===
+                    
+                    SignalingMessage::CallInitiate { target_id, public_key } => {
+                        let caller_id = my_id.clone().unwrap_or_default();
+                        let caller_name = my_username.clone().unwrap_or_else(|| "Unknown".to_string());
+                        
+                        // Check if target is online
+                        if let Some(peer_tx) = state.peers.get(&target_id) {
+                            // Check if target is busy
+                            if state.is_in_call(&target_id) {
+                                // Send busy signal back to caller
+                                if let Some(caller_tx) = state.peers.get(&caller_id) {
+                                    let busy = SignalingMessage::CallBusy { caller_id: target_id.clone() };
+                                    let msg = serde_json::to_string(&busy).unwrap();
+                                    let _ = caller_tx.send(Message::Text(msg));
+                                }
+                            } else {
+                                // Forward as IncomingCall to target
+                                let incoming = SignalingMessage::IncomingCall {
+                                    caller_id,
+                                    caller_name,
+                                    public_key,
+                                };
+                                let msg = serde_json::to_string(&incoming).unwrap();
+                                let _ = peer_tx.send(Message::Text(msg));
+                                tracing::info!("📞 Call initiated to {}", target_id);
+                            }
+                        } else {
+                            tracing::warn!("Target {} not online for call", target_id);
+                            // Could send a "user offline" response here
+                        }
+                    }
+                    
+                    SignalingMessage::CallAccept { caller_id, public_key } => {
+                        let callee_id = my_id.clone().unwrap_or_default();
+                        
+                        // Start tracking the call
+                        state.start_call(&caller_id, &callee_id);
+                        
+                        // Forward CallAccepted to caller
+                        if let Some(caller_tx) = state.peers.get(&caller_id) {
+                            let accepted = SignalingMessage::CallAccepted {
+                                target_id: callee_id,
+                                public_key,
+                            };
+                            let msg = serde_json::to_string(&accepted).unwrap();
+                            let _ = caller_tx.send(Message::Text(msg));
+                            tracing::info!("✅ Call accepted, notifying caller {}", caller_id);
+                        }
+                    }
+                    
+                    SignalingMessage::CallDecline { caller_id } => {
+                        // Forward CallDeclined to caller
+                        if let Some(caller_tx) = state.peers.get(&caller_id) {
+                            let declined = SignalingMessage::CallDeclined {
+                                target_id: my_id.clone().unwrap_or_default(),
+                            };
+                            let msg = serde_json::to_string(&declined).unwrap();
+                            let _ = caller_tx.send(Message::Text(msg));
+                            tracing::info!("❌ Call declined to {}", caller_id);
+                        }
+                    }
+                    
+                    SignalingMessage::CallEnd { peer_id } => {
+                        let user_id = my_id.clone().unwrap_or_default();
+                        
+                        // End the call tracking
+                        state.end_call(&user_id);
+                        
+                        // Notify peer
+                        if let Some(peer_tx) = state.peers.get(&peer_id) {
+                            let ended = SignalingMessage::CallEnded {
+                                peer_id: user_id,
+                            };
+                            let msg = serde_json::to_string(&ended).unwrap();
+                            let _ = peer_tx.send(Message::Text(msg));
+                            tracing::info!("📴 Call ended with {}", peer_id);
+                        }
+                    }
+                    
+                    SignalingMessage::CallCancel { target_id } => {
+                        // Forward CallCancelled to target (callee)
+                        if let Some(peer_tx) = state.peers.get(&target_id) {
+                            let cancelled = SignalingMessage::CallCancelled {
+                                caller_id: my_id.clone().unwrap_or_default(),
+                            };
+                            let msg = serde_json::to_string(&cancelled).unwrap();
+                            let _ = peer_tx.send(Message::Text(msg));
+                            tracing::info!("🚫 Call cancelled to {}", target_id);
+                        }
+                    }
+                    
+                    // These are server->client only, ignore if received
+                    SignalingMessage::IncomingCall { .. } |
+                    SignalingMessage::CallAccepted { .. } |
+                    SignalingMessage::CallDeclined { .. } |
+                    SignalingMessage::CallEnded { .. } |
+                    SignalingMessage::CallBusy { .. } |
+                    SignalingMessage::CallCancelled { .. } => {}
                 }
             }
         }
     }
 
-    // Cleanup
+    // Cleanup on disconnect
     if let Some(id) = my_id {
+        // If user was in a call, notify peer
+        if let Some(peer_id) = state.end_call(&id) {
+            if let Some(peer_tx) = state.peers.get(&peer_id) {
+                let ended = SignalingMessage::CallEnded { peer_id: id.clone() };
+                let msg = serde_json::to_string(&ended).unwrap();
+                let _ = peer_tx.send(Message::Text(msg));
+                tracing::info!("📴 User {} disconnected, ended call with {}", id, peer_id);
+            }
+        }
+        
         state.peers.remove(&id);
         tracing::info!("User disconnected: {}", id);
     }

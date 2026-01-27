@@ -56,6 +56,42 @@ pub async fn connect(server_url: &str, app_handle: tauri::AppHandle) -> Result<W
                             SignalingMessage::Candidate { target_id: _, candidate, .. } => {
                                 println!("🎯 Received ICE Candidate: {}", candidate);
                             }
+                            
+                            // === Call Events ===
+                            SignalingMessage::IncomingCall { caller_id, caller_name, public_key } => {
+                                println!("📞 Incoming call from {} ({})", caller_name, caller_id);
+                                let payload = serde_json::json!({
+                                    "callerId": caller_id,
+                                    "callerName": caller_name,
+                                    "publicKey": public_key,
+                                });
+                                let _ = app_handle_clone.emit("incoming-call", payload);
+                            }
+                            SignalingMessage::CallAccepted { target_id, public_key } => {
+                                println!("✅ Call accepted by {}", target_id);
+                                let payload = serde_json::json!({
+                                    "peerId": target_id,
+                                    "publicKey": public_key,
+                                });
+                                let _ = app_handle_clone.emit("call-accepted", payload);
+                            }
+                            SignalingMessage::CallDeclined { target_id } => {
+                                println!("❌ Call declined by {}", target_id);
+                                let _ = app_handle_clone.emit("call-declined", target_id);
+                            }
+                            SignalingMessage::CallEnded { peer_id } => {
+                                println!("📴 Call ended by {}", peer_id);
+                                let _ = app_handle_clone.emit("call-ended", peer_id);
+                            }
+                            SignalingMessage::CallBusy { caller_id: busy_user } => {
+                                println!("📳 User {} is busy", busy_user);
+                                let _ = app_handle_clone.emit("call-busy", busy_user);
+                            }
+                            SignalingMessage::CallCancelled { caller_id } => {
+                                println!("🚫 Call cancelled by {}", caller_id);
+                                let _ = app_handle_clone.emit("call-cancelled", caller_id);
+                            }
+                            
                             _ => {}
                         }
                     }

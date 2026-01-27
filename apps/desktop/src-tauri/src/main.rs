@@ -9,6 +9,7 @@ use media::MediaEngine;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use signaling::WsSender;
+use shared_proto::signaling::SignalingMessage;
 
 struct AppState {
     media: Arc<std::sync::Mutex<MediaEngine>>,
@@ -43,13 +44,104 @@ async fn identify_user(state: State<'_, AppState>, user_id: String) -> Result<()
 
 #[tauri::command]
 async fn send_offer(state: State<'_, AppState>, target_id: String, sdp: String) -> Result<(), String> {
-    let msg = shared_proto::signaling::SignalingMessage::Offer { target_id, sdp };
+    let msg = SignalingMessage::Offer { target_id, sdp };
     signaling::send_signal(&state.ws_sender, msg).await
 }
 
 #[tauri::command]
 async fn send_answer(state: State<'_, AppState>, target_id: String, sdp: String) -> Result<(), String> {
-    let msg = shared_proto::signaling::SignalingMessage::Answer { target_id, sdp };
+    let msg = SignalingMessage::Answer { target_id, sdp };
+    signaling::send_signal(&state.ws_sender, msg).await
+}
+
+// === Call Commands ===
+
+/// Start a call to a friend - generates keypair and sends CallInitiate
+#[tauri::command]
+async fn start_call(state: State<'_, AppState>, target_id: String) -> Result<String, String> {
+    println!("📞 Starting call to {}", target_id);
+    
+    // Generate keypair for E2EE
+    let public_key = {
+        let mut engine = state.media.lock().map_err(|e| e.to_string())?;
+        engine.generate_keypair().map_err(|e| e.to_string())?
+    };
+    
+    // Send call initiate signal
+    let msg = SignalingMessage::CallInitiate { 
+        target_id: target_id.clone(), 
+        public_key: public_key.clone(),
+    };
+    signaling::send_signal(&state.ws_sender, msg).await?;
+    
+    Ok(public_key)
+}
+
+/// Accept incoming call - generates keypair, completes key exchange
+#[tauri::command]
+async fn accept_call(
+    state: State<'_, AppState>, 
+    caller_id: String,
+    caller_public_key: String,
+) -> Result<String, String> {
+    println!("✅ Accepting call from {}", caller_id);
+    
+    // Generate our keypair and complete key exchange
+    let public_key = {
+        let mut engine = state.media.lock().map_err(|e| e.to_string())?;
+        let pk = engine.generate_keypair().map_err(|e| e.to_string())?;
+        engine.complete_key_exchange(&caller_public_key).map_err(|e| e.to_string())?;
+        pk
+    };
+    
+    // Send accept signal with our public key
+    let msg = SignalingMessage::CallAccept { 
+        caller_id, 
+        public_key: public_key.clone(),
+    };
+    signaling::send_signal(&state.ws_sender, msg).await?;
+    
+    Ok(public_key)
+}
+
+/// Complete key exchange after call is accepted (caller side)
+#[tauri::command]
+async fn complete_call_handshake(
+    state: State<'_, AppState>,
+    peer_public_key: String,
+) -> Result<(), String> {
+    println!("🔐 Completing E2EE handshake");
+    
+    let mut engine = state.media.lock().map_err(|e| e.to_string())?;
+    engine.complete_key_exchange(&peer_public_key).map_err(|e| e.to_string())?;
+    
+    Ok(())
+}
+
+/// Decline incoming call
+#[tauri::command]
+async fn decline_call(state: State<'_, AppState>, caller_id: String) -> Result<(), String> {
+    println!("❌ Declining call from {}", caller_id);
+    
+    let msg = SignalingMessage::CallDecline { caller_id };
+    signaling::send_signal(&state.ws_sender, msg).await
+}
+
+/// End active call
+#[tauri::command]
+async fn end_call(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
+    println!("📴 Ending call with {}", peer_id);
+    
+    let msg = SignalingMessage::CallEnd { peer_id };
+    signaling::send_signal(&state.ws_sender, msg).await
+}
+
+/// Cancel outgoing call before answer
+#[tauri::command]
+async fn cancel_call(state: State<'_, AppState>, target_id: String) -> Result<(), String> {
+    println!("🚫 Cancelling call to {}", target_id);
+    
+    let msg = SignalingMessage::CallCancel { target_id };
     signaling::send_signal(&state.ws_sender, msg).await
 }
 
@@ -87,7 +179,19 @@ fn main() {
             
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![join_call, send_offer, send_answer, identify_user])
+        .invoke_handler(tauri::generate_handler![
+            join_call, 
+            send_offer, 
+            send_answer, 
+            identify_user,
+            start_call,
+            accept_call,
+            complete_call_handshake,
+            decline_call,
+            end_call,
+            cancel_call,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+

@@ -30,12 +30,28 @@ export interface Message {
     _decryptedContent?: string;  // Client-side only - cached decrypted content
 }
 
+// === Voice Call Types ===
+
+export type CallStatus = 'idle' | 'calling' | 'ringing' | 'connecting' | 'connected' | 'ended';
+
 export interface CallState {
-    roomId: string;
-    peerId: string;
-    isConnected: boolean;
+    status: CallStatus;
+    peerId: string | null;
+    peerName: string | null;
+    peerPublicKey: string | null;
     isMuted: boolean;
-    isVideoEnabled: boolean;
+    startTime: number | null;
+}
+
+export interface IncomingCallPayload {
+    callerId: string;
+    callerName: string;
+    publicKey: string;
+}
+
+export interface CallAcceptedPayload {
+    peerId: string;
+    publicKey: string;
 }
 
 // Server types
@@ -74,3 +90,4 @@ export interface ChannelMessage {
     created_at: string;
     _decryptedContent?: string;
 }
+

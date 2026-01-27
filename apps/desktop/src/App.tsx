@@ -9,6 +9,9 @@ import { MessageContent } from './components/MessageContent';
 import { ServerSidebar } from './components/ServerSidebar';
 import { ChannelList } from './components/ChannelList';
 import { MemberList } from './components/MemberList';
+import { IncomingCallModal } from './components/IncomingCallModal';
+import { CallOverlay } from './components/CallOverlay';
+import type { IncomingCallPayload, CallAcceptedPayload } from './types';
 
 // Slash commands
 const SLASH_COMMANDS: Record<string, { description: string; replacement?: string }> = {
@@ -52,6 +55,9 @@ function App() {
     const getUnreadCount = useAppStore((s) => s.getUnreadCount);
     const decryptMessageContent = useAppStore((s) => s.decryptMessageContent);
     const pollForNewMessages = useAppStore((s) => s.pollForNewMessages);
+
+    // Call Store
+    const handleIncomingCall = useAppStore((s) => s.handleIncomingCall);
 
     // Connection state
     const wsConnected = useAppStore((s) => s.wsConnected);
@@ -143,6 +149,73 @@ function App() {
             if (cleanup) cleanup();
         };
     }, [isAuthenticated, activeRoom]);
+
+    // Call event listeners
+    useEffect(() => {
+        if (!isAuthenticated) return;
+
+        const setupCallListeners = async () => {
+            const unlistenIncoming = await listen<IncomingCallPayload>('incoming-call', (event) => {
+                console.log('[App] 📞 Incoming call event:', event.payload);
+                handleIncomingCall(event.payload);
+            });
+
+            const unlistenAccepted = await listen<CallAcceptedPayload>('call-accepted', async (event) => {
+                console.log('[App] ✅ Call accepted event:', event.payload);
+                // Complete E2EE handshake on caller side
+                try {
+                    await invoke('complete_call_handshake', { peerPublicKey: event.payload.publicKey });
+                    useAppStore.setState((state) => ({
+                        activeCall: state.activeCall ? {
+                            ...state.activeCall,
+                            status: 'connected',
+                            startTime: Date.now(),
+                        } : null,
+                    }));
+                } catch (e) {
+                    console.error('[App] E2EE handshake failed:', e);
+                    endCall();
+                }
+            });
+
+            const unlistenDeclined = await listen<string>('call-declined', () => {
+                console.log('[App] ❌ Call declined');
+                useAppStore.setState({ activeCall: null });
+            });
+
+            const unlistenEnded = await listen<string>('call-ended', () => {
+                console.log('[App] 📴 Call ended by peer');
+                useAppStore.setState({ activeCall: null });
+            });
+
+            const unlistenBusy = await listen<string>('call-busy', () => {
+                console.log('[App] 📳 Target is busy');
+                // TODO: Show toast notification
+                useAppStore.setState({ activeCall: null });
+            });
+
+            const unlistenCancelled = await listen<string>('call-cancelled', () => {
+                console.log('[App] 🚫 Call cancelled by caller');
+                useAppStore.setState({ activeCall: null });
+            });
+
+            return () => {
+                unlistenIncoming();
+                unlistenAccepted();
+                unlistenDeclined();
+                unlistenEnded();
+                unlistenBusy();
+                unlistenCancelled();
+            };
+        };
+
+        let cleanup: (() => void) | null = null;
+        setupCallListeners().then(fn => { cleanup = fn; });
+
+        return () => {
+            if (cleanup) cleanup();
+        };
+    }, [isAuthenticated, handleIncomingCall, endCall]);
 
     // Polling fallback
     useEffect(() => {
@@ -266,6 +339,10 @@ function App() {
 
     return (
         <div className="flex h-screen w-full bg-background text-white overflow-hidden font-sans">
+            {/* Call UI Components */}
+            <IncomingCallModal />
+            <CallOverlay />
+
             {/* Far Left - Server Sidebar */}
             <ServerSidebar />
 
@@ -537,8 +614,8 @@ function App() {
                                 <div className="space-y-3">
                                     <div className="flex justify-between text-xs">
                                         <span className="text-gray-500">Status</span>
-                                        <span className={activeCall.isConnected ? 'text-green-400' : 'text-yellow-400'}>
-                                            {activeCall.isConnected ? 'Connected' : 'Connecting...'}
+                                        <span className={activeCall.status === 'connected' ? 'text-green-400' : 'text-yellow-400'}>
+                                            {activeCall.status === 'connected' ? 'Connected' : activeCall.status === 'calling' ? 'Calling...' : 'Connecting...'}
                                         </span>
                                     </div>
                                 </div>

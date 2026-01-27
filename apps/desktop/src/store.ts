@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { User, Friend, Room, CallState, Message, Server, Channel, ServerMember, ChannelMessage } from './types';
+import { invoke } from '@tauri-apps/api/core';
+import type { User, Friend, Room, CallState, Message, Server, Channel, ServerMember, ChannelMessage, IncomingCallPayload, CallAcceptedPayload } from './types';
 import * as crypto from './crypto';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://live.ewanhomelab.fr';
@@ -55,8 +56,12 @@ interface AppState {
     sendFriendRequest: (username: string) => Promise<void>;
     acceptFriend: (friendId: string) => Promise<void>;
     setActiveRoom: (roomId: string | null) => void;
-    startCall: (peerId: string) => void;
-    endCall: () => void;
+    startCall: (peerId: string) => Promise<void>;
+    endCall: () => Promise<void>;
+    handleIncomingCall: (payload: IncomingCallPayload) => void;
+    acceptIncomingCall: () => Promise<void>;
+    declineIncomingCall: () => Promise<void>;
+    cancelOutgoingCall: () => Promise<void>;
 
     // Chat Actions
     createOrGetDm: (friendId: string) => Promise<void>;
@@ -653,19 +658,111 @@ export const useAppStore = create<AppState>()(
             setActiveRoom: (roomId) => set({ activeRoom: roomId }),
 
             // Call actions
-            startCall: (peerId) => {
+            startCall: async (peerId) => {
+                const { friends } = get();
+                const friend = friends.find(f => f.id === peerId);
+
                 set({
                     activeCall: {
-                        roomId: peerId,
+                        status: 'calling',
                         peerId,
-                        isConnected: false,
+                        peerName: friend?.username || 'Unknown',
+                        peerPublicKey: null,
                         isMuted: false,
-                        isVideoEnabled: false,
+                        startTime: null,
+                    },
+                });
+
+                try {
+                    await invoke('start_call', { targetId: peerId });
+                    console.log('[Call] Initiated call to', peerId);
+                } catch (e) {
+                    console.error('[Call] Failed to start call:', e);
+                    set({ activeCall: null });
+                }
+            },
+
+            endCall: async () => {
+                const { activeCall } = get();
+                if (activeCall?.peerId) {
+                    try {
+                        await invoke('end_call', { peerId: activeCall.peerId });
+                    } catch (e) {
+                        console.error('[Call] Failed to end call:', e);
+                    }
+                }
+                set({ activeCall: null });
+            },
+
+            handleIncomingCall: (payload) => {
+                console.log('[Call] Incoming call from', payload.callerName);
+                set({
+                    activeCall: {
+                        status: 'ringing',
+                        peerId: payload.callerId,
+                        peerName: payload.callerName,
+                        peerPublicKey: payload.publicKey,
+                        isMuted: false,
+                        startTime: null,
                     },
                 });
             },
 
-            endCall: () => set({ activeCall: null }),
+            acceptIncomingCall: async () => {
+                const { activeCall } = get();
+                if (!activeCall || activeCall.status !== 'ringing') return;
+
+                set({
+                    activeCall: {
+                        ...activeCall,
+                        status: 'connecting',
+                    },
+                });
+
+                try {
+                    await invoke('accept_call', {
+                        callerId: activeCall.peerId,
+                        callerPublicKey: activeCall.peerPublicKey,
+                    });
+
+                    // E2EE established on callee side, now connected
+                    set({
+                        activeCall: {
+                            ...activeCall,
+                            status: 'connected',
+                            startTime: Date.now(),
+                        },
+                    });
+                    console.log('[Call] Accepted call, E2EE established');
+                } catch (e) {
+                    console.error('[Call] Failed to accept call:', e);
+                    set({ activeCall: null });
+                }
+            },
+
+            declineIncomingCall: async () => {
+                const { activeCall } = get();
+                if (!activeCall) return;
+
+                try {
+                    await invoke('decline_call', { callerId: activeCall.peerId });
+                } catch (e) {
+                    console.error('[Call] Failed to decline call:', e);
+                }
+                set({ activeCall: null });
+            },
+
+            cancelOutgoingCall: async () => {
+                const { activeCall } = get();
+                if (!activeCall || activeCall.status !== 'calling') return;
+
+                try {
+                    await invoke('cancel_call', { targetId: activeCall.peerId });
+                } catch (e) {
+                    console.error('[Call] Failed to cancel call:', e);
+                }
+                set({ activeCall: null });
+            },
 
             // Server Actions
             fetchServers: async () => {
@@ -764,6 +861,12 @@ export const useAppStore = create<AppState>()(
                         const data = await res.json();
                         set({ channels: data.channels });
                         console.log(`[Store] Fetched ${data.channels.length} channels`);
+
+                        // Auto-select first text channel
+                        const firstTextChannel = data.channels.find((c: any) => c.channel_type === 'text');
+                        if (firstTextChannel) {
+                            get().setActiveChannel(firstTextChannel.id);
+                        }
                     }
                 } catch (e) {
                     console.error('[Store] fetchChannels error:', e);

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Hash, Volume2, Plus, Settings, ChevronDown } from 'lucide-react';
+import { Hash, Volume2, Plus, Settings, ChevronDown, Mic, MicOff, LogOut } from 'lucide-react';
 import { useAppStore } from '../store';
 import type { Channel } from '../types';
 
@@ -102,6 +102,9 @@ export function ChannelList() {
     const currentServer = servers.find((s) => s.id === activeServer);
     const isOwner = currentServer?.owner_id === user?.id;
 
+    const logout = useAppStore((s) => s.logout);
+    const [isMuted, setIsMuted] = useState(false);
+
     const textChannels = channels.filter((c) => c.channel_type === 'text');
     const voiceChannels = channels.filter((c) => c.channel_type === 'voice');
 
@@ -115,7 +118,7 @@ export function ChannelList() {
 
     return (
         <>
-            <div className="w-60 bg-surface flex flex-col border-r border-white/5">
+            <div className="w-72 bg-surface flex flex-col border-r border-white/5">
                 {/* Server Header */}
                 <div className="h-14 px-4 flex items-center justify-between border-b border-white/5 hover:bg-white/5 cursor-pointer">
                     <h2 className="font-bold truncate">{currentServer.name}</h2>
@@ -172,6 +175,34 @@ export function ChannelList() {
                         </div>
                     )}
                 </div>
+
+                {/* User Status Footer */}
+                <div className="p-3 bg-black/20 backdrop-blur-md border-t border-white/5">
+                    <div className="flex items-center justify-between">
+                        <div className="flex items-center">
+                            <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-primary to-secondary" />
+                            <div className="ml-2">
+                                <div className="text-sm font-medium">{user?.username}</div>
+                                <div className="text-xs text-green-400">Online</div>
+                            </div>
+                        </div>
+                        <div className="flex space-x-1">
+                            <button
+                                onClick={() => setIsMuted(!isMuted)}
+                                className={`p-1.5 rounded ${isMuted ? 'bg-red-500/20 text-red-400' : 'hover:bg-white/10'}`}
+                                title={isMuted ? 'Unmute' : 'Mute'}
+                            >
+                                {isMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+                            </button>
+                            <button className="p-1.5 hover:bg-white/10 rounded text-gray-400" title="Settings">
+                                <Settings className="w-4 h-4" />
+                            </button>
+                            <button onClick={logout} className="p-1.5 hover:bg-white/10 rounded text-gray-400" title="Logout">
+                                <LogOut className="w-4 h-4" />
+                            </button>
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <CreateChannelModal
@@ -196,8 +227,8 @@ function ChannelButton({
         <button
             onClick={onClick}
             className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-sm transition ${isActive
-                    ? 'bg-white/10 text-white'
-                    : 'text-gray-400 hover:text-white hover:bg-white/5'
+                ? 'bg-white/10 text-white'
+                : 'text-gray-400 hover:text-white hover:bg-white/5'
                 }`}
         >
             {channel.channel_type === 'text' ? (

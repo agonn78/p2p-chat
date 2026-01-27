@@ -43,6 +43,69 @@ pub mod signaling {
         Identify {
             user_id: String,
         },
+        
+        // === Call Signaling ===
+        
+        /// Initiate a call to a target user
+        #[serde(rename = "call_initiate")]
+        CallInitiate {
+            target_id: String,
+            public_key: String,
+        },
+        /// Incoming call notification (server -> callee)
+        #[serde(rename = "incoming_call")]
+        IncomingCall {
+            caller_id: String,
+            caller_name: String,
+            public_key: String,
+        },
+        /// Accept an incoming call
+        #[serde(rename = "call_accept")]
+        CallAccept {
+            caller_id: String,
+            public_key: String,
+        },
+        /// Call was accepted (server -> caller)
+        #[serde(rename = "call_accepted")]
+        CallAccepted {
+            target_id: String,
+            public_key: String,
+        },
+        /// Decline an incoming call
+        #[serde(rename = "call_decline")]
+        CallDecline {
+            caller_id: String,
+        },
+        /// Call was declined (server -> caller)
+        #[serde(rename = "call_declined")]
+        CallDeclined {
+            target_id: String,
+        },
+        /// End an active call
+        #[serde(rename = "call_end")]
+        CallEnd {
+            peer_id: String,
+        },
+        /// Call ended notification
+        #[serde(rename = "call_ended")]
+        CallEnded {
+            peer_id: String,
+        },
+        /// Target user is busy (in another call)
+        #[serde(rename = "call_busy")]
+        CallBusy {
+            caller_id: String,
+        },
+        /// Cancel outgoing call before answer
+        #[serde(rename = "call_cancel")]
+        CallCancel {
+            target_id: String,
+        },
+        /// Call was cancelled (server -> callee)
+        #[serde(rename = "call_cancelled")]
+        CallCancelled {
+            caller_id: String,
+        },
     }
 }
 
