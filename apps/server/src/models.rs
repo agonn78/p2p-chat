@@ -61,3 +61,50 @@ pub struct Message {
     pub nonce: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Server {
+    pub id: Uuid,
+    pub name: String,
+    pub icon_url: Option<String>,
+    pub owner_id: Uuid,
+    pub invite_code: String,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Channel {
+    pub id: Uuid,
+    pub server_id: Uuid,
+    pub name: String,
+    pub channel_type: String,
+    pub position: Option<i32>,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ServerMember {
+    pub server_id: Uuid,
+    pub user_id: Uuid,
+    pub role: String,
+    pub joined_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ServerMemberWithUser {
+    pub user_id: Uuid,
+    pub username: String,
+    pub avatar_url: Option<String>,
+    pub role: String,
+    pub last_seen: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ChannelMessage {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    pub sender_id: Option<Uuid>,
+    pub content: String,
+    pub nonce: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+}

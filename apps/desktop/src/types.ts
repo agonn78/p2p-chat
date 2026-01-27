@@ -37,3 +37,40 @@ export interface CallState {
     isMuted: boolean;
     isVideoEnabled: boolean;
 }
+
+// Server types
+export interface Server {
+    id: string;
+    name: string;
+    icon_url: string | null;
+    owner_id: string;
+    invite_code: string;
+    created_at: string;
+}
+
+export interface Channel {
+    id: string;
+    server_id: string;
+    name: string;
+    channel_type: 'text' | 'voice';
+    position: number;
+    created_at: string;
+}
+
+export interface ServerMember {
+    user_id: string;
+    username: string;
+    avatar_url: string | null;
+    role: 'owner' | 'admin' | 'member';
+    last_seen: string | null;
+}
+
+export interface ChannelMessage {
+    id: string;
+    channel_id: string;
+    sender_id?: string;
+    content: string;
+    nonce?: string | null;
+    created_at: string;
+    _decryptedContent?: string;
+}

@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { User, Friend, Room, CallState, Message } from './types';
+import type { User, Friend, Room, CallState, Message, Server, Channel, ServerMember, ChannelMessage } from './types';
 import * as crypto from './crypto';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://192.168.0.52:3000';
@@ -38,6 +38,14 @@ interface AppState {
     // Call
     activeCall: CallState | null;
 
+    // Servers
+    servers: Server[];
+    activeServer: string | null;
+    channels: Channel[];
+    activeChannel: string | null;
+    serverMembers: ServerMember[];
+    channelMessages: ChannelMessage[];
+
     // Actions
     login: (email: string, password: string) => Promise<void>;
     register: (username: string, email: string, password: string) => Promise<void>;
@@ -70,6 +78,19 @@ interface AppState {
 
     // Connection Actions
     setWsConnected: (connected: boolean) => void;
+
+    // Server Actions
+    fetchServers: () => Promise<void>;
+    createServer: (name: string, iconUrl?: string) => Promise<void>;
+    joinServer: (inviteCode: string) => Promise<void>;
+    leaveServer: (serverId: string) => Promise<void>;
+    setActiveServer: (serverId: string | null) => void;
+    fetchChannels: (serverId: string) => Promise<void>;
+    createChannel: (serverId: string, name: string, type?: 'text' | 'voice') => Promise<void>;
+    setActiveChannel: (channelId: string | null) => void;
+    fetchServerMembers: (serverId: string) => Promise<void>;
+    fetchChannelMessages: (serverId: string, channelId: string) => Promise<void>;
+    sendChannelMessage: (serverId: string, channelId: string, content: string) => Promise<void>;
 }
 
 export const useAppStore = create<AppState>()(
@@ -92,6 +113,14 @@ export const useAppStore = create<AppState>()(
             unreadCounts: {},
             wsConnected: false,
             lastMessageTimestamp: null,
+
+            // Server state
+            servers: [],
+            activeServer: null,
+            channels: [],
+            activeChannel: null,
+            serverMembers: [],
+            channelMessages: [],
 
             // Connection Actions
             setWsConnected: (connected) => {
@@ -637,6 +666,194 @@ export const useAppStore = create<AppState>()(
             },
 
             endCall: () => set({ activeCall: null }),
+
+            // Server Actions
+            fetchServers: async () => {
+                const { token } = get();
+                if (!token) return;
+                try {
+                    const res = await fetch(`${API_URL}/servers`, {
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+                    if (res.ok) {
+                        const servers = await res.json();
+                        set({ servers });
+                        console.log(`[Store] Fetched ${servers.length} servers`);
+                    }
+                } catch (e) {
+                    console.error('[Store] fetchServers error:', e);
+                }
+            },
+
+            createServer: async (name, iconUrl) => {
+                const { token, fetchServers } = get();
+                if (!token) return;
+                try {
+                    const res = await fetch(`${API_URL}/servers`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            Authorization: `Bearer ${token}`,
+                        },
+                        body: JSON.stringify({ name, icon_url: iconUrl }),
+                    });
+                    if (res.ok) {
+                        console.log('[Store] Server created');
+                        await fetchServers();
+                    }
+                } catch (e) {
+                    console.error('[Store] createServer error:', e);
+                }
+            },
+
+            joinServer: async (inviteCode) => {
+                const { token, fetchServers } = get();
+                if (!token) return;
+                try {
+                    const res = await fetch(`${API_URL}/servers/join/${inviteCode}`, {
+                        method: 'POST',
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+                    if (res.ok) {
+                        console.log('[Store] Joined server');
+                        await fetchServers();
+                    } else {
+                        console.error('[Store] Failed to join server:', await res.text());
+                    }
+                } catch (e) {
+                    console.error('[Store] joinServer error:', e);
+                }
+            },
+
+            leaveServer: async (serverId) => {
+                const { token, fetchServers, activeServer } = get();
+                if (!token) return;
+                try {
+                    const res = await fetch(`${API_URL}/servers/${serverId}/leave`, {
+                        method: 'POST',
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+                    if (res.ok) {
+                        console.log('[Store] Left server');
+                        if (activeServer === serverId) {
+                            set({ activeServer: null, channels: [], activeChannel: null, serverMembers: [], channelMessages: [] });
+                        }
+                        await fetchServers();
+                    }
+                } catch (e) {
+                    console.error('[Store] leaveServer error:', e);
+                }
+            },
+
+            setActiveServer: (serverId) => {
+                set({ activeServer: serverId, activeChannel: null, channels: [], serverMembers: [], channelMessages: [] });
+                if (serverId) {
+                    get().fetchChannels(serverId);
+                    get().fetchServerMembers(serverId);
+                }
+            },
+
+            fetchChannels: async (serverId) => {
+                const { token } = get();
+                if (!token) return;
+                try {
+                    const res = await fetch(`${API_URL}/servers/${serverId}`, {
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+                    if (res.ok) {
+                        const data = await res.json();
+                        set({ channels: data.channels });
+                        console.log(`[Store] Fetched ${data.channels.length} channels`);
+                    }
+                } catch (e) {
+                    console.error('[Store] fetchChannels error:', e);
+                }
+            },
+
+            createChannel: async (serverId, name, type = 'text') => {
+                const { token, fetchChannels } = get();
+                if (!token) return;
+                try {
+                    const res = await fetch(`${API_URL}/servers/${serverId}/channels`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            Authorization: `Bearer ${token}`,
+                        },
+                        body: JSON.stringify({ name, channel_type: type }),
+                    });
+                    if (res.ok) {
+                        console.log('[Store] Channel created');
+                        await fetchChannels(serverId);
+                    }
+                } catch (e) {
+                    console.error('[Store] createChannel error:', e);
+                }
+            },
+
+            setActiveChannel: (channelId) => {
+                const { activeServer } = get();
+                set({ activeChannel: channelId, channelMessages: [] });
+                if (channelId && activeServer) {
+                    get().fetchChannelMessages(activeServer, channelId);
+                }
+            },
+
+            fetchServerMembers: async (serverId) => {
+                const { token } = get();
+                if (!token) return;
+                try {
+                    const res = await fetch(`${API_URL}/servers/${serverId}/members`, {
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+                    if (res.ok) {
+                        const members = await res.json();
+                        set({ serverMembers: members });
+                        console.log(`[Store] Fetched ${members.length} members`);
+                    }
+                } catch (e) {
+                    console.error('[Store] fetchServerMembers error:', e);
+                }
+            },
+
+            fetchChannelMessages: async (serverId, channelId) => {
+                const { token } = get();
+                if (!token) return;
+                try {
+                    const res = await fetch(`${API_URL}/servers/${serverId}/channels/${channelId}/messages`, {
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+                    if (res.ok) {
+                        const messages = await res.json();
+                        set({ channelMessages: messages });
+                        console.log(`[Store] Fetched ${messages.length} channel messages`);
+                    }
+                } catch (e) {
+                    console.error('[Store] fetchChannelMessages error:', e);
+                }
+            },
+
+            sendChannelMessage: async (serverId, channelId, content) => {
+                const { token, channelMessages } = get();
+                if (!token) return;
+                try {
+                    const res = await fetch(`${API_URL}/servers/${serverId}/channels/${channelId}/messages`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            Authorization: `Bearer ${token}`,
+                        },
+                        body: JSON.stringify({ content }),
+                    });
+                    if (res.ok) {
+                        const message = await res.json();
+                        set({ channelMessages: [...channelMessages, message] });
+                        console.log('[Store] Channel message sent');
+                    }
+                } catch (e) {
+                    console.error('[Store] sendChannelMessage error:', e);
+                }
+            },
         }),
         {
             name: 'p2p-nitro-store',

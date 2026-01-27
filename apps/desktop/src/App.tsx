@@ -6,6 +6,9 @@ import { useAppStore, POLL_INTERVAL_MS } from './store';
 import { AuthScreen } from './components/AuthScreen';
 import { AddFriendModal } from './components/FriendsList';
 import { MessageContent } from './components/MessageContent';
+import { ServerSidebar } from './components/ServerSidebar';
+import { ChannelList } from './components/ChannelList';
+import { MemberList } from './components/MemberList';
 
 // Slash commands
 const SLASH_COMMANDS: Record<string, { description: string; replacement?: string }> = {
@@ -27,6 +30,14 @@ function App() {
     const friends = useAppStore((s) => s.friends);
     const startCall = useAppStore((s) => s.startCall);
     const fetchFriends = useAppStore((s) => s.fetchFriends);
+
+    // Server Store
+    const fetchServers = useAppStore((s) => s.fetchServers);
+    const activeServer = useAppStore((s) => s.activeServer);
+    const channels = useAppStore((s) => s.channels);
+    const activeChannel = useAppStore((s) => s.activeChannel);
+    const channelMessages = useAppStore((s) => s.channelMessages);
+    const sendChannelMessage = useAppStore((s) => s.sendChannelMessage);
 
     // Chat Store
     const activeRoom = useAppStore((s) => s.activeRoom);
@@ -59,8 +70,9 @@ function App() {
     useEffect(() => {
         if (isAuthenticated) {
             fetchFriends();
+            fetchServers();
         }
-    }, [isAuthenticated, fetchFriends]);
+    }, [isAuthenticated, fetchFriends, fetchServers]);
 
     // WebSocket Listener with connection tracking
     useEffect(() => {
@@ -254,344 +266,461 @@ function App() {
 
     return (
         <div className="flex h-screen w-full bg-background text-white overflow-hidden font-sans">
-            {/* Left Sidebar - Friends List */}
-            <div className="w-72 bg-surface flex flex-col border-r border-white/5 relative z-10 glass-panel">
-                <div className="p-4 border-b border-white/5 flex items-center justify-between">
-                    <h1 className="text-xl font-bold bg-gradient-to-r from-primary to-secondary bg-clip-text text-transparent">
-                        P2P Nitro
-                    </h1>
-                    <div className="flex items-center gap-2">
-                        <div
-                            className={`p-1.5 rounded ${wsConnected ? 'text-green-400' : 'text-yellow-400'}`}
-                            title={wsConnected ? 'Real-time connected' : 'Polling mode (5s)'}
-                        >
-                            {wsConnected ? <Wifi className="w-4 h-4" /> : <WifiOff className="w-4 h-4" />}
-                        </div>
-                        <button
-                            onClick={() => setShowAddFriend(true)}
-                            className="p-2 hover:bg-white/10 rounded-lg transition"
-                            title="Add Friend"
-                        >
-                            <UserPlus className="w-5 h-5 text-gray-400" />
-                        </button>
-                    </div>
-                </div>
+            {/* Far Left - Server Sidebar */}
+            <ServerSidebar />
 
-                {/* Friends List */}
-                <div className="flex-1 overflow-y-auto p-2 space-y-1">
-                    {friends.map((friend) => {
-                        const unreadCount = getUnreadCount(friend.id);
-                        const isActive = activeDM === friend.id;
-                        return (
-                            <button
-                                key={friend.id}
-                                onClick={() => handleFriendClick(friend.id)}
-                                className={`w-full flex items-center gap-3 p-3 rounded-lg transition relative ${isActive ? 'bg-primary/20 border border-primary/30' : 'hover:bg-white/5'
-                                    }`}
-                            >
-                                <div className="relative flex-shrink-0">
-                                    <div className="w-12 h-12 rounded-full bg-gradient-to-br from-primary to-secondary" />
-                                    <div className="absolute bottom-0 right-0 w-3.5 h-3.5 bg-green-500 rounded-full border-2 border-surface" />
+            {/* Conditional: Server View or DM View */}
+            {activeServer ? (
+                <>
+                    {/* Channel List */}
+                    <ChannelList />
+
+                    {/* Server Chat Area */}
+                    <div className="flex-1 flex flex-col relative bg-background/50">
+                        {activeChannel ? (
+                            <ServerChatView
+                                channelMessages={channelMessages}
+                                sendChannelMessage={sendChannelMessage}
+                                activeServer={activeServer}
+                                activeChannel={activeChannel}
+                                channels={channels}
+                                user={user}
+                            />
+                        ) : (
+                            <div className="flex-1 flex items-center justify-center">
+                                <div className="text-center text-gray-500">
+                                    <Hash className="w-16 h-16 mx-auto mb-4 opacity-50" />
+                                    <p className="text-lg font-medium">Select a channel</p>
+                                    <p className="text-sm">Choose a channel to start chatting</p>
                                 </div>
-
-                                <div className="flex-1 text-left">
-                                    <div className="font-medium text-sm">{friend.username}</div>
-                                    <div className="text-xs text-gray-400">Online</div>
-                                </div>
-
-                                {unreadCount > 0 && (
-                                    <div className="bg-red-500 text-white text-xs font-bold rounded-full min-w-[20px] h-5 flex items-center justify-center px-1.5">
-                                        {unreadCount > 99 ? '99+' : unreadCount}
-                                    </div>
-                                )}
-                            </button>
-                        );
-                    })}
-                </div>
-
-                {/* User Status */}
-                <div className="p-3 bg-black/20 backdrop-blur-md border-t border-white/5">
-                    <div className="flex items-center justify-between">
-                        <div className="flex items-center">
-                            <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-primary to-secondary" />
-                            <div className="ml-2">
-                                <div className="text-sm font-medium">{user?.username}</div>
-                                <div className="text-xs text-green-400">Online</div>
-                            </div>
-                        </div>
-                        <div className="flex space-x-1">
-                            <button
-                                onClick={() => setIsMuted(!isMuted)}
-                                className={`p-1.5 rounded ${isMuted ? 'bg-red-500/20 text-red-400' : 'hover:bg-white/10'}`}
-                            >
-                                {isMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-                            </button>
-                            <button onClick={logout} className="p-1.5 hover:bg-white/10 rounded text-gray-400">
-                                <LogOut className="w-4 h-4" />
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            {/* Center - Chat Area */}
-            <div className="flex-1 flex flex-col relative bg-background/50">
-                {activeDM && activeFriend ? (
-                    <>
-                        {/* Chat Header */}
-                        <div className="h-14 border-b border-white/5 flex items-center px-4 bg-surface/50 backdrop-blur-sm flex-shrink-0">
-                            <div className="flex items-center text-gray-200">
-                                <Hash className="w-5 h-5 text-gray-400 mr-2" />
-                                <span className="font-semibold">{activeFriend.username}</span>
-                            </div>
-                        </div>
-
-                        {/* Messages */}
-                        <div className="flex-1 overflow-y-auto p-4 space-y-2">
-                            {messages.length === 0 ? (
-                                <div className="flex flex-col items-center justify-center h-full text-gray-500">
-                                    <div className="w-24 h-24 rounded-full bg-gradient-to-br from-primary/20 to-secondary/20 flex items-center justify-center mb-4">
-                                        <Hash className="w-12 h-12 text-primary/50" />
-                                    </div>
-                                    <p className="text-lg font-medium">Start the conversation!</p>
-                                    <p className="text-sm">Send a message to {activeFriend.username}</p>
-                                    <p className="text-xs text-gray-600 mt-4">💡 Try /shrug, /tableflip, or **bold text**</p>
-                                </div>
-                            ) : (
-                                <>
-                                    {messages.map((msg) => {
-                                        const displayContent = msg._decryptedContent || decryptMessageContent(msg);
-                                        const isOwn = msg.sender_id === user?.id;
-                                        const isHovered = hoveredMessageId === msg.id;
-
-                                        return (
-                                            <div
-                                                key={msg.id}
-                                                className="flex group hover:bg-white/[0.02] -mx-4 px-4 py-1.5 transition relative"
-                                                onMouseEnter={() => setHoveredMessageId(msg.id)}
-                                                onMouseLeave={() => setHoveredMessageId(null)}
-                                            >
-                                                <div className="w-10 h-10 rounded-full bg-gray-700 mt-1 flex-shrink-0" />
-                                                <div className="ml-3 flex-1 min-w-0">
-                                                    <div className="flex items-baseline gap-2">
-                                                        <span className={`font-medium ${isOwn ? 'text-primary' : 'text-gray-200'}`}>
-                                                            {getSenderName(msg.sender_id)}
-                                                        </span>
-                                                        <span className="text-xs text-gray-500">
-                                                            {new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                                                        </span>
-                                                        {msg.nonce && (
-                                                            <span className="text-xs text-green-500" title="End-to-end encrypted">
-                                                                🔒
-                                                            </span>
-                                                        )}
-                                                    </div>
-                                                    <div className="text-gray-300">
-                                                        <MessageContent content={displayContent} isEncrypted={!!msg.nonce} />
-                                                    </div>
-                                                </div>
-
-                                                {/* Action buttons on hover */}
-                                                {isHovered && (
-                                                    <div className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center gap-1 bg-surface/90 backdrop-blur-sm rounded-lg p-1 border border-white/10">
-                                                        <button
-                                                            onClick={() => handleCopyMessage(displayContent)}
-                                                            className="p-1.5 hover:bg-white/10 rounded text-gray-400 hover:text-white transition"
-                                                            title="Copy message"
-                                                        >
-                                                            <Copy className="w-4 h-4" />
-                                                        </button>
-                                                        {isOwn && (
-                                                            <button
-                                                                onClick={() => handleDeleteMessage(msg.id)}
-                                                                className="p-1.5 hover:bg-red-500/20 rounded text-gray-400 hover:text-red-400 transition"
-                                                                title="Delete message"
-                                                            >
-                                                                <Trash2 className="w-4 h-4" />
-                                                            </button>
-                                                        )}
-                                                    </div>
-                                                )}
-                                            </div>
-                                        );
-                                    })}
-                                    <div ref={messagesEndRef} />
-                                </>
-                            )}
-                        </div>
-
-                        {/* Command hints */}
-                        {showCommandHint && getMatchingCommands().length > 0 && (
-                            <div className="mx-4 mb-2 bg-surface rounded-lg border border-white/10 overflow-hidden">
-                                {getMatchingCommands().map(([cmd, info]) => (
-                                    <button
-                                        key={cmd}
-                                        onClick={() => setMsgInput(cmd)}
-                                        className="w-full flex items-center justify-between px-4 py-2 hover:bg-white/5 transition text-left"
-                                    >
-                                        <span className="text-primary font-mono">{cmd}</span>
-                                        <span className="text-gray-500 text-sm">{info.description}</span>
-                                    </button>
-                                ))}
                             </div>
                         )}
+                    </div>
 
-                        {/* Input */}
-                        <div className="p-4 pt-2 flex-shrink-0 border-t border-white/5">
-                            <div className="relative bg-surface rounded-lg flex items-center p-1 ring-1 ring-white/10 focus-within:ring-primary/50 transition">
-                                <input
-                                    type="text"
-                                    value={msgInput}
-                                    onChange={(e) => setMsgInput(e.target.value)}
-                                    onKeyDown={(e) => {
-                                        if (e.key === 'Enter' && !e.shiftKey) {
-                                            e.preventDefault();
-                                            handleSendMessage();
-                                        }
-                                    }}
-                                    placeholder={`Message ${activeFriend.username} • Markdown supported`}
-                                    className="bg-transparent flex-1 px-3 py-2 outline-none text-sm"
-                                />
-                                <button
-                                    onClick={handleSendMessage}
-                                    className="p-2 text-primary hover:text-primary/80 disabled:opacity-50 disabled:cursor-not-allowed"
-                                    disabled={!msgInput.trim()}
+                    {/* Member List */}
+                    <MemberList />
+                </>
+            ) : (
+                <>
+                    {/* Left Sidebar - Friends List */}
+                    <div className="w-72 bg-surface flex flex-col border-r border-white/5 relative z-10 glass-panel">
+                        <div className="p-4 border-b border-white/5 flex items-center justify-between">
+                            <h1 className="text-xl font-bold bg-gradient-to-r from-primary to-secondary bg-clip-text text-transparent">
+                                P2P Nitro
+                            </h1>
+                            <div className="flex items-center gap-2">
+                                <div
+                                    className={`p-1.5 rounded ${wsConnected ? 'text-green-400' : 'text-yellow-400'}`}
+                                    title={wsConnected ? 'Real-time connected' : 'Polling mode (5s)'}
                                 >
-                                    <Send className="w-5 h-5" />
+                                    {wsConnected ? <Wifi className="w-4 h-4" /> : <WifiOff className="w-4 h-4" />}
+                                </div>
+                                <button
+                                    onClick={() => setShowAddFriend(true)}
+                                    className="p-2 hover:bg-white/10 rounded-lg transition"
+                                    title="Add Friend"
+                                >
+                                    <UserPlus className="w-5 h-5 text-gray-400" />
                                 </button>
                             </div>
                         </div>
-                    </>
-                ) : (
-                    <div className="flex-1 flex items-center justify-center">
-                        <div className="text-center text-gray-500">
-                            <div className="w-32 h-32 rounded-full bg-gradient-to-br from-primary/20 to-secondary/20 flex items-center justify-center mx-auto mb-6">
-                                <UserCircle className="w-16 h-16 text-primary/50" />
+
+                        {/* Friends List */}
+                        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+                            {friends.map((friend) => {
+                                const unreadCount = getUnreadCount(friend.id);
+                                const isActive = activeDM === friend.id;
+                                return (
+                                    <button
+                                        key={friend.id}
+                                        onClick={() => handleFriendClick(friend.id)}
+                                        className={`w-full flex items-center gap-3 p-3 rounded-lg transition relative ${isActive ? 'bg-primary/20 border border-primary/30' : 'hover:bg-white/5'
+                                            }`}
+                                    >
+                                        <div className="relative flex-shrink-0">
+                                            <div className="w-12 h-12 rounded-full bg-gradient-to-br from-primary to-secondary" />
+                                            <div className="absolute bottom-0 right-0 w-3.5 h-3.5 bg-green-500 rounded-full border-2 border-surface" />
+                                        </div>
+
+                                        <div className="flex-1 text-left">
+                                            <div className="font-medium text-sm">{friend.username}</div>
+                                            <div className="text-xs text-gray-400">Online</div>
+                                        </div>
+
+                                        {unreadCount > 0 && (
+                                            <div className="bg-red-500 text-white text-xs font-bold rounded-full min-w-[20px] h-5 flex items-center justify-center px-1.5">
+                                                {unreadCount > 99 ? '99+' : unreadCount}
+                                            </div>
+                                        )}
+                                    </button>
+                                );
+                            })}
+                        </div>
+
+                        {/* User Status */}
+                        <div className="p-3 bg-black/20 backdrop-blur-md border-t border-white/5">
+                            <div className="flex items-center justify-between">
+                                <div className="flex items-center">
+                                    <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-primary to-secondary" />
+                                    <div className="ml-2">
+                                        <div className="text-sm font-medium">{user?.username}</div>
+                                        <div className="text-xs text-green-400">Online</div>
+                                    </div>
+                                </div>
+                                <div className="flex space-x-1">
+                                    <button
+                                        onClick={() => setIsMuted(!isMuted)}
+                                        className={`p-1.5 rounded ${isMuted ? 'bg-red-500/20 text-red-400' : 'hover:bg-white/10'}`}
+                                    >
+                                        {isMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+                                    </button>
+                                    <button onClick={logout} className="p-1.5 hover:bg-white/10 rounded text-gray-400">
+                                        <LogOut className="w-4 h-4" />
+                                    </button>
+                                </div>
                             </div>
-                            <p className="text-xl font-medium mb-2">Welcome back, {user?.username}!</p>
-                            <p>Select a friend to start chatting</p>
                         </div>
                     </div>
-                )}
 
-                {/* Call Overlay */}
-                {activeCall && (
-                    <div className="absolute top-4 right-4 w-72 bg-black/80 backdrop-blur-xl border border-white/10 rounded-xl p-4 shadow-2xl z-20">
-                        <div className="flex items-center justify-between mb-4">
-                            <h3 className="text-sm font-bold text-white">Active Call</h3>
-                            <button
-                                onClick={endCall}
-                                className="px-3 py-1 text-xs bg-red-600 hover:bg-red-500 rounded-lg transition"
-                            >
-                                End
-                            </button>
-                        </div>
-                        <div className="space-y-3">
-                            <div className="flex justify-between text-xs">
-                                <span className="text-gray-500">Status</span>
-                                <span className={activeCall.isConnected ? 'text-green-400' : 'text-yellow-400'}>
-                                    {activeCall.isConnected ? 'Connected' : 'Connecting...'}
-                                </span>
+                    {/* Center - Chat Area */}
+                    <div className="flex-1 flex flex-col relative bg-background/50">
+                        {activeDM && activeFriend ? (
+                            <>
+                                {/* Chat Header */}
+                                <div className="h-14 border-b border-white/5 flex items-center px-4 bg-surface/50 backdrop-blur-sm flex-shrink-0">
+                                    <div className="flex items-center text-gray-200">
+                                        <Hash className="w-5 h-5 text-gray-400 mr-2" />
+                                        <span className="font-semibold">{activeFriend.username}</span>
+                                    </div>
+                                </div>
+
+                                {/* Messages */}
+                                <div className="flex-1 overflow-y-auto p-4 space-y-2">
+                                    {messages.length === 0 ? (
+                                        <div className="flex flex-col items-center justify-center h-full text-gray-500">
+                                            <div className="w-24 h-24 rounded-full bg-gradient-to-br from-primary/20 to-secondary/20 flex items-center justify-center mb-4">
+                                                <Hash className="w-12 h-12 text-primary/50" />
+                                            </div>
+                                            <p className="text-lg font-medium">Start the conversation!</p>
+                                            <p className="text-sm">Send a message to {activeFriend.username}</p>
+                                            <p className="text-xs text-gray-600 mt-4">💡 Try /shrug, /tableflip, or **bold text**</p>
+                                        </div>
+                                    ) : (
+                                        <>
+                                            {messages.map((msg) => {
+                                                const displayContent = msg._decryptedContent || decryptMessageContent(msg);
+                                                const isOwn = msg.sender_id === user?.id;
+                                                const isHovered = hoveredMessageId === msg.id;
+
+                                                return (
+                                                    <div
+                                                        key={msg.id}
+                                                        className="flex group hover:bg-white/[0.02] -mx-4 px-4 py-1.5 transition relative"
+                                                        onMouseEnter={() => setHoveredMessageId(msg.id)}
+                                                        onMouseLeave={() => setHoveredMessageId(null)}
+                                                    >
+                                                        <div className="w-10 h-10 rounded-full bg-gray-700 mt-1 flex-shrink-0" />
+                                                        <div className="ml-3 flex-1 min-w-0">
+                                                            <div className="flex items-baseline gap-2">
+                                                                <span className={`font-medium ${isOwn ? 'text-primary' : 'text-gray-200'}`}>
+                                                                    {getSenderName(msg.sender_id)}
+                                                                </span>
+                                                                <span className="text-xs text-gray-500">
+                                                                    {new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                                                </span>
+                                                                {msg.nonce && (
+                                                                    <span className="text-xs text-green-500" title="End-to-end encrypted">
+                                                                        🔒
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                            <div className="text-gray-300">
+                                                                <MessageContent content={displayContent} isEncrypted={!!msg.nonce} />
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Action buttons on hover */}
+                                                        {isHovered && (
+                                                            <div className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center gap-1 bg-surface/90 backdrop-blur-sm rounded-lg p-1 border border-white/10">
+                                                                <button
+                                                                    onClick={() => handleCopyMessage(displayContent)}
+                                                                    className="p-1.5 hover:bg-white/10 rounded text-gray-400 hover:text-white transition"
+                                                                    title="Copy message"
+                                                                >
+                                                                    <Copy className="w-4 h-4" />
+                                                                </button>
+                                                                {isOwn && (
+                                                                    <button
+                                                                        onClick={() => handleDeleteMessage(msg.id)}
+                                                                        className="p-1.5 hover:bg-red-500/20 rounded text-gray-400 hover:text-red-400 transition"
+                                                                        title="Delete message"
+                                                                    >
+                                                                        <Trash2 className="w-4 h-4" />
+                                                                    </button>
+                                                                )}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                );
+                                            })}
+                                            <div ref={messagesEndRef} />
+                                        </>
+                                    )}
+                                </div>
+
+                                {/* Command hints */}
+                                {showCommandHint && getMatchingCommands().length > 0 && (
+                                    <div className="mx-4 mb-2 bg-surface rounded-lg border border-white/10 overflow-hidden">
+                                        {getMatchingCommands().map(([cmd, info]) => (
+                                            <button
+                                                key={cmd}
+                                                onClick={() => setMsgInput(cmd)}
+                                                className="w-full flex items-center justify-between px-4 py-2 hover:bg-white/5 transition text-left"
+                                            >
+                                                <span className="text-primary font-mono">{cmd}</span>
+                                                <span className="text-gray-500 text-sm">{info.description}</span>
+                                            </button>
+                                        ))}
+                                    </div>
+                                )}
+
+                                {/* Input */}
+                                <div className="p-4 pt-2 flex-shrink-0 border-t border-white/5">
+                                    <div className="relative bg-surface rounded-lg flex items-center p-1 ring-1 ring-white/10 focus-within:ring-primary/50 transition">
+                                        <input
+                                            type="text"
+                                            value={msgInput}
+                                            onChange={(e) => setMsgInput(e.target.value)}
+                                            onKeyDown={(e) => {
+                                                if (e.key === 'Enter' && !e.shiftKey) {
+                                                    e.preventDefault();
+                                                    handleSendMessage();
+                                                }
+                                            }}
+                                            placeholder={`Message ${activeFriend.username} • Markdown supported`}
+                                            className="bg-transparent flex-1 px-3 py-2 outline-none text-sm"
+                                        />
+                                        <button
+                                            onClick={handleSendMessage}
+                                            className="p-2 text-primary hover:text-primary/80 disabled:opacity-50 disabled:cursor-not-allowed"
+                                            disabled={!msgInput.trim()}
+                                        >
+                                            <Send className="w-5 h-5" />
+                                        </button>
+                                    </div>
+                                </div>
+                            </>
+                        ) : (
+                            <div className="flex-1 flex items-center justify-center">
+                                <div className="text-center text-gray-500">
+                                    <div className="w-32 h-32 rounded-full bg-gradient-to-br from-primary/20 to-secondary/20 flex items-center justify-center mx-auto mb-6">
+                                        <UserCircle className="w-16 h-16 text-primary/50" />
+                                    </div>
+                                    <p className="text-xl font-medium mb-2">Welcome back, {user?.username}!</p>
+                                    <p>Select a friend to start chatting</p>
+                                </div>
                             </div>
-                        </div>
-                    </div>
-                )}
-            </div>
+                        )}
 
-            {/* Right Sidebar - Friend Info Panel */}
-            {activeFriend && (
-                <div className="w-80 bg-surface border-l border-white/5 flex flex-col animate-slide-in">
-                    <div className="p-6 border-b border-white/5">
-                        <div className="flex flex-col items-center text-center">
-                            <div className="w-24 h-24 rounded-full bg-gradient-to-br from-primary to-secondary mb-4 relative">
-                                <div className="absolute bottom-1 right-1 w-6 h-6 bg-green-500 rounded-full border-4 border-surface" />
+                        {/* Call Overlay */}
+                        {activeCall && (
+                            <div className="absolute top-4 right-4 w-72 bg-black/80 backdrop-blur-xl border border-white/10 rounded-xl p-4 shadow-2xl z-20">
+                                <div className="flex items-center justify-between mb-4">
+                                    <h3 className="text-sm font-bold text-white">Active Call</h3>
+                                    <button
+                                        onClick={endCall}
+                                        className="px-3 py-1 text-xs bg-red-600 hover:bg-red-500 rounded-lg transition"
+                                    >
+                                        End
+                                    </button>
+                                </div>
+                                <div className="space-y-3">
+                                    <div className="flex justify-between text-xs">
+                                        <span className="text-gray-500">Status</span>
+                                        <span className={activeCall.isConnected ? 'text-green-400' : 'text-yellow-400'}>
+                                            {activeCall.isConnected ? 'Connected' : 'Connecting...'}
+                                        </span>
+                                    </div>
+                                </div>
                             </div>
-                            <h2 className="text-xl font-bold mb-1">{activeFriend.username}</h2>
-                            <p className="text-sm text-green-400 flex items-center gap-1">
-                                <span className="w-2 h-2 bg-green-500 rounded-full" />
-                                Online
-                            </p>
-                        </div>
+                        )}
                     </div>
 
-                    <div className="p-4 border-b border-white/5 space-y-2">
-                        <button
-                            onClick={() => handleJoinCall(activeFriend.id)}
-                            className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-green-600 hover:bg-green-500 text-white font-medium rounded-lg transition"
-                        >
-                            <Phone className="w-5 h-5" />
-                            Voice Call
-                        </button>
-                        <button className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition">
-                            <Video className="w-5 h-5" />
-                            Video Call
-                        </button>
-                    </div>
+                    {/* Right Sidebar - Friend Info Panel */}
+                    {activeFriend && (
+                        <div className="w-80 bg-surface border-l border-white/5 flex flex-col animate-slide-in">
+                            <div className="p-6 border-b border-white/5">
+                                <div className="flex flex-col items-center text-center">
+                                    <div className="w-24 h-24 rounded-full bg-gradient-to-br from-primary to-secondary mb-4 relative">
+                                        <div className="absolute bottom-1 right-1 w-6 h-6 bg-green-500 rounded-full border-4 border-surface" />
+                                    </div>
+                                    <h2 className="text-xl font-bold mb-1">{activeFriend.username}</h2>
+                                    <p className="text-sm text-green-400 flex items-center gap-1">
+                                        <span className="w-2 h-2 bg-green-500 rounded-full" />
+                                        Online
+                                    </p>
+                                </div>
+                            </div>
 
-                    <div className="flex-1 overflow-y-auto p-4 space-y-4">
-                        <div className="bg-black/20 rounded-lg p-4">
-                            <h3 className="text-sm font-bold text-gray-400 uppercase mb-3">About</h3>
-                            <div className="space-y-3">
-                                <div className="flex items-center gap-3 text-sm">
-                                    <Calendar className="w-4 h-4 text-gray-400" />
-                                    <div>
-                                        <div className="text-gray-400 text-xs">Member since</div>
-                                        <div className="text-white">
-                                            {activeFriend.last_seen ? new Date(activeFriend.last_seen).toLocaleDateString() : 'Recently'}
+                            <div className="p-4 border-b border-white/5 space-y-2">
+                                <button
+                                    onClick={() => handleJoinCall(activeFriend.id)}
+                                    className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-green-600 hover:bg-green-500 text-white font-medium rounded-lg transition"
+                                >
+                                    <Phone className="w-5 h-5" />
+                                    Voice Call
+                                </button>
+                                <button className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition">
+                                    <Video className="w-5 h-5" />
+                                    Video Call
+                                </button>
+                            </div>
+
+                            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                                <div className="bg-black/20 rounded-lg p-4">
+                                    <h3 className="text-sm font-bold text-gray-400 uppercase mb-3">About</h3>
+                                    <div className="space-y-3">
+                                        <div className="flex items-center gap-3 text-sm">
+                                            <Calendar className="w-4 h-4 text-gray-400" />
+                                            <div>
+                                                <div className="text-gray-400 text-xs">Member since</div>
+                                                <div className="text-white">
+                                                    {activeFriend.last_seen ? new Date(activeFriend.last_seen).toLocaleDateString() : 'Recently'}
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-3 text-sm">
+                                            <UserCircle className="w-4 h-4 text-gray-400" />
+                                            <div>
+                                                <div className="text-gray-400 text-xs">User ID</div>
+                                                <div className="text-white text-xs font-mono">{activeFriend.id.slice(0, 8)}...</div>
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
-                                <div className="flex items-center gap-3 text-sm">
-                                    <UserCircle className="w-4 h-4 text-gray-400" />
-                                    <div>
-                                        <div className="text-gray-400 text-xs">User ID</div>
-                                        <div className="text-white text-xs font-mono">{activeFriend.id.slice(0, 8)}...</div>
+
+                                <div className="bg-black/20 rounded-lg p-4">
+                                    <h3 className="text-sm font-bold text-gray-400 uppercase mb-3">Security</h3>
+                                    <div className="flex items-center gap-2 text-green-400 text-sm">
+                                        <span>🔒</span>
+                                        <span>End-to-end encrypted</span>
+                                    </div>
+                                    <p className="text-xs text-gray-500 mt-2">
+                                        Messages are encrypted on your device. Only you and {activeFriend.username} can read them.
+                                    </p>
+                                </div>
+
+                                <div className="bg-black/20 rounded-lg p-4">
+                                    <h3 className="text-sm font-bold text-gray-400 uppercase mb-3">Quick Commands</h3>
+                                    <div className="space-y-2 text-xs">
+                                        <div className="flex justify-between">
+                                            <span className="text-primary font-mono">/clear</span>
+                                            <span className="text-gray-500">Clear local view</span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-primary font-mono">/deleteall</span>
+                                            <span className="text-gray-500">Delete all messages</span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-primary font-mono">/shrug</span>
+                                            <span className="text-gray-500">¯\_(ツ)_/¯</span>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
-                        </div>
 
-                        <div className="bg-black/20 rounded-lg p-4">
-                            <h3 className="text-sm font-bold text-gray-400 uppercase mb-3">Security</h3>
-                            <div className="flex items-center gap-2 text-green-400 text-sm">
-                                <span>🔒</span>
-                                <span>End-to-end encrypted</span>
-                            </div>
-                            <p className="text-xs text-gray-500 mt-2">
-                                Messages are encrypted on your device. Only you and {activeFriend.username} can read them.
-                            </p>
-                        </div>
-
-                        <div className="bg-black/20 rounded-lg p-4">
-                            <h3 className="text-sm font-bold text-gray-400 uppercase mb-3">Quick Commands</h3>
-                            <div className="space-y-2 text-xs">
-                                <div className="flex justify-between">
-                                    <span className="text-primary font-mono">/clear</span>
-                                    <span className="text-gray-500">Clear local view</span>
-                                </div>
-                                <div className="flex justify-between">
-                                    <span className="text-primary font-mono">/deleteall</span>
-                                    <span className="text-gray-500">Delete all messages</span>
-                                </div>
-                                <div className="flex justify-between">
-                                    <span className="text-primary font-mono">/shrug</span>
-                                    <span className="text-gray-500">¯\_(ツ)_/¯</span>
-                                </div>
+                            <div className="p-4 border-t border-white/5">
+                                <button className="w-full flex items-center justify-center gap-2 px-4 py-2 hover:bg-white/5 rounded-lg transition text-gray-400">
+                                    <Settings className="w-4 h-4" />
+                                    <span className="text-sm">More Options</span>
+                                </button>
                             </div>
                         </div>
-                    </div>
+                    )}
 
-                    <div className="p-4 border-t border-white/5">
-                        <button className="w-full flex items-center justify-center gap-2 px-4 py-2 hover:bg-white/5 rounded-lg transition text-gray-400">
-                            <Settings className="w-4 h-4" />
-                            <span className="text-sm">More Options</span>
-                        </button>
-                    </div>
-                </div>
+                    <AddFriendModal isOpen={showAddFriend} onClose={() => setShowAddFriend(false)} />
+                </>
             )}
-
-            <AddFriendModal isOpen={showAddFriend} onClose={() => setShowAddFriend(false)} />
         </div>
+    );
+}
+
+// Server Chat View Component
+function ServerChatView({
+    channelMessages,
+    sendChannelMessage,
+    activeServer,
+    activeChannel,
+    channels,
+    user,
+}: {
+    channelMessages: any[];
+    sendChannelMessage: (serverId: string, channelId: string, content: string) => Promise<void>;
+    activeServer: string;
+    activeChannel: string;
+    channels: any[];
+    user: any;
+}) {
+    const [input, setInput] = useState('');
+    const messagesEndRef = useRef<HTMLDivElement>(null);
+    const channel = channels.find((c: any) => c.id === activeChannel);
+
+    useEffect(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, [channelMessages]);
+
+    const handleSend = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!input.trim()) return;
+        await sendChannelMessage(activeServer, activeChannel, input);
+        setInput('');
+    };
+
+    return (
+        <>
+            {/* Channel Header */}
+            <div className="h-14 px-4 flex items-center border-b border-white/5">
+                <Hash className="w-5 h-5 text-gray-400 mr-2" />
+                <h2 className="font-bold">{channel?.name || 'Channel'}</h2>
+            </div>
+
+            {/* Messages */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                {channelMessages.map((msg) => (
+                    <div key={msg.id} className="flex gap-3 hover:bg-white/5 p-2 rounded-lg">
+                        <div className="w-10 h-10 rounded-full bg-gradient-to-br from-primary to-secondary flex-shrink-0" />
+                        <div>
+                            <div className="flex items-center gap-2">
+                                <span className="font-semibold text-sm">
+                                    {msg.sender_id === user?.id ? user?.username : 'Member'}
+                                </span>
+                                <span className="text-xs text-gray-500">
+                                    {new Date(msg.created_at).toLocaleTimeString()}
+                                </span>
+                            </div>
+                            <p className="text-gray-200">{msg.content}</p>
+                        </div>
+                    </div>
+                ))}
+                <div ref={messagesEndRef} />
+            </div>
+
+            {/* Input */}
+            <form onSubmit={handleSend} className="p-4 border-t border-white/5">
+                <div className="flex items-center gap-2 bg-white/5 rounded-lg px-4 py-2">
+                    <input
+                        type="text"
+                        value={input}
+                        onChange={(e) => setInput(e.target.value)}
+                        placeholder={`Message #${channel?.name || 'channel'}`}
+                        className="flex-1 bg-transparent outline-none"
+                    />
+                    <button type="submit" className="p-2 hover:bg-white/10 rounded-lg">
+                        <Send className="w-5 h-5" />
+                    </button>
+                </div>
+            </form>
+        </>
     );
 }
 
