@@ -19,21 +19,10 @@ struct AppState {
 }
 
 #[tauri::command]
-async fn join_call(state: State<'_, AppState>, channel: String) -> Result<String, String> {
-    println!("Joining call in channel: {}", channel);
-    
-    // Start media engine in background
-    let media = state.media.clone();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let engine = media.lock().unwrap();
-            if let Err(e) = engine.start().await {
-                eprintln!("Media engine error: {}", e);
-            }
-        });
-    });
-
+async fn join_call(_state: State<'_, AppState>, channel: String) -> Result<String, String> {
+    println!("🔊 [CALL-DEBUG] Joining call in channel: {}", channel);
+    // Note: Media engine will be started after E2EE handshake completes
+    // Don't start it here to avoid holding the lock during async operations
     Ok(format!("Joined channel {}", channel))
 }
 
