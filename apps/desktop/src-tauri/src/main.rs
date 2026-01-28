@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod api;
 mod config;
 mod signaling;
 
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use signaling::WsSender;
 use shared_proto::signaling::SignalingMessage;
+use api::ApiState;
 
 struct AppState {
     media: Arc<std::sync::Mutex<MediaEngine>>,
@@ -152,6 +154,10 @@ fn main() {
         .setup(move |app| {
             let app_handle = app.handle().clone();
             
+            // Initialize API state for HTTP requests
+            let api_state = ApiState::new(config::API_URL.to_string());
+            app.manage(api_state);
+            
             // Connect to signaling server (without identifying yet)
             tauri::async_runtime::spawn(async move {
                 match signaling::connect(config::SERVER_URL, app_handle.clone()).await {
@@ -180,6 +186,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // WebRTC/Call commands
             join_call, 
             send_offer, 
             send_answer, 
@@ -190,8 +197,33 @@ fn main() {
             decline_call,
             end_call,
             cancel_call,
+            // API commands
+            api::auth::api_login,
+            api::auth::api_register,
+            api::auth::api_logout,
+            api::users::api_upload_public_key,
+            api::users::api_fetch_user_public_key,
+            api::friends::api_fetch_friends,
+            api::friends::api_fetch_pending_requests,
+            api::friends::api_send_friend_request,
+            api::friends::api_accept_friend,
+            api::chat::api_create_or_get_dm,
+            api::chat::api_fetch_messages,
+            api::chat::api_send_message,
+            api::chat::api_delete_message,
+            api::chat::api_delete_all_messages,
+            api::servers::api_fetch_servers,
+            api::servers::api_create_server,
+            api::servers::api_join_server,
+            api::servers::api_leave_server,
+            api::servers::api_fetch_server_details,
+            api::servers::api_create_channel,
+            api::servers::api_fetch_server_members,
+            api::servers::api_fetch_channel_messages,
+            api::servers::api_send_channel_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
 

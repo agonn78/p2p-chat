@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type { User, Friend, Room, CallState, Message, Server, Channel, ServerMember, ChannelMessage, IncomingCallPayload, CallAcceptedPayload } from './types';
 import * as crypto from './crypto';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://live.ewanhomelab.fr';
+// Note: All HTTP API calls now go through Rust Tauri commands (no CORS issues)
 
 // Polling configuration
 const POLL_INTERVAL_MS = 5000;  // Poll every 5 seconds when WS is down
@@ -135,29 +135,14 @@ export const useAppStore = create<AppState>()(
 
             // Auth actions
             login: async (email, password) => {
-                console.log(`[Store] Attempting login to ${API_URL}/auth/login with email: ${email}`);
+                console.log(`[Store] Attempting login via Rust API with email: ${email}`);
                 try {
-                    const res = await fetch(`${API_URL}/auth/login`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ email, password }),
-                    });
-
-                    console.log(`[Store] Login response status: ${res.status}`);
-
-                    if (!res.ok) {
-                        const errorText = await res.text();
-                        console.error('[Store] Login failed body:', errorText);
-                        throw new Error(`Login failed: ${res.status} ${errorText}`);
-                    }
-
-                    const data = await res.json();
+                    const data = await invoke<{ token: string; user: User }>('api_login', { email, password });
                     console.log('[Store] Login success, received token');
                     set({ token: data.token, user: data.user, isAuthenticated: true });
 
                     // Identify user on WebSocket for real-time messaging
                     try {
-                        const { invoke } = await import('@tauri-apps/api/core');
                         await invoke('identify_user', { userId: data.user.id });
                         console.log('[Store] WebSocket identified with user ID:', data.user.id);
                     } catch (e) {
@@ -173,24 +158,19 @@ export const useAppStore = create<AppState>()(
             },
 
             register: async (username, email, password) => {
-                console.log(`[Store] Attempting register to ${API_URL}/auth/register with user: ${username}`);
+                console.log(`[Store] Attempting register via Rust API with user: ${username}`);
                 try {
-                    const res = await fetch(`${API_URL}/auth/register`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ username, email, password }),
-                    });
-
-                    console.log(`[Store] Register response status: ${res.status}`);
-
-                    if (!res.ok) {
-                        const error = await res.json();
-                        console.error('[Store] Register failed:', error);
-                        throw new Error(error.error || 'Registration failed');
-                    }
-                    const data = await res.json();
+                    const data = await invoke<{ token: string; user: User }>('api_register', { username, email, password });
                     console.log('[Store] Register success, received token');
                     set({ token: data.token, user: data.user, isAuthenticated: true });
+
+                    // Identify user on WebSocket
+                    try {
+                        await invoke('identify_user', { userId: data.user.id });
+                        console.log('[Store] WebSocket identified with user ID:', data.user.id);
+                    } catch (e) {
+                        console.error('[Store] Failed to identify on WebSocket:', e);
+                    }
 
                     // Initialize E2EE keys after registration
                     await get().initializeKeys();
@@ -202,6 +182,8 @@ export const useAppStore = create<AppState>()(
 
             logout: () => {
                 crypto.clearSecretCache();
+                // Also logout from Rust API state
+                invoke('api_logout').catch(console.error);
                 set({
                     token: null,
                     user: null,
@@ -226,30 +208,17 @@ export const useAppStore = create<AppState>()(
                 const keyPair = crypto.getOrCreateKeyPair();
                 set({ keyPair });
 
-                console.log('[Store] 🔐 Uploading public key to server...');
+                console.log('[Store] 🔐 Uploading public key to server via Rust API...');
                 try {
-                    const res = await fetch(`${API_URL}/users/me/public-key`, {
-                        method: 'PUT',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            Authorization: `Bearer ${token}`
-                        },
-                        body: JSON.stringify({ public_key: keyPair.publicKey }),
-                    });
-
-                    if (res.ok) {
-                        console.log('[Store] 🔐 Public key uploaded successfully');
-                    } else {
-                        console.error('[Store] Failed to upload public key:', await res.text());
-                    }
+                    await invoke('api_upload_public_key', { publicKey: keyPair.publicKey });
+                    console.log('[Store] 🔐 Public key uploaded successfully');
                 } catch (e) {
                     console.error('[Store] initializeKeys exception:', e);
                 }
             },
 
             fetchFriendPublicKey: async (friendId) => {
-                const { token, friendPublicKeys } = get();
-                if (!token) return null;
+                const { friendPublicKeys } = get();
 
                 // Check cache first
                 if (friendPublicKeys[friendId]) {
@@ -258,22 +227,16 @@ export const useAppStore = create<AppState>()(
 
                 console.log(`[Store] 🔐 Fetching public key for friend ${friendId}`);
                 try {
-                    const res = await fetch(`${API_URL}/users/${friendId}/public-key`, {
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
-
-                    if (res.ok) {
-                        const data = await res.json();
-                        if (data.public_key) {
-                            set({
-                                friendPublicKeys: {
-                                    ...get().friendPublicKeys,
-                                    [friendId]: data.public_key
-                                }
-                            });
-                            console.log(`[Store] 🔐 Got public key for friend ${friendId}`);
-                            return data.public_key;
-                        }
+                    const publicKey = await invoke<string | null>('api_fetch_user_public_key', { userId: friendId });
+                    if (publicKey) {
+                        set({
+                            friendPublicKeys: {
+                                ...get().friendPublicKeys,
+                                [friendId]: publicKey
+                            }
+                        });
+                        console.log(`[Store] 🔐 Got public key for friend ${friendId}`);
+                        return publicKey;
                     }
                 } catch (e) {
                     console.error('[Store] fetchFriendPublicKey exception:', e);
@@ -339,65 +302,42 @@ export const useAppStore = create<AppState>()(
 
             // Social actions
             fetchFriends: async () => {
-                const { token } = get();
-                if (!token) return;
-                const res = await fetch(`${API_URL}/friends`, {
-                    headers: { Authorization: `Bearer ${token}` },
-                });
-                if (res.ok) {
-                    const friends = await res.json();
+                try {
+                    const friends = await invoke<Friend[]>('api_fetch_friends');
                     set({ friends });
 
                     // Pre-fetch public keys for all friends
                     for (const friend of friends) {
                         get().fetchFriendPublicKey(friend.id);
                     }
+                } catch (e) {
+                    console.error('[Store] fetchFriends exception:', e);
                 }
             },
 
             fetchPendingRequests: async () => {
-                const { token } = get();
-                if (!token) return;
-                const res = await fetch(`${API_URL}/friends/pending`, {
-                    headers: { Authorization: `Bearer ${token}` },
-                });
-                if (res.ok) {
-                    const pendingRequests = await res.json();
+                try {
+                    const pendingRequests = await invoke<Friend[]>('api_fetch_pending_requests');
                     set({ pendingRequests });
+                } catch (e) {
+                    console.error('[Store] fetchPendingRequests exception:', e);
                 }
             },
 
             sendFriendRequest: async (username) => {
-                const { token } = get();
-                if (!token) return;
-                await fetch(`${API_URL}/friends/request`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        Authorization: `Bearer ${token}`,
-                    },
-                    body: JSON.stringify({ username }),
-                });
+                try {
+                    await invoke('api_send_friend_request', { username });
+                } catch (e) {
+                    console.error('[Store] sendFriendRequest exception:', e);
+                    throw e;
+                }
             },
 
             acceptFriend: async (friendId) => {
-                const { token, fetchFriends, fetchPendingRequests } = get();
-                if (!token) return;
+                const { fetchFriends, fetchPendingRequests } = get();
                 console.log(`[Store] Accepting friend request from user ID: ${friendId}`);
                 try {
-                    const res = await fetch(`${API_URL}/friends/accept/${friendId}`, {
-                        method: 'POST',
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
-
-                    console.log(`[Store] Accept response status: ${res.status}`);
-
-                    if (!res.ok) {
-                        const errorText = await res.text();
-                        console.error('[Store] Accept failed body:', errorText);
-                        throw new Error(`Accept failed: ${res.status} ${errorText}`);
-                    }
-
+                    await invoke('api_accept_friend', { friendId });
                     console.log('[Store] Friend accepted successfully. Refreshing lists...');
                     await fetchFriends();
                     await fetchPendingRequests();
@@ -408,8 +348,7 @@ export const useAppStore = create<AppState>()(
 
             // Chat actions
             createOrGetDm: async (friendId) => {
-                const { token, markAsRead, fetchFriendPublicKey } = get();
-                if (!token) return;
+                const { markAsRead, fetchFriendPublicKey } = get();
 
                 console.log(`[Store] Creating/Getting DM with friend: ${friendId}`);
 
@@ -417,57 +356,33 @@ export const useAppStore = create<AppState>()(
                 await fetchFriendPublicKey(friendId);
 
                 try {
-                    const res = await fetch(`${API_URL}/chat/dm`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            Authorization: `Bearer ${token}`
-                        },
-                        body: JSON.stringify({ friend_id: friendId }),
-                    });
+                    const room = await invoke<Room>('api_create_or_get_dm', { friendId });
+                    console.log(`[Store] Got room:`, room);
 
-                    if (res.ok) {
-                        const room = await res.json();
-                        console.log(`[Store] Got room:`, room);
+                    // Clear messages and set active room + friend
+                    set({ messages: [], activeRoom: room.id, activeFriendId: friendId });
 
-                        // Clear messages and set active room + friend
-                        set({ messages: [], activeRoom: room.id, activeFriendId: friendId });
+                    // Mark messages as read
+                    markAsRead(friendId);
 
-                        // Mark messages as read
-                        markAsRead(friendId);
-
-                        // Fetch messages for this room
-                        await get().fetchMessages(room.id);
-                    } else {
-                        console.error('[Store] Failed to create DM:', await res.text());
-                    }
+                    // Fetch messages for this room
+                    await get().fetchMessages(room.id);
                 } catch (e) {
                     console.error('[Store] createOrGetDm exception:', e);
                 }
             },
 
             fetchMessages: async (roomId) => {
-                const { token } = get();
-                if (!token) return;
-
                 console.log(`[Store] Fetching messages for room: ${roomId}`);
                 try {
-                    const res = await fetch(`${API_URL}/chat/${roomId}/messages`, {
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
+                    const messages = await invoke<Message[]>('api_fetch_messages', { roomId });
+                    console.log(`[Store] Fetched ${messages.length} messages`);
+                    set({ messages });
 
-                    if (res.ok) {
-                        const messages = await res.json();
-                        console.log(`[Store] Fetched ${messages.length} messages`);
-                        set({ messages });
-
-                        // Update last message timestamp for polling
-                        if (messages.length > 0) {
-                            const lastMsg = messages[messages.length - 1];
-                            set({ lastMessageTimestamp: lastMsg.created_at });
-                        }
-                    } else {
-                        console.error('[Store] Failed to fetch messages:', await res.text());
+                    // Update last message timestamp for polling
+                    if (messages.length > 0) {
+                        const lastMsg = messages[messages.length - 1];
+                        set({ lastMessageTimestamp: lastMsg.created_at || null });
                     }
                 } catch (e) {
                     console.error('[Store] fetchMessages exception:', e);
@@ -476,24 +391,18 @@ export const useAppStore = create<AppState>()(
 
             // Polling fallback for new messages
             pollForNewMessages: async () => {
-                const { token, activeRoom, messages, addMessage } = get();
-                if (!token || !activeRoom) return;
+                const { activeRoom, messages, addMessage } = get();
+                if (!activeRoom) return;
 
                 try {
-                    const res = await fetch(`${API_URL}/chat/${activeRoom}/messages`, {
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
+                    const serverMessages = await invoke<Message[]>('api_fetch_messages', { roomId: activeRoom });
+                    const currentIds = new Set(messages.map(m => m.id));
 
-                    if (res.ok) {
-                        const serverMessages: Message[] = await res.json();
-                        const currentIds = new Set(messages.map(m => m.id));
-
-                        // Add any new messages
-                        for (const msg of serverMessages) {
-                            if (!currentIds.has(msg.id)) {
-                                console.log('[Store] 📬 Polling found new message:', msg.id);
-                                addMessage(msg);
-                            }
+                    // Add any new messages
+                    for (const msg of serverMessages) {
+                        if (!currentIds.has(msg.id)) {
+                            console.log('[Store] 📬 Polling found new message:', msg.id);
+                            addMessage(msg);
                         }
                     }
                 } catch (e) {
@@ -502,11 +411,10 @@ export const useAppStore = create<AppState>()(
             },
 
             sendMessage: async (roomId, content) => {
-                const { token, keyPair, activeFriendId, friendPublicKeys } = get();
-                if (!token) return;
+                const { keyPair, activeFriendId, friendPublicKeys } = get();
 
                 let encryptedContent = content;
-                let nonce: string | null = null;
+                let nonce: string | undefined = undefined;
 
                 // Encrypt if we have keys
                 if (keyPair && activeFriendId && friendPublicKeys[activeFriendId]) {
@@ -527,24 +435,15 @@ export const useAppStore = create<AppState>()(
 
                 console.log(`[Store] Sending message to room ${roomId}`);
                 try {
-                    const res = await fetch(`${API_URL}/chat/${roomId}/messages`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            Authorization: `Bearer ${token}`
-                        },
-                        body: JSON.stringify({ content: encryptedContent, nonce }),
+                    const message = await invoke<Message>('api_send_message', {
+                        roomId,
+                        content: encryptedContent,
+                        nonce
                     });
-
-                    if (res.ok) {
-                        const message = await res.json();
-                        console.log('[Store] Message sent');
-                        // Store original content for our own display
-                        message._decryptedContent = content;
-                        get().addMessage(message);
-                    } else {
-                        console.error('[Store] Failed to send message:', await res.text());
-                    }
+                    console.log('[Store] Message sent');
+                    // Store original content for our own display
+                    (message as Message & { _decryptedContent?: string })._decryptedContent = content;
+                    get().addMessage(message);
                 } catch (e) {
                     console.error('[Store] sendMessage exception:', e);
                 }
@@ -559,7 +458,7 @@ export const useAppStore = create<AppState>()(
                         console.log('[Store] Adding message to active conversation');
                         set({
                             messages: [...messages, message],
-                            lastMessageTimestamp: message.created_at
+                            lastMessageTimestamp: message.created_at || null
                         });
                     } else {
                         console.log('[Store] Message for different room, incrementing unread');
@@ -606,44 +505,28 @@ export const useAppStore = create<AppState>()(
             },
 
             deleteMessage: async (messageId) => {
-                const { token, activeRoom, messages } = get();
-                if (!token || !activeRoom) return;
+                const { activeRoom, messages } = get();
+                if (!activeRoom) return;
 
                 console.log(`[Store] 🗑️ Deleting message ${messageId}`);
                 try {
-                    const res = await fetch(`${API_URL}/chat/${activeRoom}/messages/${messageId}`, {
-                        method: 'DELETE',
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
-
-                    if (res.ok) {
-                        set({ messages: messages.filter(m => m.id !== messageId) });
-                        console.log('[Store] Message deleted successfully');
-                    } else {
-                        console.error('[Store] Failed to delete message:', await res.text());
-                    }
+                    await invoke('api_delete_message', { roomId: activeRoom, messageId });
+                    set({ messages: messages.filter(m => m.id !== messageId) });
+                    console.log('[Store] Message deleted successfully');
                 } catch (e) {
                     console.error('[Store] deleteMessage exception:', e);
                 }
             },
 
             deleteAllMessages: async () => {
-                const { token, activeRoom } = get();
-                if (!token || !activeRoom) return;
+                const { activeRoom } = get();
+                if (!activeRoom) return;
 
                 console.log(`[Store] 🗑️ Deleting ALL messages in room ${activeRoom}`);
                 try {
-                    const res = await fetch(`${API_URL}/chat/${activeRoom}/messages`, {
-                        method: 'DELETE',
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
-
-                    if (res.ok) {
-                        set({ messages: [] });
-                        console.log('[Store] All messages deleted successfully');
-                    } else {
-                        console.error('[Store] Failed to delete all messages:', await res.text());
-                    }
+                    await invoke('api_delete_all_messages', { roomId: activeRoom });
+                    set({ messages: [] });
+                    console.log('[Store] All messages deleted successfully');
                 } catch (e) {
                     console.error('[Store] deleteAllMessages exception:', e);
                 }
@@ -766,77 +649,46 @@ export const useAppStore = create<AppState>()(
 
             // Server Actions
             fetchServers: async () => {
-                const { token } = get();
-                if (!token) return;
                 try {
-                    const res = await fetch(`${API_URL}/servers`, {
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
-                    if (res.ok) {
-                        const servers = await res.json();
-                        set({ servers });
-                        console.log(`[Store] Fetched ${servers.length} servers`);
-                    }
+                    const servers = await invoke<Server[]>('api_fetch_servers');
+                    set({ servers });
+                    console.log(`[Store] Fetched ${servers.length} servers`);
                 } catch (e) {
                     console.error('[Store] fetchServers error:', e);
                 }
             },
 
             createServer: async (name, iconUrl) => {
-                const { token, fetchServers } = get();
-                if (!token) return;
+                const { fetchServers } = get();
                 try {
-                    const res = await fetch(`${API_URL}/servers`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            Authorization: `Bearer ${token}`,
-                        },
-                        body: JSON.stringify({ name, icon_url: iconUrl }),
-                    });
-                    if (res.ok) {
-                        console.log('[Store] Server created');
-                        await fetchServers();
-                    }
+                    await invoke('api_create_server', { name, iconUrl });
+                    console.log('[Store] Server created');
+                    await fetchServers();
                 } catch (e) {
                     console.error('[Store] createServer error:', e);
                 }
             },
 
             joinServer: async (inviteCode) => {
-                const { token, fetchServers } = get();
-                if (!token) return;
+                const { fetchServers } = get();
                 try {
-                    const res = await fetch(`${API_URL}/servers/join/${inviteCode}`, {
-                        method: 'POST',
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
-                    if (res.ok) {
-                        console.log('[Store] Joined server');
-                        await fetchServers();
-                    } else {
-                        console.error('[Store] Failed to join server:', await res.text());
-                    }
+                    await invoke('api_join_server', { inviteCode });
+                    console.log('[Store] Joined server');
+                    await fetchServers();
                 } catch (e) {
                     console.error('[Store] joinServer error:', e);
                 }
             },
 
             leaveServer: async (serverId) => {
-                const { token, fetchServers, activeServer } = get();
-                if (!token) return;
+                const { fetchServers, activeServer } = get();
                 try {
-                    const res = await fetch(`${API_URL}/servers/${serverId}/leave`, {
-                        method: 'POST',
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
-                    if (res.ok) {
-                        console.log('[Store] Left server');
-                        if (activeServer === serverId) {
-                            set({ activeServer: null, channels: [], activeChannel: null, serverMembers: [], channelMessages: [] });
-                        }
-                        await fetchServers();
+                    await invoke('api_leave_server', { serverId });
+                    console.log('[Store] Left server');
+                    if (activeServer === serverId) {
+                        set({ activeServer: null, channels: [], activeChannel: null, serverMembers: [], channelMessages: [] });
                     }
+                    await fetchServers();
                 } catch (e) {
                     console.error('[Store] leaveServer error:', e);
                 }
@@ -851,22 +703,15 @@ export const useAppStore = create<AppState>()(
             },
 
             fetchChannels: async (serverId) => {
-                const { token } = get();
-                if (!token) return;
                 try {
-                    const res = await fetch(`${API_URL}/servers/${serverId}`, {
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
-                    if (res.ok) {
-                        const data = await res.json();
-                        set({ channels: data.channels });
-                        console.log(`[Store] Fetched ${data.channels.length} channels`);
+                    const data = await invoke<{ channels: Channel[] }>('api_fetch_server_details', { serverId });
+                    set({ channels: data.channels });
+                    console.log(`[Store] Fetched ${data.channels.length} channels`);
 
-                        // Auto-select first text channel
-                        const firstTextChannel = data.channels.find((c: any) => c.channel_type === 'text');
-                        if (firstTextChannel) {
-                            get().setActiveChannel(firstTextChannel.id);
-                        }
+                    // Auto-select first text channel
+                    const firstTextChannel = data.channels.find((c: Channel) => c.channel_type === 'text');
+                    if (firstTextChannel) {
+                        get().setActiveChannel(firstTextChannel.id);
                     }
                 } catch (e) {
                     console.error('[Store] fetchChannels error:', e);
@@ -874,21 +719,11 @@ export const useAppStore = create<AppState>()(
             },
 
             createChannel: async (serverId, name, type = 'text') => {
-                const { token, fetchChannels } = get();
-                if (!token) return;
+                const { fetchChannels } = get();
                 try {
-                    const res = await fetch(`${API_URL}/servers/${serverId}/channels`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            Authorization: `Bearer ${token}`,
-                        },
-                        body: JSON.stringify({ name, channel_type: type }),
-                    });
-                    if (res.ok) {
-                        console.log('[Store] Channel created');
-                        await fetchChannels(serverId);
-                    }
+                    await invoke('api_create_channel', { serverId, name, channelType: type });
+                    console.log('[Store] Channel created');
+                    await fetchChannels(serverId);
                 } catch (e) {
                     console.error('[Store] createChannel error:', e);
                 }
@@ -903,56 +738,31 @@ export const useAppStore = create<AppState>()(
             },
 
             fetchServerMembers: async (serverId) => {
-                const { token } = get();
-                if (!token) return;
                 try {
-                    const res = await fetch(`${API_URL}/servers/${serverId}/members`, {
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
-                    if (res.ok) {
-                        const members = await res.json();
-                        set({ serverMembers: members });
-                        console.log(`[Store] Fetched ${members.length} members`);
-                    }
+                    const members = await invoke<ServerMember[]>('api_fetch_server_members', { serverId });
+                    set({ serverMembers: members });
+                    console.log(`[Store] Fetched ${members.length} members`);
                 } catch (e) {
                     console.error('[Store] fetchServerMembers error:', e);
                 }
             },
 
             fetchChannelMessages: async (serverId, channelId) => {
-                const { token } = get();
-                if (!token) return;
                 try {
-                    const res = await fetch(`${API_URL}/servers/${serverId}/channels/${channelId}/messages`, {
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
-                    if (res.ok) {
-                        const messages = await res.json();
-                        set({ channelMessages: messages });
-                        console.log(`[Store] Fetched ${messages.length} channel messages`);
-                    }
+                    const messages = await invoke<ChannelMessage[]>('api_fetch_channel_messages', { serverId, channelId });
+                    set({ channelMessages: messages });
+                    console.log(`[Store] Fetched ${messages.length} channel messages`);
                 } catch (e) {
                     console.error('[Store] fetchChannelMessages error:', e);
                 }
             },
 
             sendChannelMessage: async (serverId, channelId, content) => {
-                const { token, channelMessages } = get();
-                if (!token) return;
+                const { channelMessages } = get();
                 try {
-                    const res = await fetch(`${API_URL}/servers/${serverId}/channels/${channelId}/messages`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            Authorization: `Bearer ${token}`,
-                        },
-                        body: JSON.stringify({ content }),
-                    });
-                    if (res.ok) {
-                        const message = await res.json();
-                        set({ channelMessages: [...channelMessages, message] });
-                        console.log('[Store] Channel message sent');
-                    }
+                    const message = await invoke<ChannelMessage>('api_send_channel_message', { serverId, channelId, content });
+                    set({ channelMessages: [...channelMessages, message] });
+                    console.log('[Store] Channel message sent');
                 } catch (e) {
                     console.error('[Store] sendChannelMessage error:', e);
                 }
