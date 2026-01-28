@@ -10,7 +10,7 @@ thiserror = "1.0"
 tracing = "0.1"
 cpal = "0.15"
 audiopus = "0.3.0-rc.0"
-webrtc = { version = "0.10", features = ["serde"] }
+webrtc = { version = "0.14.0", features = ["serde"] }
 xcap = "0.0.9"
 ring = "0.17"
 rand = "0.8"
