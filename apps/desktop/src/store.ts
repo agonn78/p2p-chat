@@ -227,7 +227,7 @@ export const useAppStore = create<AppState>()(
 
                 console.log(`[Store] 🔐 Fetching public key for friend ${friendId}`);
                 try {
-                    const publicKey = await invoke<string | null>('api_fetch_user_public_key', { user_id: friendId });
+                    const publicKey = await invoke<string | null>('api_fetch_user_public_key', { userId: friendId });
                     if (publicKey) {
                         set({
                             friendPublicKeys: {
@@ -273,11 +273,18 @@ export const useAppStore = create<AppState>()(
                 const friendPublicKey = friendPublicKeys[friendId];
                 if (!friendPublicKey) {
                     // Try to fetch the key asynchronously
+                    console.log(`[E2EE-DEBUG] No cached key for ${friendId}, fetching...`);
                     fetchFriendPublicKey(friendId);
                     return '[Decrypting...]';
                 }
 
                 try {
+                    console.log(`[E2EE-DEBUG] Decrypting message from ${message.sender_id}`);
+                    console.log(`[E2EE-DEBUG] Using friendId: ${friendId}`);
+                    console.log(`[E2EE-DEBUG] My public key: ${keyPair.publicKey?.substring(0, 20)}...`);
+                    console.log(`[E2EE-DEBUG] Friend public key: ${friendPublicKey?.substring(0, 20)}...`);
+                    console.log(`[E2EE-DEBUG] Nonce: ${message.nonce?.substring(0, 20)}...`);
+
                     const sharedSecret = crypto.getSharedSecret(
                         friendId,
                         keyPair.secretKey,
@@ -291,8 +298,10 @@ export const useAppStore = create<AppState>()(
                     );
 
                     if (decrypted) {
+                        console.log(`[E2EE-DEBUG] ✅ Decryption successful`);
                         return decrypted;
                     }
+                    console.log(`[E2EE-DEBUG] ❌ decryptMessage returned null`);
                 } catch (e) {
                     console.error('[Store] Decryption failed:', e);
                 }
@@ -337,7 +346,7 @@ export const useAppStore = create<AppState>()(
                 const { fetchFriends, fetchPendingRequests } = get();
                 console.log(`[Store] Accepting friend request from user ID: ${friendId}`);
                 try {
-                    await invoke('api_accept_friend', { friend_id: friendId });
+                    await invoke('api_accept_friend', { friendId });
                     console.log('[Store] Friend accepted successfully. Refreshing lists...');
                     await fetchFriends();
                     await fetchPendingRequests();
@@ -356,7 +365,7 @@ export const useAppStore = create<AppState>()(
                 await fetchFriendPublicKey(friendId);
 
                 try {
-                    const room = await invoke<Room>('api_create_or_get_dm', { friend_id: friendId });
+                    const room = await invoke<Room>('api_create_or_get_dm', { friendId });
                     console.log(`[Store] Got room:`, room);
 
                     // Clear messages and set active room + friend
@@ -375,7 +384,7 @@ export const useAppStore = create<AppState>()(
             fetchMessages: async (roomId) => {
                 console.log(`[Store] Fetching messages for room: ${roomId}`);
                 try {
-                    const messages = await invoke<Message[]>('api_fetch_messages', { room_id: roomId });
+                    const messages = await invoke<Message[]>('api_fetch_messages', { roomId });
                     console.log(`[Store] Fetched ${messages.length} messages`);
                     set({ messages });
 
@@ -395,7 +404,7 @@ export const useAppStore = create<AppState>()(
                 if (!activeRoom) return;
 
                 try {
-                    const serverMessages = await invoke<Message[]>('api_fetch_messages', { room_id: activeRoom });
+                    const serverMessages = await invoke<Message[]>('api_fetch_messages', { roomId: activeRoom });
                     const currentIds = new Set(messages.map(m => m.id));
 
                     // Add any new messages
@@ -436,7 +445,7 @@ export const useAppStore = create<AppState>()(
                 console.log(`[Store] Sending message to room ${roomId}`);
                 try {
                     const message = await invoke<Message>('api_send_message', {
-                        room_id: roomId,
+                        roomId,
                         content: encryptedContent,
                         nonce
                     });
@@ -510,7 +519,7 @@ export const useAppStore = create<AppState>()(
 
                 console.log(`[Store] 🗑️ Deleting message ${messageId}`);
                 try {
-                    await invoke('api_delete_message', { room_id: activeRoom, message_id: messageId });
+                    await invoke('api_delete_message', { roomId: activeRoom, messageId });
                     set({ messages: messages.filter(m => m.id !== messageId) });
                     console.log('[Store] Message deleted successfully');
                 } catch (e) {
@@ -524,7 +533,7 @@ export const useAppStore = create<AppState>()(
 
                 console.log(`[Store] 🗑️ Deleting ALL messages in room ${activeRoom}`);
                 try {
-                    await invoke('api_delete_all_messages', { room_id: activeRoom });
+                    await invoke('api_delete_all_messages', { roomId: activeRoom });
                     set({ messages: [] });
                     console.log('[Store] All messages deleted successfully');
                 } catch (e) {
@@ -661,7 +670,7 @@ export const useAppStore = create<AppState>()(
             createServer: async (name, iconUrl) => {
                 const { fetchServers } = get();
                 try {
-                    await invoke('api_create_server', { name, icon_url: iconUrl });
+                    await invoke('api_create_server', { name, iconUrl });
                     console.log('[Store] Server created');
                     await fetchServers();
                 } catch (e) {
@@ -672,7 +681,7 @@ export const useAppStore = create<AppState>()(
             joinServer: async (inviteCode) => {
                 const { fetchServers } = get();
                 try {
-                    await invoke('api_join_server', { invite_code: inviteCode });
+                    await invoke('api_join_server', { inviteCode });
                     console.log('[Store] Joined server');
                     await fetchServers();
                 } catch (e) {
@@ -683,7 +692,7 @@ export const useAppStore = create<AppState>()(
             leaveServer: async (serverId) => {
                 const { fetchServers, activeServer } = get();
                 try {
-                    await invoke('api_leave_server', { server_id: serverId });
+                    await invoke('api_leave_server', { serverId });
                     console.log('[Store] Left server');
                     if (activeServer === serverId) {
                         set({ activeServer: null, channels: [], activeChannel: null, serverMembers: [], channelMessages: [] });
@@ -704,7 +713,7 @@ export const useAppStore = create<AppState>()(
 
             fetchChannels: async (serverId) => {
                 try {
-                    const data = await invoke<{ channels: Channel[] }>('api_fetch_server_details', { server_id: serverId });
+                    const data = await invoke<{ channels: Channel[] }>('api_fetch_server_details', { serverId });
                     set({ channels: data.channels });
                     console.log(`[Store] Fetched ${data.channels.length} channels`);
 
@@ -721,7 +730,7 @@ export const useAppStore = create<AppState>()(
             createChannel: async (serverId, name, type = 'text') => {
                 const { fetchChannels } = get();
                 try {
-                    await invoke('api_create_channel', { server_id: serverId, name, channel_type: type });
+                    await invoke('api_create_channel', { serverId, name, channelType: type });
                     console.log('[Store] Channel created');
                     await fetchChannels(serverId);
                 } catch (e) {
@@ -739,7 +748,7 @@ export const useAppStore = create<AppState>()(
 
             fetchServerMembers: async (serverId) => {
                 try {
-                    const members = await invoke<ServerMember[]>('api_fetch_server_members', { server_id: serverId });
+                    const members = await invoke<ServerMember[]>('api_fetch_server_members', { serverId });
                     set({ serverMembers: members });
                     console.log(`[Store] Fetched ${members.length} members`);
                 } catch (e) {
@@ -749,7 +758,7 @@ export const useAppStore = create<AppState>()(
 
             fetchChannelMessages: async (serverId, channelId) => {
                 try {
-                    const messages = await invoke<ChannelMessage[]>('api_fetch_channel_messages', { server_id: serverId, channel_id: channelId });
+                    const messages = await invoke<ChannelMessage[]>('api_fetch_channel_messages', { serverId, channelId });
                     set({ channelMessages: messages });
                     console.log(`[Store] Fetched ${messages.length} channel messages`);
                 } catch (e) {
@@ -760,7 +769,7 @@ export const useAppStore = create<AppState>()(
             sendChannelMessage: async (serverId, channelId, content) => {
                 const { channelMessages } = get();
                 try {
-                    const message = await invoke<ChannelMessage>('api_send_channel_message', { server_id: serverId, channel_id: channelId, content });
+                    const message = await invoke<ChannelMessage>('api_send_channel_message', { serverId, channelId, content });
                     set({ channelMessages: [...channelMessages, message] });
                     console.log('[Store] Channel message sent');
                 } catch (e) {
