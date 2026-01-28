@@ -8,9 +8,8 @@ pub struct PublicKeyRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct UserPublicKey {
-    pub id: String,
-    pub username: String,
+pub struct PublicKeyResponse {
+    pub user_id: String,
     pub public_key: Option<String>,
 }
 
@@ -61,7 +60,7 @@ pub async fn api_fetch_user_public_key(
         return Ok(None);
     }
 
-    let data: UserPublicKey = res.json().await
+    let data: PublicKeyResponse = res.json().await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
     Ok(data.public_key)
