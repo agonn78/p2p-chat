@@ -201,6 +201,7 @@ fn main() {
             api::auth::api_login,
             api::auth::api_register,
             api::auth::api_logout,
+            api::auth::api_health_check,
             api::users::api_upload_public_key,
             api::users::api_fetch_user_public_key,
             api::friends::api_fetch_friends,

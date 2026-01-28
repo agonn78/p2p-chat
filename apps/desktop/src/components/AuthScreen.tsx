@@ -1,9 +1,8 @@
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { Loader2, Zap, Wifi, WifiOff } from 'lucide-react';
-
-const API_URL = import.meta.env.VITE_API_URL || 'http://live.ewanhomelab.fr';
 
 export function AuthScreen() {
     const [mode, setMode] = useState<'login' | 'register'>('login');
@@ -22,8 +21,9 @@ export function AuthScreen() {
     useEffect(() => {
         const checkServer = async () => {
             try {
-                const res = await fetch(`${API_URL}/health`, { method: 'GET' });
-                setServerStatus(res.ok ? 'online' : 'offline');
+                // Use Rust API to avoid CORS on Windows
+                const isHealthy = await invoke<boolean>('api_health_check');
+                setServerStatus(isHealthy ? 'online' : 'offline');
             } catch {
                 setServerStatus('offline');
             }

@@ -19,9 +19,9 @@ pub struct RegisterRequest {
 pub struct User {
     pub id: String,
     pub username: String,
-    pub email: String,
+    // Note: server's UserPublic doesn't include email in response
     pub avatar_url: Option<String>,
-    pub public_key: Option<String>,
+    pub last_seen: Option<String>,  // DateTime comes as string
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -95,4 +95,14 @@ pub async fn api_register(
 pub async fn api_logout(state: State<'_, ApiState>) -> Result<(), String> {
     state.set_token(None).await;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn api_health_check(state: State<'_, ApiState>) -> Result<bool, String> {
+    let url = format!("{}/health", state.base_url);
+    
+    match state.client.get(&url).send().await {
+        Ok(res) => Ok(res.status().is_success()),
+        Err(_) => Ok(false),
+    }
 }
