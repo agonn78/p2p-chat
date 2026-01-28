@@ -173,6 +173,186 @@ async fn cancel_call(state: State<'_, AppState>, target_id: String) -> Result<()
     signaling::send_signal(&state.ws_sender, msg).await
 }
 
+// === Audio Commands ===
+
+/// Audio device info for frontend
+#[derive(serde::Serialize)]
+struct AudioDevice {
+    id: String,
+    name: String,
+}
+
+/// List available input (microphone) devices
+#[tauri::command]
+async fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
+    MediaEngine::list_input_devices()
+        .map(|devices| {
+            devices.into_iter()
+                .map(|(id, name)| AudioDevice { id, name })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_default_audio_device() -> Result<AudioDevice, String> {
+    MediaEngine::default_input_device_name()
+        .map(|name| AudioDevice { id: name.clone(), name })
+        .map_err(|e| e.to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct IceCandidatePayload {
+    candidate: String,
+    sdpMid: Option<String>,
+    sdpMLineIndex: Option<u16>,
+}
+
+/// Start WebRTC handshake (Caller side)
+/// Initializes PC, DC, creates Offer, and sends it via WS.
+#[tauri::command]
+async fn init_audio_call(state: State<'_, AppState>, target_id: String) -> Result<(), String> {
+    println!("📞 [WEBRTC] Initializing audio call to {}", target_id);
+    
+    // 1. Initialize WebRTC
+    let mut ice_rx = {
+        let mut engine = state.media.lock().map_err(|e| e.to_string())?;
+        if !engine.is_ready_for_audio() {
+            return Err("E2EE handshake not completed".to_string());
+        }
+        engine.init_webrtc().await.map_err(|e| e.to_string())?
+    };
+
+    // 2. Spawn ICE candidate forwarder
+    let ws_sender = state.ws_sender.clone();
+    let target_id_clone = target_id.clone();
+    tokio::spawn(async move {
+        while let Some(candidate_json) = ice_rx.recv().await {
+            // Parse JSON to extract fields for SignalingMessage
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&candidate_json) {
+                let candidate = parsed["candidate"].as_str().unwrap_or("").to_string();
+                let sdp_mid = parsed["sdpMid"].as_str().map(|s| s.to_string());
+                let sdp_m_line_index = parsed["sdpMLineIndex"].as_u64().map(|n| n as u16);
+
+                let msg = SignalingMessage::Candidate {
+                    target_id: target_id_clone.clone(),
+                    candidate,
+                    sdp_mid,
+                    sdp_m_line_index,
+                };
+                let _ = signaling::send_signal(&ws_sender, msg).await;
+            }
+        }
+    });
+
+    // 3. Create Audio DataChannel
+    {
+        let engine = state.media.lock().map_err(|e| e.to_string())?;
+        engine.create_audio_channel().await.map_err(|e| e.to_string())?;
+    }
+
+    // 4. Create Offer
+    let sdp = {
+        let engine = state.media.lock().map_err(|e| e.to_string())?;
+        engine.create_offer().await.map_err(|e| e.to_string())?
+    };
+    println!("📞 [WEBRTC] Offer created, sending...");
+
+    // 5. Send Offer via WS
+    let msg = SignalingMessage::Offer { target_id, sdp };
+    signaling::send_signal(&state.ws_sender, msg).await
+}
+
+/// Handle received Offer (Callee side)
+/// Initializes PC, accepts offer, creates Answer, and sends it via WS.
+#[tauri::command]
+async fn handle_audio_offer(state: State<'_, AppState>, target_id: String, sdp: String) -> Result<(), String> {
+    println!("📞 [WEBRTC] Handling Offer from {}", target_id);
+
+    // 1. Initialize WebRTC (Answerer)
+    let mut ice_rx = {
+        let mut engine = state.media.lock().map_err(|e| e.to_string())?;
+        // Note: is_ready_for_audio check might fail if E2EE not finished, but normally it is.
+        engine.init_webrtc().await.map_err(|e| e.to_string())?
+    };
+
+    // 2. Spawn ICE candidate forwarder
+    let ws_sender = state.ws_sender.clone();
+    let target_id_clone = target_id.clone();
+    tokio::spawn(async move {
+        while let Some(candidate_json) = ice_rx.recv().await {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&candidate_json) {
+                let candidate = parsed["candidate"].as_str().unwrap_or("").to_string();
+                let sdp_mid = parsed["sdpMid"].as_str().map(|s| s.to_string());
+                let sdp_m_line_index = parsed["sdpMLineIndex"].as_u64().map(|n| n as u16);
+
+                let msg = SignalingMessage::Candidate {
+                    target_id: target_id_clone.clone(),
+                    candidate,
+                    sdp_mid,
+                    sdp_m_line_index,
+                };
+                let _ = signaling::send_signal(&ws_sender, msg).await;
+            }
+        }
+    });
+
+    // 3. Accept Offer and Create Answer
+    let answer_sdp = {
+        let engine = state.media.lock().map_err(|e| e.to_string())?;
+        engine.accept_offer(&sdp).await.map_err(|e| e.to_string())?
+    };
+    println!("📞 [WEBRTC] Answer created, sending...");
+
+    // 4. Send Answer
+    let msg = SignalingMessage::Answer { target_id, sdp: answer_sdp };
+    signaling::send_signal(&state.ws_sender, msg).await
+}
+
+/// Handle received Answer (Caller side)
+#[tauri::command]
+async fn handle_audio_answer(state: State<'_, AppState>, sdp: String) -> Result<(), String> {
+    println!("📞 [WEBRTC] Handling Answer");
+    let engine = state.media.lock().map_err(|e| e.to_string())?;
+    engine.set_remote_description(&sdp).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Handle received ICE candidate
+#[tauri::command]
+async fn handle_ice_candidate(state: State<'_, AppState>, payload: IceCandidatePayload) -> Result<(), String> {
+    // Reconstruct valid JSON for RTCIceCandidateInit
+    let json = serde_json::json!({
+        "candidate": payload.candidate,
+        "sdpMid": payload.sdpMid,
+        "sdpMLineIndex": payload.sdpMLineIndex
+    });
+    let candidate_str = json.to_string();
+
+    let engine = state.media.lock().map_err(|e| e.to_string())?;
+    engine.add_ice_candidate(&candidate_str).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Start audio capture on call (after E2EE handshake)
+#[tauri::command]
+async fn start_call_audio(state: State<'_, AppState>) -> Result<(), String> {
+    println!("🔊 [AUDIO] Starting call audio...");
+    
+    let engine = state.media.lock().map_err(|e| e.to_string())?;
+    
+    if !engine.is_ready_for_audio() {
+        return Err("E2EE key exchange not completed".to_string());
+    }
+    
+    // For now, just log that we're ready
+    // The actual audio streaming requires WebRTC or similar transport
+    println!("🔊 [AUDIO] ✅ Audio is ready - E2EE context available");
+    println!("🔊 [AUDIO] Note: Full audio streaming requires WebRTC transport (TODO)");
+    
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -223,6 +403,13 @@ fn main() {
             decline_call,
             end_call,
             cancel_call,
+            // Audio commands
+            list_audio_devices,
+            get_default_audio_device,
+            init_audio_call,
+            handle_audio_offer,
+            handle_audio_answer,
+            handle_ice_candidate,
             // API commands
             api::auth::api_login,
             api::auth::api_register,

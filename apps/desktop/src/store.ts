@@ -617,10 +617,17 @@ export const useAppStore = create<AppState>()(
                 });
 
                 try {
+                    console.log('[CALL-DEBUG] Callee: Invoking accept_call...');
                     await invoke('accept_call', {
                         callerId: activeCall.peerId,
                         callerPublicKey: activeCall.peerPublicKey,
                     });
+                    console.log('[CALL-DEBUG] Callee: ✅ accept_call succeeded');
+
+                    console.log('[CALL-DEBUG] Callee: ✅ accept_call succeeded');
+
+                    // Audio setup will be triggered by incoming WebRTC Offer (webrtc-offer event in App.tsx)
+
 
                     // E2EE established on callee side, now connected
                     set({
@@ -630,9 +637,9 @@ export const useAppStore = create<AppState>()(
                             startTime: Date.now(),
                         },
                     });
-                    console.log('[Call] Accepted call, E2EE established');
+                    console.log('[CALL-DEBUG] Callee: ✅ Call status set to connected');
                 } catch (e) {
-                    console.error('[Call] Failed to accept call:', e);
+                    console.error('[CALL-DEBUG] Callee: ❌ Failed to accept call:', e);
                     set({ activeCall: null });
                 }
             },

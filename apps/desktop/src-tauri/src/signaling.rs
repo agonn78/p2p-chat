@@ -47,14 +47,31 @@ pub async fn connect(server_url: &str, app_handle: tauri::AppHandle) -> Result<W
                     // Also handle WebRTC signaling
                     if let Ok(signal) = serde_json::from_str::<SignalingMessage>(&text) {
                         match signal {
-                            SignalingMessage::Offer { target_id: _, sdp } => {
-                                println!("🎯 Received Offer SDP: {}...", &sdp[..50.min(sdp.len())]);
+                            SignalingMessage::Offer { target_id, sdp } => {
+                                println!("🎯 Received Offer SDP from {}", target_id);
+                                let payload = serde_json::json!({
+                                    "peerId": target_id,
+                                    "sdp": sdp,
+                                });
+                                let _ = app_handle_clone.emit("webrtc-offer", payload);
                             }
-                            SignalingMessage::Answer { target_id: _, sdp } => {
-                                println!("🎯 Received Answer SDP: {}...", &sdp[..50.min(sdp.len())]);
+                            SignalingMessage::Answer { target_id, sdp } => {
+                                println!("🎯 Received Answer SDP from {}", target_id);
+                                let payload = serde_json::json!({
+                                    "peerId": target_id,
+                                    "sdp": sdp,
+                                });
+                                let _ = app_handle_clone.emit("webrtc-answer", payload);
                             }
-                            SignalingMessage::Candidate { target_id: _, candidate, .. } => {
-                                println!("🎯 Received ICE Candidate: {}", candidate);
+                            SignalingMessage::Candidate { target_id, candidate, sdp_mid, sdp_m_line_index } => {
+                                println!("🎯 Received ICE Candidate from {}", target_id);
+                                let payload = serde_json::json!({
+                                    "peerId": target_id,
+                                    "candidate": candidate,
+                                    "sdpMid": sdp_mid,
+                                    "sdpMLineIndex": sdp_m_line_index,
+                                });
+                                let _ = app_handle_clone.emit("webrtc-candidate", payload);
                             }
                             
                             // === Call Events ===

@@ -1,6 +1,12 @@
 import { useState, useEffect } from 'react';
-import { Phone, PhoneOff, Mic, MicOff, X } from 'lucide-react';
+import { Phone, PhoneOff, Mic, MicOff, Settings, ChevronDown } from 'lucide-react';
 import { useAppStore } from '../store';
+import { invoke } from '@tauri-apps/api/core';
+
+interface AudioDevice {
+    id: string;
+    name: string;
+}
 
 export function CallOverlay() {
     const activeCall = useAppStore((s) => s.activeCall);
@@ -9,6 +15,10 @@ export function CallOverlay() {
 
     const [isMuted, setIsMuted] = useState(false);
     const [callDuration, setCallDuration] = useState(0);
+    const [showSettings, setShowSettings] = useState(false);
+    const [audioDevices, setAudioDevices] = useState<AudioDevice[]>([]);
+    const [selectedDevice, setSelectedDevice] = useState<string>('');
+    const [isLoadingDevices, setIsLoadingDevices] = useState(false);
 
     // Timer for call duration
     useEffect(() => {
@@ -20,6 +30,30 @@ export function CallOverlay() {
         }
         setCallDuration(0);
     }, [activeCall?.status, activeCall?.startTime]);
+
+    // Load audio devices when settings opened
+    useEffect(() => {
+        if (showSettings) {
+            loadAudioDevices();
+        }
+    }, [showSettings]);
+
+    const loadAudioDevices = async () => {
+        setIsLoadingDevices(true);
+        try {
+            const devices = await invoke<AudioDevice[]>('list_audio_devices');
+            setAudioDevices(devices);
+
+            // Get default device
+            const defaultDevice = await invoke<string>('get_default_audio_device');
+            if (!selectedDevice && devices.length > 0) {
+                setSelectedDevice(defaultDevice || devices[0].id);
+            }
+        } catch (err) {
+            console.error('Failed to load audio devices:', err);
+        }
+        setIsLoadingDevices(false);
+    };
 
     // Only show for calling, connecting, or connected states
     if (!activeCall || activeCall.status === 'idle' || activeCall.status === 'ended' || activeCall.status === 'ringing') {
@@ -38,15 +72,17 @@ export function CallOverlay() {
         } else {
             endCall();
         }
+        setShowSettings(false);
     };
 
     const toggleMute = () => {
         setIsMuted(!isMuted);
         // TODO: Actually mute the audio stream
+        console.log('[Audio] Mute toggled:', !isMuted);
     };
 
     return (
-        <div className="fixed top-4 right-4 z-50 w-72 bg-surface/95 backdrop-blur-lg rounded-xl border border-white/10 shadow-2xl overflow-hidden">
+        <div className="fixed top-4 right-4 z-50 w-80 bg-surface/95 backdrop-blur-lg rounded-xl border border-white/10 shadow-2xl overflow-hidden">
             {/* Header */}
             <div className="p-4 bg-gradient-to-r from-primary/20 to-secondary/20 border-b border-white/5">
                 <div className="flex items-center gap-3">
@@ -72,8 +108,53 @@ export function CallOverlay() {
                             )}
                         </div>
                     </div>
+
+                    {/* Settings button */}
+                    <button
+                        onClick={() => setShowSettings(!showSettings)}
+                        className={`w-8 h-8 rounded-full flex items-center justify-center transition ${showSettings ? 'bg-white/20' : 'hover:bg-white/10'
+                            }`}
+                        title="Audio Settings"
+                    >
+                        <Settings className="w-4 h-4" />
+                    </button>
                 </div>
             </div>
+
+            {/* Audio Settings Panel */}
+            {showSettings && (
+                <div className="p-3 border-b border-white/5 bg-white/5">
+                    <div className="text-xs text-gray-400 mb-2">Microphone</div>
+                    <div className="relative">
+                        <select
+                            value={selectedDevice}
+                            onChange={(e) => {
+                                setSelectedDevice(e.target.value);
+                                console.log('[Audio] Selected device:', e.target.value);
+                                // TODO: Actually switch audio device
+                            }}
+                            className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-sm appearance-none cursor-pointer focus:outline-none focus:border-primary/50"
+                            disabled={isLoadingDevices}
+                        >
+                            {isLoadingDevices ? (
+                                <option>Loading...</option>
+                            ) : audioDevices.length === 0 ? (
+                                <option>No devices found</option>
+                            ) : (
+                                audioDevices.map((device) => (
+                                    <option key={device.id} value={device.id}>
+                                        {device.name}
+                                    </option>
+                                ))
+                            )}
+                        </select>
+                        <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
+                    </div>
+                    <div className="mt-2 text-xs text-gray-500">
+                        ⚠️ Device switching requires call restart
+                    </div>
+                </div>
+            )}
 
             {/* Controls */}
             <div className="p-4 flex justify-center gap-4">
@@ -81,8 +162,8 @@ export function CallOverlay() {
                 <button
                     onClick={toggleMute}
                     className={`w-12 h-12 rounded-full flex items-center justify-center transition ${isMuted
-                            ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
-                            : 'bg-white/10 hover:bg-white/20'
+                        ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
+                        : 'bg-white/10 hover:bg-white/20'
                         }`}
                     title={isMuted ? 'Unmute' : 'Mute'}
                 >

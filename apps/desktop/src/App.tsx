@@ -163,13 +163,21 @@ function App() {
             const unlistenAccepted = await listen<CallAcceptedPayload>('call-accepted', async (event) => {
                 console.log('[CALL-DEBUG] ===== CALL ACCEPTED EVENT =====');
                 console.log('[CALL-DEBUG] Payload:', JSON.stringify(event.payload, null, 2));
-                console.log('[CALL-DEBUG] Current activeCall state:', JSON.stringify(useAppStore.getState().activeCall, null, 2));
+
                 // Complete E2EE handshake on caller side
                 try {
-                    console.log('[CALL-DEBUG] Calling complete_call_handshake with publicKey:', event.payload.publicKey?.substring(0, 20) + '...');
                     await invoke('complete_call_handshake', { peerPublicKey: event.payload.publicKey });
                     console.log('[CALL-DEBUG] ✅ complete_call_handshake succeeded');
-                    console.log('[CALL-DEBUG] Setting status to connected...');
+
+                    // Start WebRTC Audio Handshake
+                    console.log('[CALL-DEBUG] Initializing WebRTC audio call...');
+                    try {
+                        await invoke('init_audio_call', { targetId: event.payload.peerId });
+                        console.log('[CALL-DEBUG] ✅ WebRTC audio call initialized');
+                    } catch (audioErr) {
+                        console.warn('[CALL-DEBUG] ⚠️ Audio start failed:', audioErr);
+                    }
+
                     useAppStore.setState((state) => ({
                         activeCall: state.activeCall ? {
                             ...state.activeCall,
@@ -177,31 +185,56 @@ function App() {
                             startTime: Date.now(),
                         } : null,
                     }));
-                    console.log('[CALL-DEBUG] ✅ Call status set to connected');
-                    console.log('[CALL-DEBUG] New activeCall state:', JSON.stringify(useAppStore.getState().activeCall, null, 2));
                 } catch (e) {
                     console.error('[CALL-DEBUG] ❌ E2EE handshake failed:', e);
                     endCall();
                 }
             });
 
+            // WebRTC Listeners
+            const unlistenOffer = await listen<any>('webrtc-offer', async (event) => {
+                console.log('[WEBRTC] Received Offer, handling...');
+                try {
+                    await invoke('handle_audio_offer', {
+                        targetId: event.payload.peerId,
+                        sdp: event.payload.sdp
+                    });
+                    // Note: Callee starts sending media after handling offer (creating answer)
+                } catch (e) {
+                    console.error('[WEBRTC] Failed to handle offer:', e);
+                }
+            });
+
+            const unlistenAnswer = await listen<any>('webrtc-answer', async (event) => {
+                console.log('[WEBRTC] Received Answer, handling...');
+                try {
+                    await invoke('handle_audio_answer', { sdp: event.payload.sdp });
+                } catch (e) {
+                    console.error('[WEBRTC] Failed to handle answer:', e);
+                }
+            });
+
+            const unlistenCandidate = await listen<any>('webrtc-candidate', async (event) => {
+                // console.log('[WEBRTC] Received ICE candidate');
+                try {
+                    await invoke('handle_ice_candidate', { payload: event.payload });
+                } catch (e) {
+                    console.error('[WEBRTC] Failed to handle candidate:', e);
+                }
+            });
+
             const unlistenDeclined = await listen<string>('call-declined', (event) => {
                 console.log('[CALL-DEBUG] ===== CALL DECLINED EVENT =====');
-                console.log('[CALL-DEBUG] Event payload:', event.payload);
                 useAppStore.setState({ activeCall: null });
             });
 
             const unlistenEnded = await listen<string>('call-ended', (event) => {
                 console.log('[CALL-DEBUG] ===== CALL ENDED EVENT =====');
-                console.log('[CALL-DEBUG] Event payload:', event.payload);
-                console.log('[CALL-DEBUG] Current activeCall before clear:', JSON.stringify(useAppStore.getState().activeCall, null, 2));
                 useAppStore.setState({ activeCall: null });
-                console.log('[CALL-DEBUG] activeCall cleared');
             });
 
             const unlistenBusy = await listen<string>('call-busy', () => {
                 console.log('[App] 📳 Target is busy');
-                // TODO: Show toast notification
                 useAppStore.setState({ activeCall: null });
             });
 
@@ -213,6 +246,9 @@ function App() {
             return () => {
                 unlistenIncoming();
                 unlistenAccepted();
+                unlistenOffer();
+                unlistenAnswer();
+                unlistenCandidate();
                 unlistenDeclined();
                 unlistenEnded();
                 unlistenBusy();
