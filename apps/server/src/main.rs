@@ -61,11 +61,13 @@ async fn main() {
     // Initialize state
     let app_state = AppState::new(pool.clone());
 
-    // CORS configuration
+    // CORS configuration - explicit for Windows compatibility
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers(Any)
+        .expose_headers(Any)
+        .max_age(std::time::Duration::from_secs(3600));
 
     // Build router
     let app = Router::new()
