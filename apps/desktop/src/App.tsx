@@ -161,10 +161,15 @@ function App() {
             });
 
             const unlistenAccepted = await listen<CallAcceptedPayload>('call-accepted', async (event) => {
-                console.log('[App] ✅ Call accepted event:', event.payload);
+                console.log('[CALL-DEBUG] ===== CALL ACCEPTED EVENT =====');
+                console.log('[CALL-DEBUG] Payload:', JSON.stringify(event.payload, null, 2));
+                console.log('[CALL-DEBUG] Current activeCall state:', JSON.stringify(useAppStore.getState().activeCall, null, 2));
                 // Complete E2EE handshake on caller side
                 try {
+                    console.log('[CALL-DEBUG] Calling complete_call_handshake with publicKey:', event.payload.publicKey?.substring(0, 20) + '...');
                     await invoke('complete_call_handshake', { peerPublicKey: event.payload.publicKey });
+                    console.log('[CALL-DEBUG] ✅ complete_call_handshake succeeded');
+                    console.log('[CALL-DEBUG] Setting status to connected...');
                     useAppStore.setState((state) => ({
                         activeCall: state.activeCall ? {
                             ...state.activeCall,
@@ -172,20 +177,26 @@ function App() {
                             startTime: Date.now(),
                         } : null,
                     }));
+                    console.log('[CALL-DEBUG] ✅ Call status set to connected');
+                    console.log('[CALL-DEBUG] New activeCall state:', JSON.stringify(useAppStore.getState().activeCall, null, 2));
                 } catch (e) {
-                    console.error('[App] E2EE handshake failed:', e);
+                    console.error('[CALL-DEBUG] ❌ E2EE handshake failed:', e);
                     endCall();
                 }
             });
 
-            const unlistenDeclined = await listen<string>('call-declined', () => {
-                console.log('[App] ❌ Call declined');
+            const unlistenDeclined = await listen<string>('call-declined', (event) => {
+                console.log('[CALL-DEBUG] ===== CALL DECLINED EVENT =====');
+                console.log('[CALL-DEBUG] Event payload:', event.payload);
                 useAppStore.setState({ activeCall: null });
             });
 
-            const unlistenEnded = await listen<string>('call-ended', () => {
-                console.log('[App] 📴 Call ended by peer');
+            const unlistenEnded = await listen<string>('call-ended', (event) => {
+                console.log('[CALL-DEBUG] ===== CALL ENDED EVENT =====');
+                console.log('[CALL-DEBUG] Event payload:', event.payload);
+                console.log('[CALL-DEBUG] Current activeCall before clear:', JSON.stringify(useAppStore.getState().activeCall, null, 2));
                 useAppStore.setState({ activeCall: null });
+                console.log('[CALL-DEBUG] activeCall cleared');
             });
 
             const unlistenBusy = await listen<string>('call-busy', () => {

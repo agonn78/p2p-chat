@@ -61,20 +61,31 @@ async fn send_answer(state: State<'_, AppState>, target_id: String, sdp: String)
 /// Start a call to a friend - generates keypair and sends CallInitiate
 #[tauri::command]
 async fn start_call(state: State<'_, AppState>, target_id: String) -> Result<String, String> {
-    println!("📞 Starting call to {}", target_id);
+    println!("📞 [CALL-DEBUG] ===== STARTING CALL =====");
+    println!("📞 [CALL-DEBUG] Target ID: {}", target_id);
     
     // Generate keypair for E2EE
+    println!("📞 [CALL-DEBUG] Generating keypair...");
     let public_key = {
-        let mut engine = state.media.lock().map_err(|e| e.to_string())?;
-        engine.generate_keypair().map_err(|e| e.to_string())?
+        let mut engine = state.media.lock().map_err(|e| {
+            println!("📞 [CALL-DEBUG] ❌ Failed to lock media engine: {}", e);
+            e.to_string()
+        })?;
+        engine.generate_keypair().map_err(|e| {
+            println!("📞 [CALL-DEBUG] ❌ Failed to generate keypair: {}", e);
+            e.to_string()
+        })?
     };
+    println!("📞 [CALL-DEBUG] Generated public key: {}...", &public_key[..30.min(public_key.len())]);
     
     // Send call initiate signal
+    println!("📞 [CALL-DEBUG] Sending CallInitiate signal...");
     let msg = SignalingMessage::CallInitiate { 
         target_id: target_id.clone(), 
         public_key: public_key.clone(),
     };
     signaling::send_signal(&state.ws_sender, msg).await?;
+    println!("📞 [CALL-DEBUG] ✅ CallInitiate sent successfully");
     
     Ok(public_key)
 }
@@ -86,22 +97,37 @@ async fn accept_call(
     caller_id: String,
     caller_public_key: String,
 ) -> Result<String, String> {
-    println!("✅ Accepting call from {}", caller_id);
+    println!("✅ [CALL-DEBUG] ===== ACCEPTING CALL =====");
+    println!("✅ [CALL-DEBUG] Caller ID: {}", caller_id);
+    println!("✅ [CALL-DEBUG] Caller public key: {}...", &caller_public_key[..30.min(caller_public_key.len())]);
     
     // Generate our keypair and complete key exchange
+    println!("✅ [CALL-DEBUG] Generating keypair and completing key exchange...");
     let public_key = {
-        let mut engine = state.media.lock().map_err(|e| e.to_string())?;
-        let pk = engine.generate_keypair().map_err(|e| e.to_string())?;
-        engine.complete_key_exchange(&caller_public_key).map_err(|e| e.to_string())?;
+        let mut engine = state.media.lock().map_err(|e| {
+            println!("✅ [CALL-DEBUG] ❌ Failed to lock media engine: {}", e);
+            e.to_string()
+        })?;
+        let pk = engine.generate_keypair().map_err(|e| {
+            println!("✅ [CALL-DEBUG] ❌ Failed to generate keypair: {}", e);
+            e.to_string()
+        })?;
+        engine.complete_key_exchange(&caller_public_key).map_err(|e| {
+            println!("✅ [CALL-DEBUG] ❌ Key exchange failed: {}", e);
+            e.to_string()
+        })?;
         pk
     };
+    println!("✅ [CALL-DEBUG] Generated our public key: {}...", &public_key[..30.min(public_key.len())]);
     
     // Send accept signal with our public key
+    println!("✅ [CALL-DEBUG] Sending CallAccept signal...");
     let msg = SignalingMessage::CallAccept { 
         caller_id, 
         public_key: public_key.clone(),
     };
     signaling::send_signal(&state.ws_sender, msg).await?;
+    println!("✅ [CALL-DEBUG] ✅ CallAccept sent successfully");
     
     Ok(public_key)
 }
@@ -112,11 +138,22 @@ async fn complete_call_handshake(
     state: State<'_, AppState>,
     peer_public_key: String,
 ) -> Result<(), String> {
-    println!("🔐 Completing E2EE handshake");
+    println!("🔐 [CALL-DEBUG] ===== COMPLETING E2EE HANDSHAKE =====");
+    println!("🔐 [CALL-DEBUG] Peer public key (first 30 chars): {}...", &peer_public_key[..30.min(peer_public_key.len())]);
     
-    let mut engine = state.media.lock().map_err(|e| e.to_string())?;
-    engine.complete_key_exchange(&peer_public_key).map_err(|e| e.to_string())?;
+    {
+        let mut engine = state.media.lock().map_err(|e| {
+            println!("🔐 [CALL-DEBUG] ❌ Failed to lock media engine: {}", e);
+            e.to_string()
+        })?;
+        println!("🔐 [CALL-DEBUG] Got media engine lock");
+        engine.complete_key_exchange(&peer_public_key).map_err(|e| {
+            println!("🔐 [CALL-DEBUG] ❌ Key exchange failed: {}", e);
+            e.to_string()
+        })?;
+    }
     
+    println!("🔐 [CALL-DEBUG] ✅ Key exchange completed successfully");
     Ok(())
 }
 

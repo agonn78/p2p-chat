@@ -551,25 +551,30 @@ export const useAppStore = create<AppState>()(
 
             // Call actions
             startCall: async (peerId) => {
+                console.log('[CALL-DEBUG] ===== START CALL =====');
+                console.log('[CALL-DEBUG] Target peerId:', peerId);
                 const { friends } = get();
                 const friend = friends.find(f => f.id === peerId);
+                console.log('[CALL-DEBUG] Found friend:', friend?.username);
 
-                set({
-                    activeCall: {
-                        status: 'calling',
-                        peerId,
-                        peerName: friend?.username || 'Unknown',
-                        peerPublicKey: null,
-                        isMuted: false,
-                        startTime: null,
-                    },
-                });
+                const newCallState = {
+                    status: 'calling' as const,
+                    peerId,
+                    peerName: friend?.username || 'Unknown',
+                    peerPublicKey: null,
+                    isMuted: false,
+                    startTime: null,
+                };
+                console.log('[CALL-DEBUG] Setting activeCall state:', JSON.stringify(newCallState, null, 2));
+                set({ activeCall: newCallState });
 
                 try {
-                    await invoke('start_call', { targetId: peerId });
-                    console.log('[Call] Initiated call to', peerId);
+                    console.log('[CALL-DEBUG] Invoking start_call command...');
+                    const result = await invoke('start_call', { targetId: peerId });
+                    console.log('[CALL-DEBUG] ✅ start_call returned:', result);
+                    console.log('[CALL-DEBUG] Call initiated, waiting for acceptance...');
                 } catch (e) {
-                    console.error('[Call] Failed to start call:', e);
+                    console.error('[CALL-DEBUG] ❌ Failed to start call:', e);
                     set({ activeCall: null });
                 }
             },
