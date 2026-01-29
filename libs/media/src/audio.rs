@@ -1,9 +1,10 @@
 use crate::crypto::CryptoContext;
 use anyhow::Result;
-use audiopus::{coder::Decoder, coder::Encoder, Channels, SampleRate, Application};
+use audiopus::{coder::Decoder, coder::Encoder, packet::Packet, Channels, MutSignals, SampleRate, Application};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::collections::VecDeque;
+use std::thread;
 use tokio::sync::mpsc;
 
 /// Audio configuration
@@ -56,8 +57,12 @@ impl OpusDecoder {
     /// Decode Opus packet to audio samples
     pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<i16>> {
         let mut output = vec![0i16; FRAME_SIZE];
+        let opus_packet = Packet::try_from(packet)
+            .map_err(|e| anyhow::anyhow!("Invalid packet: {:?}", e))?;
+        let signals = MutSignals::try_from(&mut output[..])
+            .map_err(|e| anyhow::anyhow!("Signal buffer error: {:?}", e))?;
         let len = self.decoder
-            .decode(Some(packet), &mut output[..], false)
+            .decode(Some(opus_packet), signals, false)
             .map_err(|e| anyhow::anyhow!("Decode error: {:?}", e))?;
         output.truncate(len);
         Ok(output)
@@ -81,8 +86,9 @@ pub struct AudioCapture {
     // We hold the receiver until it's taken by the WebRTC engine
     packet_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<AudioPacket>>>>,
     seq: Arc<std::sync::atomic::AtomicU32>,
-    // Keep stream alive
-    stream: Arc<Mutex<Option<cpal::Stream>>>,
+    // Flag to signal the capture thread to stop
+    running: Arc<AtomicBool>,
+    // Thread handle (not stored in struct since we don't need to join)
 }
 
 impl AudioCapture {
@@ -96,7 +102,7 @@ impl AudioCapture {
             packet_tx,
             packet_rx: Arc::new(Mutex::new(Some(packet_rx))),
             seq: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            stream: Arc::new(Mutex::new(None)),
+            running: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -105,61 +111,94 @@ impl AudioCapture {
     }
 
     pub fn start(&self) -> Result<()> {
-        let host = cpal::default_host();
-        let device = host.default_input_device()
-            .ok_or_else(|| anyhow::anyhow!("No input device"))?;
-
-        tracing::info!("Using input device: {:?}", device.name());
-
-        let config = cpal::StreamConfig {
-            channels: CHANNELS,
-            sample_rate: cpal::SampleRate(SAMPLE_RATE),
-            buffer_size: cpal::BufferSize::Fixed(FRAME_SIZE as u32),
-        };
+        // Prevent starting twice
+        if self.running.swap(true, Ordering::SeqCst) {
+            return Ok(()); // Already running
+        }
 
         let encoder = self.encoder.clone();
         let crypto = self.crypto.clone();
         let packet_tx = self.packet_tx.clone();
         let seq = self.seq.clone();
-        let sample_buffer = Arc::new(Mutex::new(Vec::with_capacity(FRAME_SIZE * 2)));
+        let running = self.running.clone();
 
-        let stream = device.build_input_stream(
-            &config,
-            move |data: &[f32], _info| {
-                // Convert f32 to i16
-                let samples: Vec<i16> = data.iter()
-                    .map(|&s| (s * 32767.0) as i16)
-                    .collect();
+        // Spawn audio capture in a dedicated thread (cpal::Stream is not Send)
+        thread::spawn(move || {
+            let host = cpal::default_host();
+            let device = match host.default_input_device() {
+                Some(d) => d,
+                None => {
+                    tracing::error!("No input device");
+                    return;
+                }
+            };
 
-                let mut buffer = sample_buffer.lock().unwrap();
-                buffer.extend_from_slice(&samples);
+            tracing::info!("Using input device: {:?}", device.name());
 
-                // Process frames
-                while buffer.len() >= FRAME_SIZE {
-                    let frame: Vec<i16> = buffer.drain(..FRAME_SIZE).collect();
-                    
-                    if let Ok(mut enc) = encoder.lock() {
-                        // Use explicit slice cast to satisfy types if needed
-                        if let Ok(encoded) = enc.encode(&frame) {
-                            if let Ok(encrypted) = crypto.encrypt(&encoded) {
-                                let sequence = seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                let packet = AudioPacket {
-                                    seq: sequence,
-                                    data: encrypted,
-                                };
-                                let _ = packet_tx.send(packet);
+            let config = cpal::StreamConfig {
+                channels: CHANNELS,
+                sample_rate: cpal::SampleRate(SAMPLE_RATE),
+                buffer_size: cpal::BufferSize::Fixed(FRAME_SIZE as u32),
+            };
+
+            let sample_buffer = Arc::new(Mutex::new(Vec::with_capacity(FRAME_SIZE * 2)));
+
+            let stream = match device.build_input_stream(
+                &config,
+                move |data: &[f32], _info| {
+                    // Convert f32 to i16
+                    let samples: Vec<i16> = data.iter()
+                        .map(|&s| (s * 32767.0) as i16)
+                        .collect();
+
+                    let mut buffer = sample_buffer.lock().unwrap();
+                    buffer.extend_from_slice(&samples);
+
+                    // Process frames
+                    while buffer.len() >= FRAME_SIZE {
+                        let frame: Vec<i16> = buffer.drain(..FRAME_SIZE).collect();
+                        
+                        if let Ok(mut enc) = encoder.lock() {
+                            if let Ok(encoded) = enc.encode(&frame) {
+                                if let Ok(encrypted) = crypto.encrypt(&encoded) {
+                                    let sequence = seq.fetch_add(1, Ordering::SeqCst);
+                                    let packet = AudioPacket {
+                                        seq: sequence,
+                                        data: encrypted,
+                                    };
+                                    let _ = packet_tx.send(packet);
+                                }
                             }
                         }
                     }
+                },
+                |err| tracing::error!("Capture stream error: {}", err),
+                None,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Failed to build input stream: {}", e);
+                    return;
                 }
-            },
-            |err| tracing::error!("Capture stream error: {}", err),
-            None,
-        )?;
+            };
 
-        stream.play()?;
-        *self.stream.lock().unwrap() = Some(stream);
+            if let Err(e) = stream.play() {
+                tracing::error!("Failed to play stream: {}", e);
+                return;
+            }
+
+            // Keep the thread alive while running is true
+            while running.load(Ordering::SeqCst) {
+                thread::sleep(std::time::Duration::from_millis(100));
+            }
+            // Stream is dropped here, stopping capture
+        });
+
         Ok(())
+    }
+
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
     }
 }
 

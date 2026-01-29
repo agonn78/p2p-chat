@@ -14,7 +14,7 @@ use shared_proto::signaling::SignalingMessage;
 use api::ApiState;
 
 struct AppState {
-    media: Arc<std::sync::Mutex<MediaEngine>>,
+    media: Arc<Mutex<MediaEngine>>,
     ws_sender: WsSender,
 }
 
@@ -56,10 +56,7 @@ async fn start_call(state: State<'_, AppState>, target_id: String) -> Result<Str
     // Generate keypair for E2EE
     println!("📞 [CALL-DEBUG] Generating keypair...");
     let public_key = {
-        let mut engine = state.media.lock().map_err(|e| {
-            println!("📞 [CALL-DEBUG] ❌ Failed to lock media engine: {}", e);
-            e.to_string()
-        })?;
+        let mut engine = state.media.lock().await;
         engine.generate_keypair().map_err(|e| {
             println!("📞 [CALL-DEBUG] ❌ Failed to generate keypair: {}", e);
             e.to_string()
@@ -93,10 +90,7 @@ async fn accept_call(
     // Generate our keypair and complete key exchange
     println!("✅ [CALL-DEBUG] Generating keypair and completing key exchange...");
     let public_key = {
-        let mut engine = state.media.lock().map_err(|e| {
-            println!("✅ [CALL-DEBUG] ❌ Failed to lock media engine: {}", e);
-            e.to_string()
-        })?;
+        let mut engine = state.media.lock().await;
         let pk = engine.generate_keypair().map_err(|e| {
             println!("✅ [CALL-DEBUG] ❌ Failed to generate keypair: {}", e);
             e.to_string()
@@ -131,10 +125,7 @@ async fn complete_call_handshake(
     println!("🔐 [CALL-DEBUG] Peer public key (first 30 chars): {}...", &peer_public_key[..30.min(peer_public_key.len())]);
     
     {
-        let mut engine = state.media.lock().map_err(|e| {
-            println!("🔐 [CALL-DEBUG] ❌ Failed to lock media engine: {}", e);
-            e.to_string()
-        })?;
+        let mut engine = state.media.lock().await;
         println!("🔐 [CALL-DEBUG] Got media engine lock");
         engine.complete_key_exchange(&peer_public_key).map_err(|e| {
             println!("🔐 [CALL-DEBUG] ❌ Key exchange failed: {}", e);
@@ -216,7 +207,7 @@ async fn init_audio_call(state: State<'_, AppState>, target_id: String) -> Resul
     
     // 1. Initialize WebRTC
     let mut ice_rx = {
-        let mut engine = state.media.lock().map_err(|e| e.to_string())?;
+        let mut engine = state.media.lock().await;
         if !engine.is_ready_for_audio() {
             return Err("E2EE handshake not completed".to_string());
         }
@@ -247,13 +238,13 @@ async fn init_audio_call(state: State<'_, AppState>, target_id: String) -> Resul
 
     // 3. Create Audio DataChannel
     {
-        let engine = state.media.lock().map_err(|e| e.to_string())?;
+        let engine = state.media.lock().await;
         engine.create_audio_channel().await.map_err(|e| e.to_string())?;
     }
 
     // 4. Create Offer
     let sdp = {
-        let engine = state.media.lock().map_err(|e| e.to_string())?;
+        let engine = state.media.lock().await;
         engine.create_offer().await.map_err(|e| e.to_string())?
     };
     println!("📞 [WEBRTC] Offer created, sending...");
@@ -271,7 +262,7 @@ async fn handle_audio_offer(state: State<'_, AppState>, target_id: String, sdp: 
 
     // 1. Initialize WebRTC (Answerer)
     let mut ice_rx = {
-        let mut engine = state.media.lock().map_err(|e| e.to_string())?;
+        let mut engine = state.media.lock().await;
         // Note: is_ready_for_audio check might fail if E2EE not finished, but normally it is.
         engine.init_webrtc().await.map_err(|e| e.to_string())?
     };
@@ -299,7 +290,7 @@ async fn handle_audio_offer(state: State<'_, AppState>, target_id: String, sdp: 
 
     // 3. Accept Offer and Create Answer
     let answer_sdp = {
-        let engine = state.media.lock().map_err(|e| e.to_string())?;
+        let engine = state.media.lock().await;
         engine.accept_offer(&sdp).await.map_err(|e| e.to_string())?
     };
     println!("📞 [WEBRTC] Answer created, sending...");
@@ -313,7 +304,7 @@ async fn handle_audio_offer(state: State<'_, AppState>, target_id: String, sdp: 
 #[tauri::command]
 async fn handle_audio_answer(state: State<'_, AppState>, sdp: String) -> Result<(), String> {
     println!("📞 [WEBRTC] Handling Answer");
-    let engine = state.media.lock().map_err(|e| e.to_string())?;
+    let engine = state.media.lock().await;
     engine.set_remote_description(&sdp).await.map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -329,7 +320,7 @@ async fn handle_ice_candidate(state: State<'_, AppState>, payload: IceCandidateP
     });
     let candidate_str = json.to_string();
 
-    let engine = state.media.lock().map_err(|e| e.to_string())?;
+    let engine = state.media.lock().await;
     engine.add_ice_candidate(&candidate_str).await.map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -339,7 +330,7 @@ async fn handle_ice_candidate(state: State<'_, AppState>, payload: IceCandidateP
 async fn start_call_audio(state: State<'_, AppState>) -> Result<(), String> {
     println!("🔊 [AUDIO] Starting call audio...");
     
-    let engine = state.media.lock().map_err(|e| e.to_string())?;
+    let engine = state.media.lock().await;
     
     if !engine.is_ready_for_audio() {
         return Err("E2EE key exchange not completed".to_string());
@@ -370,7 +361,7 @@ fn main() {
                     Ok(sender) => {
                         // Store the sender in app state
                         let state = AppState {
-                            media: Arc::new(std::sync::Mutex::new(MediaEngine::new())),
+                            media: Arc::new(Mutex::new(MediaEngine::new())),
                             ws_sender: sender,
                         };
                         app_handle.manage(state);
@@ -381,7 +372,7 @@ fn main() {
                         eprintln!("Server URL: {}", config::SERVER_URL);
                         // Manage with empty sender
                         let state = AppState {
-                            media: Arc::new(std::sync::Mutex::new(MediaEngine::new())),
+                            media: Arc::new(Mutex::new(MediaEngine::new())),
                             ws_sender: Arc::new(Mutex::new(None)),
                         };
                         app_handle.manage(state);

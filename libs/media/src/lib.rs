@@ -10,7 +10,7 @@ mod crypto;
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use webrtc::api::media_engine::MediaEngine as WebRtcMediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
@@ -142,9 +142,12 @@ impl MediaEngine {
             let ice_tx = ice_tx.clone();
             Box::pin(async move {
                 if let Some(candidate) = candidate {
-                    // candidate.to_json() returns RTCIceCandidateInit which is Serializable
-                    if let Ok(json) = serde_json::to_string(&candidate.to_json()) {
-                        let _ = ice_tx.send(json).await;
+                    // candidate.to_json() returns Result<RTCIceCandidateInit, webrtc::Error>
+                    // parameters. webrtc::Error is not serializable, so we must unwrap the result first.
+                    if let Ok(ice_candidate_init) = candidate.to_json() {
+                        if let Ok(json) = serde_json::to_string(&ice_candidate_init) {
+                            let _ = ice_tx.send(json).await;
+                        }
                     }
                 }
             })
@@ -316,29 +319,18 @@ impl MediaEngine {
                     return;
                 }
                 
-                // Now, pipe packets from AudioCapture to the DataChannel
-                // This requires a way to get the packet_rx from AudioCapture.
-                // The current AudioCapture::new takes a tx, so we need to get the rx from it.
-                // This is a design challenge.
-                //
-                // RE-THINK: packet_rx can't be stored easily because it's not Clone/Sync compatible in Arc<Mutex> easily.
-                // Better: `init_webrtc` should SPAWN the capture->channel loop?
-                // But we don't have the DC yet.
-                
-                // Solution: Use a broadcast channel or a shared buffer?
-                // OR: `AudioCapture` takes a callback `OnPacket` instead of a channel?
-                // Yes! `AudioCapture` should take a `Arc<dyn Fn(AudioPacket) + Send + Sync>`.
-                // Then that callback calls `dc.send()`.
-                //
-                // For now, this part is a placeholder, as the `packet_rx` is not accessible here.
-                // A refactor of `AudioCapture` to accept a callback or a shared queue would be needed.
-                //
-                // Example of how it *would* work if `AudioCapture` provided a `packet_rx` or callback:
-                // while let Some(packet) = capture.get_packet_receiver().await.recv().await {
-                //     if let Ok(encoded) = bincode::serialize(&packet) {
-                //         let _ = dc.send(&encoded).await;
-                //     }
-                // }
+                // Pipe captured audio packets to the DataChannel
+                if let Some(mut rx) = capture.take_packet_receiver() {
+                    tokio::spawn(async move {
+                        while let Some(packet) = rx.recv().await {
+                            if let Ok(bytes) = bincode::serialize(&packet) {
+                                let _ = dc.send(&bytes.into()).await;
+                            }
+                        }
+                    });
+                } else {
+                    tracing::error!("Failed to take packet receiver - already taken?");
+                }
             })
         }));
         

@@ -11,14 +11,20 @@ use ring::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey, X25519};
 use ring::rand::SystemRandom;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Cryptographic context for E2EE communication
+/// Thread-safe wrapper around ring's AES-GCM key
 pub struct CryptoContext {
-    /// AES-GCM key derived from X25519 key exchange
-    key: LessSafeKey,
+    /// AES-GCM key derived from X25519 key exchange, wrapped in Mutex for thread-safety
+    key: Mutex<LessSafeKey>,
     /// Counter for generating unique nonces
     nonce_counter: AtomicU64,
 }
+
+// Explicitly implement Send + Sync since we're protecting access with Mutex
+unsafe impl Send for CryptoContext {}
+unsafe impl Sync for CryptoContext {}
 
 /// Key pair for X25519 key exchange
 pub struct KeyPair {
@@ -70,7 +76,7 @@ impl CryptoContext {
             .map_err(|_| "Failed to create AES key".to_string())?;
         
         Ok(Self {
-            key: LessSafeKey::new(unbound_key),
+            key: Mutex::new(LessSafeKey::new(unbound_key)),
             nonce_counter: AtomicU64::new(0),
         })
     }
@@ -94,8 +100,8 @@ impl CryptoContext {
         // Reserve space for the authentication tag
         buffer.extend_from_slice(&[0u8; 16]);
         
-        self.key
-            .seal_in_place_separate_tag(nonce, Aad::empty(), &mut buffer[..plaintext.len()])
+        let key = self.key.lock().map_err(|_| "Lock poisoned")?;
+        key.seal_in_place_separate_tag(nonce, Aad::empty(), &mut buffer[..plaintext.len()])
             .map(|tag| {
                 buffer[plaintext.len()..].copy_from_slice(tag.as_ref());
                 let mut result = nonce_bytes.to_vec();
@@ -118,8 +124,8 @@ impl CryptoContext {
         
         let mut buffer = encrypted.to_vec();
         
-        self.key
-            .open_in_place(nonce, Aad::empty(), &mut buffer)
+        let key = self.key.lock().map_err(|_| "Lock poisoned")?;
+        key.open_in_place(nonce, Aad::empty(), &mut buffer)
             .map(|plaintext| plaintext.to_vec())
             .map_err(|_| "Decryption failed".to_string())
     }
