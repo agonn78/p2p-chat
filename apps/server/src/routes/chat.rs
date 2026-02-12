@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, post, delete, put},
+    routing::{delete, get, post},
     Json, Router,
     http::StatusCode,
 };
@@ -15,7 +15,10 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/dm", post(create_or_get_dm))
+        .route("/:room_id/typing", post(send_typing))
+        .route("/:room_id/read", post(mark_room_read))
         .route("/:room_id/messages", get(get_messages).post(send_message).delete(delete_all_messages))
+        .route("/:room_id/messages/:message_id/delivered", post(mark_message_delivered))
         .route("/:room_id/messages/:message_id", delete(delete_message).put(edit_message))
 }
 
@@ -28,6 +31,7 @@ struct CreateDmRequest {
 struct SendMessageRequest {
     content: String,
     nonce: Option<String>,  // E2EE nonce
+    client_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -40,6 +44,16 @@ struct PaginationParams {
 struct EditMessageRequest {
     content: String,
     nonce: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TypingRequest {
+    is_typing: bool,
+}
+
+#[derive(Deserialize)]
+struct ReadRequest {
+    upto_message_id: Option<Uuid>,
 }
 
 /// Create or get existing DM room with a friend
@@ -114,7 +128,7 @@ async fn get_messages(
         return Err(AuthError::InvalidToken);
     }
 
-    let limit = params.limit.unwrap_or(50).min(100);
+    let limit = params.limit.unwrap_or(100).min(200);
 
     let messages = if let Some(before_id) = params.before {
         let before_uuid = Uuid::parse_str(&before_id).map_err(|_| AuthError::InvalidToken)?;
@@ -162,11 +176,26 @@ async fn send_message(
         return Err(AuthError::InvalidToken);
     }
 
-    // Insert message with nonce for E2EE
+    // Deduplicate retries (same sender + client_id)
+    if let Some(client_id) = req.client_id {
+        if let Some(existing) = sqlx::query_as::<_, Message>(
+            "SELECT * FROM messages WHERE room_id = $1 AND sender_id = $2 AND client_id = $3 LIMIT 1"
+        )
+        .bind(room_id)
+        .bind(user.id)
+        .bind(client_id)
+        .fetch_optional(&state.db)
+        .await?
+        {
+            return Ok(Json(existing));
+        }
+    }
+
+    // Insert message with nonce/client_id for E2EE + retry-safe dedup
     let message = sqlx::query_as::<_, Message>(
         r#"
-        INSERT INTO messages (room_id, sender_id, content, nonce)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO messages (room_id, sender_id, content, nonce, client_id)
+        VALUES ($1, $2, $3, $4, $5)
         RETURNING *
         "#
     )
@@ -174,6 +203,7 @@ async fn send_message(
     .bind(user.id)
     .bind(&req.content)
     .bind(&req.nonce)
+    .bind(req.client_id)
     .fetch_one(&state.db)
     .await?;
 
@@ -200,6 +230,193 @@ async fn send_message(
     }
 
     Ok(Json(message))
+}
+
+/// Broadcast typing indicator for DM room
+async fn send_typing(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(room_id): Path<Uuid>,
+    Json(req): Json<TypingRequest>,
+) -> Result<StatusCode, AuthError> {
+    let member_ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM room_members WHERE room_id = $1"
+    )
+    .bind(room_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    if !member_ids.contains(&user.id) {
+        return Err(AuthError::InvalidToken);
+    }
+
+    let ws_payload = serde_json::json!({
+        "type": "TYPING",
+        "room_id": room_id,
+        "user_id": user.id,
+        "is_typing": req.is_typing,
+    });
+    let ws_text = serde_json::to_string(&ws_payload).unwrap();
+
+    for member_id in member_ids {
+        if member_id == user.id {
+            continue;
+        }
+        if let Some(peer_tx) = state.peers.get(&member_id.to_string()) {
+            let _ = peer_tx.send(WsMessage::Text(ws_text.clone()));
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Mark one message as delivered by current user (receiver)
+async fn mark_message_delivered(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((room_id, message_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AuthError> {
+    let is_member = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM room_members WHERE room_id = $1 AND user_id = $2"
+    )
+    .bind(room_id)
+    .bind(user.id)
+    .fetch_one(&state.db)
+    .await? > 0;
+
+    if !is_member {
+        return Err(AuthError::InvalidToken);
+    }
+
+    // upsert delivered_at (first delivery wins)
+    sqlx::query(
+        r#"
+        INSERT INTO message_receipts (message_id, user_id, delivered_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (message_id, user_id)
+        DO UPDATE SET delivered_at = COALESCE(message_receipts.delivered_at, EXCLUDED.delivered_at)
+        "#
+    )
+    .bind(message_id)
+    .bind(user.id)
+    .execute(&state.db)
+    .await?;
+
+    // Notify sender about delivery status
+    let sender_id = sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT sender_id FROM messages WHERE id = $1"
+    )
+    .bind(message_id)
+    .fetch_optional(&state.db)
+    .await?
+    .flatten();
+
+    if let Some(sender_id) = sender_id {
+        if sender_id != user.id {
+            if let Some(peer_tx) = state.peers.get(&sender_id.to_string()) {
+                let ws_payload = serde_json::json!({
+                    "type": "MESSAGE_STATUS",
+                    "room_id": room_id,
+                    "message_id": message_id,
+                    "status": "delivered",
+                    "user_id": user.id,
+                });
+                let ws_text = serde_json::to_string(&ws_payload).unwrap();
+                let _ = peer_tx.send(WsMessage::Text(ws_text));
+            }
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Mark all unread messages in room as read by current user
+async fn mark_room_read(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(room_id): Path<Uuid>,
+    Json(req): Json<ReadRequest>,
+) -> Result<StatusCode, AuthError> {
+    let is_member = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM room_members WHERE room_id = $1 AND user_id = $2"
+    )
+    .bind(room_id)
+    .bind(user.id)
+    .fetch_one(&state.db)
+    .await? > 0;
+
+    if !is_member {
+        return Err(AuthError::InvalidToken);
+    }
+
+    let rows: Vec<(Uuid, Option<Uuid>)> = if let Some(upto_message_id) = req.upto_message_id {
+        sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
+            r#"
+            SELECT m.id, m.sender_id
+            FROM messages m
+            LEFT JOIN message_receipts mr ON mr.message_id = m.id AND mr.user_id = $2
+            WHERE m.room_id = $1
+              AND m.sender_id IS NOT NULL
+              AND m.sender_id <> $2
+              AND (mr.read_at IS NULL)
+              AND m.created_at <= (SELECT created_at FROM messages WHERE id = $3)
+            "#
+        )
+        .bind(room_id)
+        .bind(user.id)
+        .bind(upto_message_id)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
+            r#"
+            SELECT m.id, m.sender_id
+            FROM messages m
+            LEFT JOIN message_receipts mr ON mr.message_id = m.id AND mr.user_id = $2
+            WHERE m.room_id = $1
+              AND m.sender_id IS NOT NULL
+              AND m.sender_id <> $2
+              AND (mr.read_at IS NULL)
+            "#
+        )
+        .bind(room_id)
+        .bind(user.id)
+        .fetch_all(&state.db)
+        .await?
+    };
+
+    for (message_id, sender_id) in rows {
+        sqlx::query(
+            r#"
+            INSERT INTO message_receipts (message_id, user_id, delivered_at, read_at)
+            VALUES ($1, $2, NOW(), NOW())
+            ON CONFLICT (message_id, user_id)
+            DO UPDATE SET
+                delivered_at = COALESCE(message_receipts.delivered_at, NOW()),
+                read_at = COALESCE(message_receipts.read_at, NOW())
+            "#
+        )
+        .bind(message_id)
+        .bind(user.id)
+        .execute(&state.db)
+        .await?;
+
+        if let Some(sender_id) = sender_id {
+            if let Some(peer_tx) = state.peers.get(&sender_id.to_string()) {
+                let ws_payload = serde_json::json!({
+                    "type": "MESSAGE_STATUS",
+                    "room_id": room_id,
+                    "message_id": message_id,
+                    "status": "read",
+                    "user_id": user.id,
+                });
+                let ws_text = serde_json::to_string(&ws_payload).unwrap();
+                let _ = peer_tx.send(WsMessage::Text(ws_text));
+            }
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Delete a single message (own messages only)

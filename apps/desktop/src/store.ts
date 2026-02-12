@@ -51,7 +51,11 @@ interface AppState {
     activeRoom: string | null;
     activeFriendId: string | null;
     messages: Message[];
+    hasMoreMessages: boolean;
+    isLoadingMoreMessages: boolean;
     unreadCounts: Record<string, number>;
+    typingByRoom: Record<string, string[]>;
+    typingByChannel: Record<string, string[]>;
 
     // Connection state
     wsConnected: boolean;
@@ -67,6 +71,8 @@ interface AppState {
     activeChannel: string | null;
     serverMembers: ServerMember[];
     channelMessages: ChannelMessage[];
+    hasMoreChannelMessages: boolean;
+    isLoadingMoreChannelMessages: boolean;
 
     // Actions
     login: (email: string, password: string) => Promise<void>;
@@ -86,9 +92,12 @@ interface AppState {
 
     // Chat Actions
     createOrGetDm: (friendId: string) => Promise<void>;
-    fetchMessages: (roomId: string) => Promise<void>;
+    fetchMessages: (roomId: string, options?: { before?: string; append?: boolean; limit?: number }) => Promise<void>;
+    loadOlderMessages: () => Promise<void>;
     sendMessage: (roomId: string, content: string) => Promise<void>;
     addMessage: (message: Message) => void;
+    setTyping: (roomId: string, userId: string, isTyping: boolean) => void;
+    setChannelTyping: (channelId: string, userId: string, isTyping: boolean) => void;
     removeMessage: (messageId: string) => void;
     deleteMessage: (messageId: string) => Promise<void>;
     deleteAllMessages: () => Promise<void>;
@@ -117,7 +126,8 @@ interface AppState {
     createChannel: (serverId: string, name: string, type?: 'text' | 'voice') => Promise<void>;
     setActiveChannel: (channelId: string | null) => void;
     fetchServerMembers: (serverId: string) => Promise<void>;
-    fetchChannelMessages: (serverId: string, channelId: string) => Promise<void>;
+    fetchChannelMessages: (serverId: string, channelId: string, options?: { before?: string; append?: boolean; limit?: number }) => Promise<void>;
+    loadOlderChannelMessages: () => Promise<void>;
     sendChannelMessage: (serverId: string, channelId: string, content: string) => Promise<void>;
 }
 
@@ -138,7 +148,11 @@ export const useAppStore = create<AppState>()(
             activeFriendId: null,
             activeCall: null,
             messages: [],
+            hasMoreMessages: true,
+            isLoadingMoreMessages: false,
             unreadCounts: {},
+            typingByRoom: {},
+            typingByChannel: {},
             wsConnected: false,
             lastMessageTimestamp: null,
 
@@ -149,6 +163,8 @@ export const useAppStore = create<AppState>()(
             activeChannel: null,
             serverMembers: [],
             channelMessages: [],
+            hasMoreChannelMessages: true,
+            isLoadingMoreChannelMessages: false,
 
             // Connection Actions
             setWsConnected: (connected) => {
@@ -214,10 +230,17 @@ export const useAppStore = create<AppState>()(
                     friends: [],
                     rooms: [],
                     messages: [],
+                    hasMoreMessages: true,
+                    isLoadingMoreMessages: false,
                     keyPair: null,
                     friendPublicKeys: {},
                     activeRoom: null,
                     activeFriendId: null,
+                    channelMessages: [],
+                    hasMoreChannelMessages: true,
+                    isLoadingMoreChannelMessages: false,
+                    typingByRoom: {},
+                    typingByChannel: {},
                     wsConnected: false,
                 });
             },
@@ -401,33 +424,90 @@ export const useAppStore = create<AppState>()(
                     console.log(`[Store] Got room:`, room);
 
                     // Clear messages and set active room + friend
-                    set({ messages: [], activeRoom: room.id, activeFriendId: friendId });
+                    set({
+                        messages: [],
+                        activeRoom: room.id,
+                        activeFriendId: friendId,
+                        hasMoreMessages: true,
+                        isLoadingMoreMessages: false,
+                    });
 
                     // Mark messages as read
                     markAsRead(friendId);
 
                     // Fetch messages for this room
-                    await get().fetchMessages(room.id);
+                    await get().fetchMessages(room.id, { limit: 100 });
+
+                    // Immediately mark as read up to latest message for receipts
+                    const latest = get().messages[get().messages.length - 1];
+                    if (latest?.id) {
+                        invoke('api_mark_room_read', { roomId: room.id, uptoMessageId: latest.id }).catch(() => undefined);
+                    }
                 } catch (e) {
                     console.error('[Store] createOrGetDm exception:', e);
                 }
             },
 
-            fetchMessages: async (roomId) => {
-                console.log(`[Store] Fetching messages for room: ${roomId}`);
-                try {
-                    const messages = await invoke<Message[]>('api_fetch_messages', { roomId });
-                    console.log(`[Store] Fetched ${messages.length} messages`);
-                    set({ messages });
+            fetchMessages: async (roomId, options) => {
+                const before = options?.before;
+                const limit = options?.limit ?? 100;
+                const append = options?.append ?? false;
+                console.log(`[Store] Fetching messages for room: ${roomId} (before=${before ?? 'none'}, limit=${limit}, append=${append})`);
 
-                    // Update last message timestamp for polling
-                    if (messages.length > 0) {
-                        const lastMsg = messages[messages.length - 1];
+                if (append) {
+                    set({ isLoadingMoreMessages: true });
+                }
+
+                try {
+                    const fetched = await invoke<Message[]>('api_fetch_messages', { roomId, before, limit });
+                    const normalized = fetched.map((m) => ({ ...m, status: m.status ?? 'sent' as const }));
+                    console.log(`[Store] Fetched ${normalized.length} messages`);
+
+                    if (append) {
+                        const current = get().messages;
+                        const merged = [...normalized, ...current].filter((msg, idx, arr) => {
+                            if (arr.findIndex((x) => x.id === msg.id) !== idx) return false;
+                            if (msg.client_id && arr.findIndex((x) => x.client_id === msg.client_id) !== idx) return false;
+                            return true;
+                        });
+                        set({
+                            messages: merged,
+                            hasMoreMessages: normalized.length >= limit,
+                            isLoadingMoreMessages: false,
+                        });
+                    } else {
+                        set({
+                            messages: normalized,
+                            hasMoreMessages: normalized.length >= limit,
+                            isLoadingMoreMessages: false,
+                        });
+                    }
+
+                    if (normalized.length > 0) {
+                        const lastMsg = normalized[normalized.length - 1];
                         set({ lastMessageTimestamp: lastMsg.created_at || null });
                     }
                 } catch (e) {
                     console.error('[Store] fetchMessages exception:', e);
+                    if (append) {
+                        set({ isLoadingMoreMessages: false });
+                    }
                 }
+            },
+
+            loadOlderMessages: async () => {
+                const { activeRoom, messages, hasMoreMessages, isLoadingMoreMessages, fetchMessages } = get();
+                if (!activeRoom || !hasMoreMessages || isLoadingMoreMessages || messages.length === 0) {
+                    return;
+                }
+
+                const firstMessage = messages.find((m) => !m.id.startsWith('local-'));
+                if (!firstMessage) return;
+                await fetchMessages(activeRoom, {
+                    before: firstMessage.id,
+                    append: true,
+                    limit: 100,
+                });
             },
 
             // Polling fallback for new messages
@@ -436,7 +516,7 @@ export const useAppStore = create<AppState>()(
                 if (!activeRoom) return;
 
                 try {
-                    const serverMessages = await invoke<Message[]>('api_fetch_messages', { roomId: activeRoom });
+                    const serverMessages = await invoke<Message[]>('api_fetch_messages', { roomId: activeRoom, limit: 100 });
                     const currentIds = new Set(messages.map(m => m.id));
 
                     // Add any new messages
@@ -452,7 +532,11 @@ export const useAppStore = create<AppState>()(
             },
 
             sendMessage: async (roomId, content) => {
-                const { keyPair, activeFriendId, friendPublicKeys } = get();
+                const { keyPair, activeFriendId, friendPublicKeys, user, messages } = get();
+
+                const clientId = globalThis.crypto.randomUUID();
+                const localId = `local-${clientId}`;
+                const nowIso = new Date().toISOString();
 
                 let encryptedContent = content;
                 let nonce: string | undefined = undefined;
@@ -475,18 +559,48 @@ export const useAppStore = create<AppState>()(
                 }
 
                 console.log(`[Store] Sending message to room ${roomId}`);
+
+                // Optimistic local message for status transitions
+                const optimistic: Message = {
+                    id: localId,
+                    client_id: clientId,
+                    room_id: roomId,
+                    sender_id: user?.id,
+                    content: encryptedContent,
+                    nonce,
+                    created_at: nowIso,
+                    status: 'sending',
+                    _decryptedContent: content,
+                };
+                set({ messages: [...messages, optimistic] });
+
                 try {
                     const message = await invoke<Message>('api_send_message', {
                         roomId,
                         content: encryptedContent,
-                        nonce
+                        nonce,
+                        clientId,
                     });
                     console.log('[Store] Message sent');
                     // Store original content for our own display
                     (message as Message & { _decryptedContent?: string })._decryptedContent = content;
-                    get().addMessage(message);
+                    message.status = message.status ?? 'sent';
+                    set({
+                        messages: get().messages.map((m) =>
+                            m.id === localId || (m.client_id && m.client_id === clientId)
+                                ? { ...message, _decryptedContent: content }
+                                : m
+                        )
+                    });
                 } catch (e) {
                     console.error('[Store] sendMessage exception:', e);
+                    set({
+                        messages: get().messages.map((m) =>
+                            m.id === localId || (m.client_id && m.client_id === clientId)
+                                ? { ...m, status: 'failed', _decryptedContent: content }
+                                : m
+                        )
+                    });
                 }
             },
 
@@ -494,34 +608,72 @@ export const useAppStore = create<AppState>()(
                 const { messages, activeRoom, user, friends, unreadCounts } = get();
                 console.log(`[Store] addMessage called for room ${message.room_id}, active room: ${activeRoom}`);
 
-                if (!messages.find(m => m.id === message.id)) {
-                    if (activeRoom === message.room_id) {
-                        console.log('[Store] Adding message to active conversation');
+                const existingIndex = messages.findIndex((m) =>
+                    m.id === message.id ||
+                    (!!message.client_id && !!m.client_id && m.client_id === message.client_id)
+                );
+
+                if (activeRoom === message.room_id) {
+                    if (existingIndex >= 0) {
+                        const next = [...messages];
+                        next[existingIndex] = { ...next[existingIndex], ...message, status: message.status ?? next[existingIndex].status ?? 'sent' };
                         set({
-                            messages: [...messages, message],
-                            lastMessageTimestamp: message.created_at || null
+                            messages: next,
+                            lastMessageTimestamp: message.created_at || null,
                         });
                     } else {
-                        console.log('[Store] Message for different room, incrementing unread');
-
-                        const senderId = message.sender_id;
-                        if (senderId && senderId !== user?.id) {
-                            const friend = friends.find(f => f.id === senderId);
-                            if (friend) {
-                                const currentCount = unreadCounts[friend.id] || 0;
-                                set({
-                                    unreadCounts: {
-                                        ...unreadCounts,
-                                        [friend.id]: currentCount + 1
-                                    }
-                                });
-                                console.log(`[Store] Unread count for ${friend.username}: ${currentCount + 1}`);
-                            }
-                        }
+                        console.log('[Store] Adding message to active conversation');
+                        set({
+                            messages: [...messages, { ...message, status: message.status ?? 'sent' }],
+                            lastMessageTimestamp: message.created_at || null
+                        });
                     }
                 } else {
-                    console.log('[Store] Message not added (duplicate)');
+                    if (existingIndex >= 0) {
+                        return;
+                    }
+
+                    console.log('[Store] Message for different room, incrementing unread');
+
+                    const senderId = message.sender_id;
+                    if (senderId && senderId !== user?.id) {
+                        const friend = friends.find(f => f.id === senderId);
+                        if (friend) {
+                            const currentCount = unreadCounts[friend.id] || 0;
+                            set({
+                                unreadCounts: {
+                                    ...unreadCounts,
+                                    [friend.id]: currentCount + 1
+                                }
+                            });
+                            console.log(`[Store] Unread count for ${friend.username}: ${currentCount + 1}`);
+                        }
+                    }
                 }
+            },
+
+            setTyping: (roomId, userId, isTyping) => {
+                const typingByRoom = { ...get().typingByRoom };
+                const current = new Set(typingByRoom[roomId] || []);
+                if (isTyping) {
+                    current.add(userId);
+                } else {
+                    current.delete(userId);
+                }
+                typingByRoom[roomId] = Array.from(current);
+                set({ typingByRoom });
+            },
+
+            setChannelTyping: (channelId, userId, isTyping) => {
+                const typingByChannel = { ...get().typingByChannel };
+                const current = new Set(typingByChannel[channelId] || []);
+                if (isTyping) {
+                    current.add(userId);
+                } else {
+                    current.delete(userId);
+                }
+                typingByChannel[channelId] = Array.from(current);
+                set({ typingByChannel });
             },
 
             markAsRead: (friendId) => {
@@ -548,6 +700,15 @@ export const useAppStore = create<AppState>()(
             editMessage: async (messageId, content) => {
                 const { activeRoom, keyPair, activeFriendId, friendPublicKeys } = get();
                 if (!activeRoom) return;
+
+                if (messageId.startsWith('local-')) {
+                    set({
+                        messages: get().messages.map((m) =>
+                            m.id === messageId ? { ...m, _decryptedContent: content, content } : m
+                        )
+                    });
+                    return;
+                }
 
                 let encryptedContent = content;
                 let nonce: string | undefined = undefined;
@@ -581,13 +742,22 @@ export const useAppStore = create<AppState>()(
             updateMessage: (message) => {
                 const { messages } = get();
                 set({
-                    messages: messages.map(m => m.id === message.id ? { ...m, ...message } : m)
+                    messages: messages.map(m =>
+                        m.id === message.id || (!!message.client_id && !!m.client_id && m.client_id === message.client_id)
+                            ? { ...m, ...message }
+                            : m
+                    )
                 });
             },
 
             deleteMessage: async (messageId) => {
                 const { activeRoom, messages } = get();
                 if (!activeRoom) return;
+
+                if (messageId.startsWith('local-')) {
+                    set({ messages: messages.filter(m => m.id !== messageId) });
+                    return;
+                }
 
                 console.log(`[Store] 🗑️ Deleting message ${messageId}`);
                 try {
@@ -779,7 +949,15 @@ export const useAppStore = create<AppState>()(
                     await invoke('api_leave_server', { serverId });
                     console.log('[Store] Left server');
                     if (activeServer === serverId) {
-                        set({ activeServer: null, channels: [], activeChannel: null, serverMembers: [], channelMessages: [] });
+                        set({
+                            activeServer: null,
+                            channels: [],
+                            activeChannel: null,
+                            serverMembers: [],
+                            channelMessages: [],
+                            hasMoreChannelMessages: true,
+                            isLoadingMoreChannelMessages: false,
+                        });
                     }
                     await fetchServers();
                 } catch (e) {
@@ -788,7 +966,15 @@ export const useAppStore = create<AppState>()(
             },
 
             setActiveServer: (serverId) => {
-                set({ activeServer: serverId, activeChannel: null, channels: [], serverMembers: [], channelMessages: [] });
+                set({
+                    activeServer: serverId,
+                    activeChannel: null,
+                    channels: [],
+                    serverMembers: [],
+                    channelMessages: [],
+                    hasMoreChannelMessages: true,
+                    isLoadingMoreChannelMessages: false,
+                });
                 if (serverId) {
                     get().fetchChannels(serverId);
                     get().fetchServerMembers(serverId);
@@ -824,9 +1010,14 @@ export const useAppStore = create<AppState>()(
 
             setActiveChannel: (channelId) => {
                 const { activeServer } = get();
-                set({ activeChannel: channelId, channelMessages: [] });
+                set({
+                    activeChannel: channelId,
+                    channelMessages: [],
+                    hasMoreChannelMessages: true,
+                    isLoadingMoreChannelMessages: false,
+                });
                 if (channelId && activeServer) {
-                    get().fetchChannelMessages(activeServer, channelId);
+                    get().fetchChannelMessages(activeServer, channelId, { limit: 100 });
                 }
             },
 
@@ -840,24 +1031,106 @@ export const useAppStore = create<AppState>()(
                 }
             },
 
-            fetchChannelMessages: async (serverId, channelId) => {
+            fetchChannelMessages: async (serverId, channelId, options) => {
+                const before = options?.before;
+                const limit = options?.limit ?? 100;
+                const append = options?.append ?? false;
+
+                if (append) {
+                    set({ isLoadingMoreChannelMessages: true });
+                }
+
                 try {
-                    const messages = await invoke<ChannelMessage[]>('api_fetch_channel_messages', { serverId, channelId });
-                    set({ channelMessages: messages });
-                    console.log(`[Store] Fetched ${messages.length} channel messages`);
+                    const fetched = await invoke<ChannelMessage[]>('api_fetch_channel_messages', { serverId, channelId, before, limit });
+                    const normalized = fetched.map((m) => ({ ...m, status: m.status ?? 'sent' as const }));
+
+                    if (append) {
+                        const merged = [...normalized, ...get().channelMessages].filter((msg, idx, arr) => {
+                            if (arr.findIndex((x) => x.id === msg.id) !== idx) return false;
+                            if (msg.client_id && arr.findIndex((x) => x.client_id === msg.client_id) !== idx) return false;
+                            return true;
+                        });
+                        set({
+                            channelMessages: merged,
+                            hasMoreChannelMessages: normalized.length >= limit,
+                            isLoadingMoreChannelMessages: false,
+                        });
+                    } else {
+                        set({
+                            channelMessages: normalized,
+                            hasMoreChannelMessages: normalized.length >= limit,
+                            isLoadingMoreChannelMessages: false,
+                        });
+                    }
+
+                    console.log(`[Store] Fetched ${normalized.length} channel messages`);
                 } catch (e) {
                     console.error('[Store] fetchChannelMessages error:', e);
+                    if (append) {
+                        set({ isLoadingMoreChannelMessages: false });
+                    }
                 }
             },
 
+            loadOlderChannelMessages: async () => {
+                const {
+                    activeServer,
+                    activeChannel,
+                    channelMessages,
+                    hasMoreChannelMessages,
+                    isLoadingMoreChannelMessages,
+                    fetchChannelMessages,
+                } = get();
+
+                if (!activeServer || !activeChannel || !hasMoreChannelMessages || isLoadingMoreChannelMessages || channelMessages.length === 0) {
+                    return;
+                }
+
+                const first = channelMessages.find((m) => !m.id.startsWith('local-'));
+                if (!first) return;
+                await fetchChannelMessages(activeServer, activeChannel, {
+                    before: first.id,
+                    append: true,
+                    limit: 100,
+                });
+            },
+
             sendChannelMessage: async (serverId, channelId, content) => {
-                const { channelMessages } = get();
+                const { channelMessages, user } = get();
+                const clientId = globalThis.crypto.randomUUID();
+                const localId = `local-${clientId}`;
+                const optimistic: ChannelMessage = {
+                    id: localId,
+                    client_id: clientId,
+                    channel_id: channelId,
+                    sender_id: user?.id,
+                    sender_username: user?.username,
+                    content,
+                    nonce: null,
+                    created_at: new Date().toISOString(),
+                    status: 'sending',
+                };
+                set({ channelMessages: [...channelMessages, optimistic] });
+
                 try {
-                    const message = await invoke<ChannelMessage>('api_send_channel_message', { serverId, channelId, content });
-                    set({ channelMessages: [...channelMessages, message] });
+                    const message = await invoke<ChannelMessage>('api_send_channel_message', { serverId, channelId, content, clientId });
+                    set({
+                        channelMessages: get().channelMessages.map((m) =>
+                            m.id === localId || (m.client_id && m.client_id === clientId)
+                                ? { ...message, status: message.status ?? 'sent' }
+                                : m
+                        )
+                    });
                     console.log('[Store] Channel message sent');
                 } catch (e) {
                     console.error('[Store] sendChannelMessage error:', e);
+                    set({
+                        channelMessages: get().channelMessages.map((m) =>
+                            m.id === localId || (m.client_id && m.client_id === clientId)
+                                ? { ...m, status: 'failed' }
+                                : m
+                        )
+                    });
                 }
             },
         }),

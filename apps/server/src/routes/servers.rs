@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post, put},
     Json, Router,
@@ -18,6 +18,7 @@ pub fn router() -> Router<AppState> {
         .route("/:id", get(get_server))
         .route("/:id/members", get(get_members))
         .route("/:id/channels", post(create_channel))
+        .route("/:id/channels/:channel_id/typing", post(send_channel_typing))
         .route("/:id/channels/:channel_id/messages", get(get_channel_messages).post(send_channel_message))
         .route("/:id/channels/:channel_id/messages/:message_id", put(edit_channel_message))
         .route("/join/:code", post(join_server))
@@ -47,12 +48,24 @@ pub struct CreateChannelRequest {
 pub struct SendMessageRequest {
     pub content: String,
     pub nonce: Option<String>,
+    pub client_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
 pub struct EditChannelMessageRequest {
     pub content: String,
     pub nonce: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ChannelPaginationParams {
+    pub before: Option<Uuid>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct TypingRequest {
+    pub is_typing: bool,
 }
 
 #[derive(Serialize)]
@@ -363,6 +376,7 @@ async fn get_channel_messages(
     State(state): State<AppState>,
     user: AuthUser,
     Path((server_id, channel_id)): Path<(Uuid, Uuid)>,
+    Query(params): Query<ChannelPaginationParams>,
 ) -> Result<Json<Vec<ChannelMessage>>, StatusCode> {
     // Verify membership
     let is_member = sqlx::query_scalar::<_, i64>(
@@ -378,22 +392,65 @@ async fn get_channel_messages(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let messages = sqlx::query_as::<_, ChannelMessage>(
-        r#"
-        SELECT id, channel_id, sender_id, content, nonce, created_at, edited_at
-        FROM messages
-        WHERE channel_id = $1
-        ORDER BY created_at ASC
-        LIMIT 100
-        "#
-    )
-    .bind(channel_id)
-    .fetch_all(&state.db)
-    .await
+    let limit = params.limit.unwrap_or(100).clamp(1, 200);
+
+    let mut messages = if let Some(before_id) = params.before {
+        sqlx::query_as::<_, ChannelMessage>(
+            r#"
+            SELECT
+                m.id,
+                m.client_id,
+                m.channel_id,
+                m.sender_id,
+                u.username as sender_username,
+                m.content,
+                m.nonce,
+                m.created_at,
+                m.edited_at
+            FROM messages m
+            LEFT JOIN users u ON u.id = m.sender_id
+            WHERE m.channel_id = $1
+              AND m.created_at < (SELECT created_at FROM messages WHERE id = $3)
+            ORDER BY m.created_at DESC
+            LIMIT $2
+            "#
+        )
+        .bind(channel_id)
+        .bind(limit)
+        .bind(before_id)
+        .fetch_all(&state.db)
+        .await
+    } else {
+        sqlx::query_as::<_, ChannelMessage>(
+            r#"
+            SELECT
+                m.id,
+                m.client_id,
+                m.channel_id,
+                m.sender_id,
+                u.username as sender_username,
+                m.content,
+                m.nonce,
+                m.created_at,
+                m.edited_at
+            FROM messages m
+            LEFT JOIN users u ON u.id = m.sender_id
+            WHERE m.channel_id = $1
+            ORDER BY m.created_at DESC
+            LIMIT $2
+            "#
+        )
+        .bind(channel_id)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await
+    }
     .map_err(|e| {
         tracing::error!("Failed to get channel messages: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    messages.reverse();
 
     Ok(Json(messages))
 }
@@ -419,17 +476,62 @@ async fn send_channel_message(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    if let Some(client_id) = req.client_id {
+        if let Some(existing) = sqlx::query_as::<_, ChannelMessage>(
+            r#"
+            SELECT
+                m.id,
+                m.client_id,
+                m.channel_id,
+                m.sender_id,
+                u.username as sender_username,
+                m.content,
+                m.nonce,
+                m.created_at,
+                m.edited_at
+            FROM messages m
+            LEFT JOIN users u ON u.id = m.sender_id
+            WHERE m.channel_id = $1 AND m.sender_id = $2 AND m.client_id = $3
+            LIMIT 1
+            "#
+        )
+        .bind(channel_id)
+        .bind(user.id)
+        .bind(client_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        {
+            return Ok(Json(existing));
+        }
+    }
+
     let message = sqlx::query_as::<_, ChannelMessage>(
         r#"
-        INSERT INTO messages (channel_id, sender_id, content, nonce)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, channel_id, sender_id, content, nonce, created_at, edited_at
+        WITH inserted AS (
+            INSERT INTO messages (channel_id, sender_id, content, nonce, client_id)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, client_id, channel_id, sender_id, content, nonce, created_at, edited_at
+        )
+        SELECT
+            i.id,
+            i.client_id,
+            i.channel_id,
+            i.sender_id,
+            u.username as sender_username,
+            i.content,
+            i.nonce,
+            i.created_at,
+            i.edited_at
+        FROM inserted i
+        LEFT JOIN users u ON u.id = i.sender_id
         "#
     )
     .bind(channel_id)
     .bind(user.id)
     .bind(&req.content)
     .bind(&req.nonce)
+    .bind(req.client_id)
     .fetch_one(&state.db)
     .await
     .map_err(|e| {
@@ -460,6 +562,55 @@ async fn send_channel_message(
     }
 
     Ok(Json(message))
+}
+
+/// Broadcast typing indicator in a server channel
+async fn send_channel_typing(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((server_id, channel_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<TypingRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let is_member = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM server_members WHERE server_id = $1 AND user_id = $2"
+    )
+    .bind(server_id)
+    .bind(user.id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0) > 0;
+
+    if !is_member {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let members = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM server_members WHERE server_id = $1"
+    )
+    .bind(server_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let ws_payload = serde_json::json!({
+        "type": "CHANNEL_TYPING",
+        "server_id": server_id,
+        "channel_id": channel_id,
+        "user_id": user.id,
+        "is_typing": req.is_typing,
+    });
+    let ws_text = serde_json::to_string(&ws_payload).unwrap();
+
+    for member_id in members {
+        if member_id == user.id {
+            continue;
+        }
+        if let Some(peer_tx) = state.peers.get(&member_id.to_string()) {
+            let _ = peer_tx.send(WsMessage::Text(ws_text.clone()));
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Edit a channel message (only original sender can edit)
@@ -498,7 +649,26 @@ async fn edit_channel_message(
     }
 
     let updated = sqlx::query_as::<_, ChannelMessage>(
-        "UPDATE messages SET content = $1, nonce = $2, edited_at = NOW() WHERE id = $3 RETURNING id, channel_id, sender_id, content, nonce, created_at, edited_at"
+        r#"
+        WITH updated AS (
+            UPDATE messages
+            SET content = $1, nonce = $2, edited_at = NOW()
+            WHERE id = $3
+            RETURNING id, client_id, channel_id, sender_id, content, nonce, created_at, edited_at
+        )
+        SELECT
+            u2.id,
+            u2.client_id,
+            u2.channel_id,
+            u2.sender_id,
+            u.username as sender_username,
+            u2.content,
+            u2.nonce,
+            u2.created_at,
+            u2.edited_at
+        FROM updated u2
+        LEFT JOIN users u ON u.id = u2.sender_id
+        "#
     )
     .bind(&req.content)
     .bind(&req.nonce)

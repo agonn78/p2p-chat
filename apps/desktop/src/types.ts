@@ -22,13 +22,24 @@ export interface Room {
 
 export interface Message {
     id: string;
+    client_id?: string | null;
     room_id: string;
     sender_id?: string;
     content: string;
     nonce?: string | null;  // For E2EE - if present, content is encrypted
     created_at: string;
     edited_at?: string | null;
+    status?: MessageStatus;
     _decryptedContent?: string;  // Client-side only - cached decrypted content
+}
+
+export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
+
+export interface Conversation {
+    id: string;
+    kind: 'dm' | 'channel';
+    name?: string;
+    updated_at?: string;
 }
 
 // === Voice Call Types ===
@@ -84,12 +95,15 @@ export interface ServerMember {
 
 export interface ChannelMessage {
     id: string;
+    client_id?: string | null;
     channel_id: string;
     sender_id?: string;
+    sender_username?: string | null;
     content: string;
     nonce?: string | null;
     created_at: string;
     edited_at?: string | null;
+    status?: MessageStatus;
     _decryptedContent?: string;
 }
 

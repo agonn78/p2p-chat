@@ -40,11 +40,22 @@ function App() {
     const channels = useAppStore((s) => s.channels);
     const activeChannel = useAppStore((s) => s.activeChannel);
     const channelMessages = useAppStore((s) => s.channelMessages);
+    const hasMoreChannelMessages = useAppStore((s) => s.hasMoreChannelMessages);
+    const isLoadingMoreChannelMessages = useAppStore((s) => s.isLoadingMoreChannelMessages);
+    const loadOlderChannelMessages = useAppStore((s) => s.loadOlderChannelMessages);
+    const serverMembers = useAppStore((s) => s.serverMembers);
+    const typingByChannel = useAppStore((s) => s.typingByChannel);
+    const setChannelTyping = useAppStore((s) => s.setChannelTyping);
     const sendChannelMessage = useAppStore((s) => s.sendChannelMessage);
 
     // Chat Store
     const activeRoom = useAppStore((s) => s.activeRoom);
     const messages = useAppStore((s) => s.messages);
+    const hasMoreMessages = useAppStore((s) => s.hasMoreMessages);
+    const isLoadingMoreMessages = useAppStore((s) => s.isLoadingMoreMessages);
+    const loadOlderMessages = useAppStore((s) => s.loadOlderMessages);
+    const typingByRoom = useAppStore((s) => s.typingByRoom);
+    const setTyping = useAppStore((s) => s.setTyping);
     const createOrGetDm = useAppStore((s) => s.createOrGetDm);
     const sendMessage = useAppStore((s) => s.sendMessage);
     const addMessage = useAppStore((s) => s.addMessage);
@@ -75,8 +86,11 @@ function App() {
     const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
     const [editInput, setEditInput] = useState('');
 
-    // Ref for auto-scrolling to bottom
+    // Refs for chat containers
+    const dmMessagesContainerRef = useRef<HTMLDivElement>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
+
+    const typingTimeoutRef = useRef<number | null>(null);
 
     useEffect(() => {
         if (isAuthenticated) {
@@ -109,9 +123,33 @@ function App() {
                         if (payload.type === 'NEW_MESSAGE') {
                             console.log('[App] ✉️ NEW_MESSAGE via WebSocket');
                             addMessage(payload.message);
+
+                            if (payload.message?.room_id && payload.message?.id && payload.message?.sender_id !== user?.id) {
+                                invoke('api_mark_message_delivered', {
+                                    roomId: payload.message.room_id,
+                                    messageId: payload.message.id,
+                                }).catch(() => undefined);
+
+                                if (payload.message.room_id === activeRoom) {
+                                    invoke('api_mark_room_read', {
+                                        roomId: payload.message.room_id,
+                                        uptoMessageId: payload.message.id,
+                                    }).catch(() => undefined);
+                                }
+                            }
                         } else if (payload.type === 'MESSAGE_EDITED') {
                             console.log('[App] ✏️ MESSAGE_EDITED via WebSocket');
                             updateMessage(payload.message);
+                        } else if (payload.type === 'MESSAGE_STATUS') {
+                            useAppStore.setState((state) => ({
+                                messages: state.messages.map((m) =>
+                                    m.id === payload.message_id ? { ...m, status: payload.status } : m
+                                ),
+                            }));
+                        } else if (payload.type === 'TYPING') {
+                            if (payload.room_id && payload.user_id) {
+                                setTyping(payload.room_id, payload.user_id, !!payload.is_typing);
+                            }
                         } else if (payload.type === 'MESSAGE_DELETED') {
                             console.log('[App] 🗑️ MESSAGE_DELETED via WebSocket');
                             removeMessage(payload.message_id);
@@ -123,13 +161,20 @@ function App() {
                         } else if (payload.type === 'NEW_CHANNEL_MESSAGE') {
                             if (payload.channel_id === activeChannel) {
                                 useAppStore.setState((state) => {
-                                    if (state.channelMessages.some((m) => m.id === payload.message.id)) {
+                                    if (state.channelMessages.some((m) =>
+                                        m.id === payload.message.id ||
+                                        (!!m.client_id && !!payload.message.client_id && m.client_id === payload.message.client_id)
+                                    )) {
                                         return state;
                                     }
                                     return {
                                         channelMessages: [...state.channelMessages, payload.message],
                                     };
                                 });
+                            }
+                        } else if (payload.type === 'CHANNEL_TYPING') {
+                            if (payload.channel_id && payload.user_id) {
+                                setChannelTyping(payload.channel_id, payload.user_id, !!payload.is_typing);
                             }
                         } else if (payload.type === 'CHANNEL_MESSAGE_EDITED') {
                             useAppStore.setState((state) => ({
@@ -185,7 +230,7 @@ function App() {
             console.log('[App] 🔌 Cleaning up WebSocket listener');
             if (cleanup) cleanup();
         };
-    }, [isAuthenticated, activeRoom, activeChannel, user?.id]);
+    }, [isAuthenticated, activeRoom, activeChannel, user?.id, setTyping, setChannelTyping]);
 
     // Call event listeners
     useEffect(() => {
@@ -322,17 +367,69 @@ function App() {
         };
     }, [isAuthenticated, activeRoom, wsConnected, pollForNewMessages]);
 
-    // Auto-scroll to bottom when messages change
+    // Mark active DM as read (receipts)
     useEffect(() => {
-        if (messagesEndRef.current) {
-            messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+        if (!activeRoom || messages.length === 0) {
+            return;
         }
-    }, [messages]);
+
+        const latest = messages[messages.length - 1];
+        if (!latest?.id || latest.sender_id === user?.id) {
+            return;
+        }
+
+        invoke('api_mark_room_read', { roomId: activeRoom, uptoMessageId: latest.id }).catch(() => undefined);
+    }, [activeRoom, messages.length, user?.id]);
+
+    // Auto-scroll DM only if user is already near bottom
+    useEffect(() => {
+        const container = dmMessagesContainerRef.current;
+        if (!container) return;
+
+        const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+        if (distanceToBottom < 120) {
+            messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
+        }
+    }, [messages.length, activeRoom]);
 
     // Command hint visibility
     useEffect(() => {
         setShowCommandHint(msgInput.startsWith('/') && msgInput.length > 1);
     }, [msgInput]);
+
+    // Typing indicator emitter (DM + channel)
+    useEffect(() => {
+        if (!isAuthenticated) return;
+
+        const isTyping = msgInput.trim().length > 0;
+
+        if (activeRoom) {
+            invoke('api_send_typing', { roomId: activeRoom, isTyping }).catch(() => undefined);
+            if (typingTimeoutRef.current) {
+                window.clearTimeout(typingTimeoutRef.current);
+            }
+            if (isTyping) {
+                typingTimeoutRef.current = window.setTimeout(() => {
+                    invoke('api_send_typing', { roomId: activeRoom, isTyping: false }).catch(() => undefined);
+                }, 2500);
+            }
+        }
+
+        if (activeServer && activeChannel) {
+            invoke('api_send_channel_typing', {
+                serverId: activeServer,
+                channelId: activeChannel,
+                isTyping,
+            }).catch(() => undefined);
+        }
+
+        return () => {
+            if (typingTimeoutRef.current) {
+                window.clearTimeout(typingTimeoutRef.current);
+                typingTimeoutRef.current = null;
+            }
+        };
+    }, [msgInput, activeRoom, activeServer, activeChannel, isAuthenticated]);
 
     const handleJoinCall = async (friendId: string) => {
         startCall(friendId);
@@ -420,7 +517,9 @@ function App() {
         if (!senderId) return 'Unknown';
         if (senderId === user?.id) return 'Me';
         const friend = friends.find(f => f.id === senderId);
-        return friend ? friend.username : 'Unknown';
+        if (friend) return friend.username;
+        const member = serverMembers.find((m) => m.user_id === senderId);
+        return member ? member.username : 'Unknown';
     };
 
     // Get matching commands for hint
@@ -459,10 +558,15 @@ function App() {
                             <ServerChatView
                                 channelMessages={channelMessages}
                                 sendChannelMessage={sendChannelMessage}
+                                loadOlderChannelMessages={loadOlderChannelMessages}
+                                hasMoreChannelMessages={hasMoreChannelMessages}
+                                isLoadingMoreChannelMessages={isLoadingMoreChannelMessages}
                                 activeServer={activeServer}
                                 activeChannel={activeChannel}
                                 channels={channels}
                                 user={user}
+                                serverMembers={serverMembers}
+                                typingUserIds={typingByChannel[activeChannel] || []}
                             />
                         ) : (
                             <div className="flex-1 flex items-center justify-center">
@@ -576,7 +680,27 @@ function App() {
                                 </div>
 
                                 {/* Messages */}
-                                <div className="flex-1 overflow-y-auto p-4 space-y-2">
+                                <div
+                                    ref={dmMessagesContainerRef}
+                                    className="flex-1 overflow-y-auto p-4 space-y-2"
+                                    onScroll={(e) => {
+                                        const el = e.currentTarget;
+                                        if (el.scrollTop < 80) {
+                                            loadOlderMessages();
+                                        }
+                                    }}
+                                >
+                                    {(hasMoreMessages || isLoadingMoreMessages) && (
+                                        <div className="flex justify-center mb-3">
+                                            <button
+                                                onClick={loadOlderMessages}
+                                                disabled={isLoadingMoreMessages}
+                                                className="text-xs px-3 py-1 rounded-full bg-white/5 hover:bg-white/10 disabled:opacity-60"
+                                            >
+                                                {isLoadingMoreMessages ? 'Loading older messages...' : 'Load older messages'}
+                                            </button>
+                                        </div>
+                                    )}
                                     {messages.length === 0 ? (
                                         <div className="flex flex-col items-center justify-center h-full text-gray-500">
                                             <div className="w-24 h-24 rounded-full bg-gradient-to-br from-primary/20 to-secondary/20 flex items-center justify-center mb-4">
@@ -610,6 +734,9 @@ function App() {
                                                                 <span className="text-xs text-gray-500">
                                                                     {new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                                                                 </span>
+                                                                {isOwn && msg.status && (
+                                                                    <span className="text-xs text-gray-500 capitalize">{msg.status}</span>
+                                                                )}
                                                                 {msg.nonce && (
                                                                     <span className="text-xs text-green-500" title="End-to-end encrypted">
                                                                         🔒
@@ -687,6 +814,14 @@ function App() {
                                         </>
                                     )}
                                 </div>
+
+                                {activeRoom && (typingByRoom[activeRoom] || []).length > 0 && (
+                                    <div className="px-4 pb-1 text-xs text-gray-400">
+                                        {(typingByRoom[activeRoom] || [])
+                                            .filter((id) => id !== user?.id)
+                                            .map((id) => getSenderName(id))[0] || 'Someone'} is typing...
+                                    </div>
+                                )}
 
                                 {/* Command hints */}
                                 {showCommandHint && getMatchingCommands().length > 0 && (
@@ -847,25 +982,77 @@ function App() {
 function ServerChatView({
     channelMessages,
     sendChannelMessage,
+    loadOlderChannelMessages,
+    hasMoreChannelMessages,
+    isLoadingMoreChannelMessages,
     activeServer,
     activeChannel,
     channels,
     user,
+    serverMembers,
+    typingUserIds,
 }: {
     channelMessages: any[];
     sendChannelMessage: (serverId: string, channelId: string, content: string) => Promise<void>;
+    loadOlderChannelMessages: () => Promise<void>;
+    hasMoreChannelMessages: boolean;
+    isLoadingMoreChannelMessages: boolean;
     activeServer: string;
     activeChannel: string;
     channels: any[];
     user: any;
+    serverMembers: any[];
+    typingUserIds: string[];
 }) {
     const [input, setInput] = useState('');
+    const messagesContainerRef = useRef<HTMLDivElement>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
+    const typingTimeoutRef = useRef<number | null>(null);
     const channel = channels.find((c: any) => c.id === activeChannel);
+    const typingMemberName = typingUserIds
+        .filter((id) => id !== user?.id)
+        .map((id) => serverMembers.find((m: any) => m.user_id === id)?.username || 'Someone')[0];
 
     useEffect(() => {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [channelMessages]);
+        const isTyping = input.trim().length > 0;
+
+        invoke('api_send_channel_typing', {
+            serverId: activeServer,
+            channelId: activeChannel,
+            isTyping,
+        }).catch(() => undefined);
+
+        if (typingTimeoutRef.current) {
+            window.clearTimeout(typingTimeoutRef.current);
+        }
+
+        if (isTyping) {
+            typingTimeoutRef.current = window.setTimeout(() => {
+                invoke('api_send_channel_typing', {
+                    serverId: activeServer,
+                    channelId: activeChannel,
+                    isTyping: false,
+                }).catch(() => undefined);
+            }, 2500);
+        }
+
+        return () => {
+            if (typingTimeoutRef.current) {
+                window.clearTimeout(typingTimeoutRef.current);
+                typingTimeoutRef.current = null;
+            }
+        };
+    }, [input, activeServer, activeChannel]);
+
+    useEffect(() => {
+        const container = messagesContainerRef.current;
+        if (!container) return;
+
+        const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+        if (distanceToBottom < 120) {
+            messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
+        }
+    }, [channelMessages.length]);
 
     const handleSend = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -883,18 +1070,43 @@ function ServerChatView({
             </div>
 
             {/* Messages */}
-            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+            <div
+                ref={messagesContainerRef}
+                className="flex-1 overflow-y-auto p-4 space-y-4"
+                onScroll={(e) => {
+                    const el = e.currentTarget;
+                    if (el.scrollTop < 80) {
+                        loadOlderChannelMessages();
+                    }
+                }}
+            >
+                {(hasMoreChannelMessages || isLoadingMoreChannelMessages) && (
+                    <div className="flex justify-center mb-2">
+                        <button
+                            onClick={() => void loadOlderChannelMessages()}
+                            disabled={isLoadingMoreChannelMessages}
+                            className="text-xs px-3 py-1 rounded-full bg-white/5 hover:bg-white/10 disabled:opacity-60"
+                        >
+                            {isLoadingMoreChannelMessages ? 'Loading older messages...' : 'Load older messages'}
+                        </button>
+                    </div>
+                )}
                 {channelMessages.map((msg) => (
                     <div key={msg.id} className="flex gap-3 hover:bg-white/5 p-2 rounded-lg">
                         <div className="w-10 h-10 rounded-full bg-gradient-to-br from-primary to-secondary flex-shrink-0" />
                         <div>
                             <div className="flex items-center gap-2">
                                 <span className="font-semibold text-sm">
-                                    {msg.sender_id === user?.id ? user?.username : 'Member'}
+                                    {msg.sender_id === user?.id
+                                        ? user?.username
+                                        : msg.sender_username || serverMembers.find((m: any) => m.user_id === msg.sender_id)?.username || 'Member'}
                                 </span>
                                 <span className="text-xs text-gray-500">
                                     {new Date(msg.created_at).toLocaleTimeString()}
                                 </span>
+                                {msg.status && msg.sender_id === user?.id && (
+                                    <span className="text-xs text-gray-500 capitalize">{msg.status}</span>
+                                )}
                             </div>
                             <p className="text-gray-200">{msg.content}</p>
                         </div>
@@ -902,6 +1114,10 @@ function ServerChatView({
                 ))}
                 <div ref={messagesEndRef} />
             </div>
+
+            {typingMemberName && (
+                <div className="px-4 pb-1 text-xs text-gray-400">{typingMemberName} is typing...</div>
+            )}
 
             {/* Input */}
             <form onSubmit={handleSend} className="p-4 border-t border-white/5">

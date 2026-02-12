@@ -34,11 +34,15 @@ pub struct ServerMember {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelMessage {
     pub id: String,
+    pub client_id: Option<String>,
     pub channel_id: String,
     pub sender_id: Option<String>,
+    pub sender_username: Option<String>,
     pub content: String,
     pub nonce: Option<String>,
     pub created_at: Option<String>,
+    pub edited_at: Option<String>,
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +68,12 @@ struct CreateChannelRequest {
 struct SendChannelMessageRequest {
     content: String,
     nonce: Option<String>,
+    client_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TypingRequest {
+    is_typing: bool,
 }
 
 #[tauri::command]
@@ -268,15 +278,26 @@ pub async fn api_fetch_channel_messages(
     state: State<'_, ApiState>,
     server_id: String,
     channel_id: String,
+    before: Option<String>,
+    limit: Option<i64>,
 ) -> Result<Vec<ChannelMessage>, String> {
     let token = state.get_token().await
         .ok_or("Not authenticated")?;
     
     let url = format!("{}/servers/{}/channels/{}/messages", state.base_url, server_id, channel_id);
+
+    let mut query_params: Vec<(String, String)> = Vec::new();
+    if let Some(before_id) = before {
+        query_params.push(("before".to_string(), before_id));
+    }
+    if let Some(limit) = limit {
+        query_params.push(("limit".to_string(), limit.to_string()));
+    }
     
     let res = state.client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
+        .query(&query_params)
         .send()
         .await
         .map_err(|e| format!("Network error: {}", e))?;
@@ -299,6 +320,7 @@ pub async fn api_send_channel_message(
     channel_id: String,
     content: String,
     nonce: Option<String>,
+    client_id: Option<String>,
 ) -> Result<ChannelMessage, String> {
     let token = state.get_token().await
         .ok_or("Not authenticated")?;
@@ -308,7 +330,7 @@ pub async fn api_send_channel_message(
     let res = state.client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .json(&SendChannelMessageRequest { content, nonce })
+        .json(&SendChannelMessageRequest { content, nonce, client_id })
         .send()
         .await
         .map_err(|e| format!("Network error: {}", e))?;
@@ -322,4 +344,32 @@ pub async fn api_send_channel_message(
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
     Ok(message)
+}
+
+#[tauri::command]
+pub async fn api_send_channel_typing(
+    state: State<'_, ApiState>,
+    server_id: String,
+    channel_id: String,
+    is_typing: bool,
+) -> Result<(), String> {
+    let token = state.get_token().await
+        .ok_or("Not authenticated")?;
+
+    let url = format!("{}/servers/{}/channels/{}/typing", state.base_url, server_id, channel_id);
+
+    let res = state.client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&TypingRequest { is_typing })
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Failed to send channel typing: {}", text));
+    }
+
+    Ok(())
 }

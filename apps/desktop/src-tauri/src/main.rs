@@ -3,6 +3,7 @@
 
 mod api;
 mod config;
+mod messaging;
 mod signaling;
 
 use tauri::{State, Manager, Emitter};
@@ -576,6 +577,9 @@ fn main() {
             api::chat::api_create_or_get_dm,
             api::chat::api_fetch_messages,
             api::chat::api_send_message,
+            api::chat::api_send_typing,
+            api::chat::api_mark_message_delivered,
+            api::chat::api_mark_room_read,
             api::chat::api_delete_message,
             api::chat::api_delete_all_messages,
             api::chat::api_edit_message,
@@ -588,6 +592,7 @@ fn main() {
             api::servers::api_fetch_server_members,
             api::servers::api_fetch_channel_messages,
             api::servers::api_send_channel_message,
+            api::servers::api_send_channel_typing,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

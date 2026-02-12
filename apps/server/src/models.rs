@@ -1,7 +1,7 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct User {
@@ -55,6 +55,7 @@ pub struct Room {
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Message {
     pub id: Uuid,
+    pub client_id: Option<Uuid>,
     pub room_id: Uuid,
     pub sender_id: Option<Uuid>,
     pub content: String,
@@ -103,8 +104,10 @@ pub struct ServerMemberWithUser {
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ChannelMessage {
     pub id: Uuid,
+    pub client_id: Option<Uuid>,
     pub channel_id: Uuid,
     pub sender_id: Option<Uuid>,
+    pub sender_username: Option<String>,
     pub content: String,
     pub nonce: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
