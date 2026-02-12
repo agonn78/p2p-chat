@@ -741,28 +741,6 @@ function App() {
                             </div>
                         )}
 
-                        {/* Call Overlay */}
-                        {activeCall && (
-                            <div className="absolute top-4 right-4 w-72 bg-black/80 backdrop-blur-xl border border-white/10 rounded-xl p-4 shadow-2xl z-20">
-                                <div className="flex items-center justify-between mb-4">
-                                    <h3 className="text-sm font-bold text-white">Active Call</h3>
-                                    <button
-                                        onClick={endCall}
-                                        className="px-3 py-1 text-xs bg-red-600 hover:bg-red-500 rounded-lg transition"
-                                    >
-                                        End
-                                    </button>
-                                </div>
-                                <div className="space-y-3">
-                                    <div className="flex justify-between text-xs">
-                                        <span className="text-gray-500">Status</span>
-                                        <span className={activeCall.status === 'connected' ? 'text-green-400' : 'text-yellow-400'}>
-                                            {activeCall.status === 'connected' ? 'Connected' : activeCall.status === 'calling' ? 'Calling...' : 'Connecting...'}
-                                        </span>
-                                    </div>
-                                </div>
-                            </div>
-                        )}
                     </div>
 
                     {/* Right Sidebar - Friend Info Panel */}
