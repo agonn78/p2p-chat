@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use axum::extract::ws::Message as WsMessage;
 
 use crate::auth::AuthUser;
 use crate::models::{Channel, ChannelMessage, Server, ServerMemberWithUser};
@@ -428,6 +429,28 @@ async fn send_channel_message(
         tracing::error!("Failed to send channel message: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    // Broadcast via WebSocket to all server members
+    let members = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM server_members WHERE server_id = $1"
+    )
+    .bind(server_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let ws_payload = serde_json::json!({
+        "type": "NEW_CHANNEL_MESSAGE",
+        "server_id": server_id,
+        "channel_id": channel_id,
+        "message": message
+    });
+    let ws_text = serde_json::to_string(&ws_payload).unwrap();
+
+    for member_id in members {
+        if let Some(peer_tx) = state.peers.get(&member_id.to_string()) {
+            let _ = peer_tx.send(WsMessage::Text(ws_text.clone()));
+        }
+    }
 
     Ok(Json(message))
 }

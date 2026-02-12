@@ -2,6 +2,7 @@ use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use std::sync::LazyLock;
 use axum::{
     async_trait,
     extract::FromRequestParts,
@@ -21,8 +22,19 @@ use uuid::Uuid;
 
 use crate::models::User;
 
-// JWT secret - in production, use env var
-const JWT_SECRET: &[u8] = b"your-super-secret-key-change-in-production";
+// JWT secret loaded from environment variable
+static JWT_SECRET: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    match std::env::var("JWT_SECRET") {
+        Ok(secret) => {
+            tracing::info!("JWT_SECRET loaded from environment");
+            secret.into_bytes()
+        }
+        Err(_) => {
+            tracing::warn!("⚠️  JWT_SECRET not set! Using insecure default. Set JWT_SECRET env var in production!");
+            b"dev-only-insecure-default-key-change-me".to_vec()
+        }
+    }
+});
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
@@ -111,7 +123,7 @@ pub fn generate_token(user: &User) -> Result<String, AuthError> {
     encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(JWT_SECRET),
+        &EncodingKey::from_secret(&JWT_SECRET),
     )
     .map_err(|_| AuthError::InvalidToken)
 }
@@ -120,7 +132,7 @@ pub fn generate_token(user: &User) -> Result<String, AuthError> {
 pub fn validate_token(token: &str) -> Result<Claims, AuthError> {
     decode::<Claims>(
         token,
-        &DecodingKey::from_secret(JWT_SECRET),
+        &DecodingKey::from_secret(&JWT_SECRET),
         &Validation::default(),
     )
     .map(|data| data.claims)

@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use shared_proto::signaling::SignalingMessage;
 use crate::state::AppState;
 use sqlx::postgres::PgPoolOptions;
+use axum::http::HeaderValue;
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
@@ -55,19 +56,40 @@ async fn main() {
         .expect("Failed to run migrations");
     tracing::info!("Migrations complete!");
 
-    // Seed test users if they don't exist
-    seed_test_users(&pool).await;
+    // Seed test users only if SEED_TEST_USERS=true (dev/testing only)
+    if std::env::var("SEED_TEST_USERS").map(|v| v == "true").unwrap_or(false) {
+        tracing::info!("SEED_TEST_USERS=true, seeding test users...");
+        seed_test_users(&pool).await;
+    }
 
     // Initialize state
     let app_state = AppState::new(pool.clone());
 
-    // CORS configuration - explicit for Windows compatibility
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any)
-        .expose_headers(Any)
-        .max_age(std::time::Duration::from_secs(3600));
+    // CORS configuration - load allowed origins from env, or default to Any (dev)
+    let cors = match std::env::var("ALLOWED_ORIGINS") {
+        Ok(origins_str) => {
+            let origins: Vec<HeaderValue> = origins_str
+                .split(',')
+                .filter_map(|o| o.trim().parse::<HeaderValue>().ok())
+                .collect();
+            tracing::info!("CORS: allowing origins: {:?}", origins);
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods(Any)
+                .allow_headers(Any)
+                .expose_headers(Any)
+                .max_age(std::time::Duration::from_secs(3600))
+        }
+        Err(_) => {
+            tracing::warn!("⚠️  ALLOWED_ORIGINS not set, allowing all origins. Set ALLOWED_ORIGINS in production!");
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
+                .expose_headers(Any)
+                .max_age(std::time::Duration::from_secs(3600))
+        }
+    };
 
     // Build router
     let app = Router::new()
@@ -297,8 +319,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             if let Some(peer_tx) = state.peers.get(&peer_id) {
                 let ended = SignalingMessage::CallEnded { peer_id: id.clone() };
                 let msg = serde_json::to_string(&ended).unwrap();
-                let _ = peer_tx.send(Message::Text(msg));
-                tracing::info!("📴 User {} disconnected, ended call with {}", id, peer_id);
+                match peer_tx.send(Message::Text(msg)) {
+                    Ok(_) => tracing::info!("📴 User {} disconnected, notified peer {}", id, peer_id),
+                    Err(e) => tracing::warn!("📴 User {} disconnected, failed to notify peer {}: {}", id, peer_id, e),
+                }
+            } else {
+                tracing::warn!("📴 User {} disconnected, peer {} already gone", id, peer_id);
             }
         }
         

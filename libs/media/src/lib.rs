@@ -9,7 +9,7 @@ mod crypto;
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tokio::sync::mpsc;
 use webrtc::api::media_engine::MediaEngine as WebRtcMediaEngine;
 use webrtc::api::APIBuilder;
@@ -41,6 +41,10 @@ pub struct MediaEngine {
     // Audio components
     audio_capture: Option<Arc<AudioCapture>>,
     audio_playback: Option<Arc<AudioPlayback>>,
+    /// Track whether playback stream has been started
+    playback_started: Arc<AtomicBool>,
+    /// Hold the playback stream to prevent it from being dropped
+    _playback_stream: Option<cpal::Stream>,
 }
 
 impl Default for MediaEngine {
@@ -57,7 +61,32 @@ impl MediaEngine {
             rtc_connection: None,
             audio_capture: None,
             audio_playback: None,
+            playback_started: Arc::new(AtomicBool::new(false)),
+            _playback_stream: None,
         }
+    }
+
+    /// Reset the media engine for a new call
+    /// Must be called when a call ends to clean up all state
+    pub async fn reset(&mut self) {
+        // Stop audio capture
+        if let Some(capture) = &self.audio_capture {
+            capture.stop();
+        }
+        
+        // Close WebRTC connection
+        if let Some(pc) = self.rtc_connection.take() {
+            let _ = pc.close().await;
+            tracing::info!("WebRTC connection closed");
+        }
+        
+        self.keypair = None;
+        self.crypto_ctx = None;
+        self.audio_capture = None;
+        self.audio_playback = None;
+        self._playback_stream = None;
+        self.playback_started.store(false, Ordering::SeqCst);
+        tracing::info!("MediaEngine reset for next call");
     }
 
     /// Generate a new key pair for E2EE
@@ -168,6 +197,9 @@ impl MediaEngine {
             let capture = Arc::new(AudioCapture::new(ctx.clone())?);
             self.audio_capture = Some(capture.clone());
 
+            // Clone for on_data_channel closures
+            let playback_started_clone = self.playback_started.clone();
+
             // Handle incoming DataChannel (Answerer side receives channel created by Offerer)
             let playback_clone = playback.clone();
             let capture_clone = capture.clone();
@@ -175,16 +207,29 @@ impl MediaEngine {
             pc.on_data_channel(Box::new(move |d_channel: Arc<RTCDataChannel>| {
                 let playback = playback_clone.clone();
                 let capture = capture_clone.clone();
+                let playback_started = playback_started_clone.clone();
                 
                 Box::pin(async move {
                     tracing::info!("New DataChannel {} {}", d_channel.label(), d_channel.id());
                     
                     let d_channel_clone = d_channel.clone();
+                    let playback_for_open = playback.clone();
+                    let ps_for_open = playback_started.clone();
                     d_channel.on_open(Box::new(move || {
                         tracing::info!("Data channel opened (Answerer)");
                         let dc = d_channel_clone.clone();
                         let capture = capture.clone();
-                         Box::pin(async move {
+                        let playback = playback_for_open.clone();
+                        let ps = ps_for_open.clone();
+                        Box::pin(async move {
+                            // Start playback stream once
+                            if !ps.swap(true, Ordering::SeqCst) {
+                                match playback.start() {
+                                    Ok(_stream) => tracing::info!("Playback stream started (Answerer)"),
+                                    Err(e) => tracing::error!("Failed to start playback: {}", e),
+                                }
+                            }
+                            
                             // Start capture
                             if let Err(e) = capture.start() {
                                 tracing::error!("Failed to start capture: {}", e);
@@ -208,7 +253,6 @@ impl MediaEngine {
                         Box::pin(async move {
                            if let Ok(packet) = bincode::deserialize::<AudioPacket>(&msg.data) {
                                let _ = playback.process_packet(packet);
-                               let _ = playback.start(); // Ensure playback is running
                            }
                         })
                     }));

@@ -2,6 +2,10 @@ import nacl from 'tweetnacl';
 import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
 
 // Storage key for keypair
+// ⚠️ SECURITY NOTE: Storing secret keys in localStorage is a compromise.
+// In a Tauri desktop app, localStorage is file-system backed and not accessible
+// from the web. For maximum security, consider using OS keychain via
+// tauri-plugin-stronghold or platform-specific secure storage.
 const KEYPAIR_STORAGE_KEY = 'p2p-nitro-keypair';
 
 export interface KeyPair {

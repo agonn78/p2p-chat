@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post, delete},
     Json, Router,
     http::StatusCode,
@@ -28,6 +28,12 @@ struct CreateDmRequest {
 struct SendMessageRequest {
     content: String,
     nonce: Option<String>,  // E2EE nonce
+}
+
+#[derive(Deserialize)]
+struct PaginationParams {
+    before: Option<String>,  // cursor: message ID to fetch before
+    limit: Option<i64>,      // max messages to return (default 50, max 100)
 }
 
 /// Create or get existing DM room with a friend
@@ -82,11 +88,12 @@ async fn create_or_get_dm(
     Ok(Json(room))
 }
 
-/// Get messages for a room
+/// Get messages for a room (with pagination)
 async fn get_messages(
     State(state): State<AppState>,
     user: AuthUser,
     Path(room_id): Path<Uuid>,
+    Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<Message>>, AuthError> {
     // Verify membership
     let is_member = sqlx::query_scalar::<_, i64>(
@@ -101,12 +108,31 @@ async fn get_messages(
         return Err(AuthError::InvalidToken);
     }
 
-    let messages = sqlx::query_as::<_, Message>(
-        "SELECT * FROM messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT 100"
-    )
-    .bind(room_id)
-    .fetch_all(&state.db)
-    .await?;
+    let limit = params.limit.unwrap_or(50).min(100);
+
+    let messages = if let Some(before_id) = params.before {
+        let before_uuid = Uuid::parse_str(&before_id).map_err(|_| AuthError::InvalidToken)?;
+        sqlx::query_as::<_, Message>(
+            "SELECT * FROM messages WHERE room_id = $1 AND created_at < (SELECT created_at FROM messages WHERE id = $3) ORDER BY created_at DESC LIMIT $2"
+        )
+        .bind(room_id)
+        .bind(limit)
+        .bind(before_uuid)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        sqlx::query_as::<_, Message>(
+            "SELECT * FROM messages WHERE room_id = $1 ORDER BY created_at DESC LIMIT $2"
+        )
+        .bind(room_id)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await?
+    };
+
+    // Reverse to return in chronological order
+    let mut messages = messages;
+    messages.reverse();
 
     Ok(Json(messages))
 }
@@ -230,7 +256,7 @@ async fn delete_message(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Delete all messages in a room (for /deleteall command)
+/// Delete all messages in a room (admin/owner only, or for /deleteall command in DMs)
 async fn delete_all_messages(
     State(state): State<AppState>,
     user: AuthUser,
@@ -246,6 +272,21 @@ async fn delete_all_messages(
     .await? > 0;
 
     if !is_member {
+        return Err(AuthError::InvalidToken);
+    }
+
+    // Check if this is a DM room (any member can delete in DMs)
+    let is_dm = sqlx::query_scalar::<_, bool>(
+        "SELECT is_dm FROM rooms WHERE id = $1"
+    )
+    .bind(room_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false);
+
+    if !is_dm {
+        // For non-DM rooms, only allow if we have no server role check
+        // (this endpoint is mainly for DMs via /deleteall command)
         return Err(AuthError::InvalidToken);
     }
 

@@ -10,6 +10,27 @@ import * as crypto from './crypto';
 const POLL_INTERVAL_MS = 5000;  // Poll every 5 seconds when WS is down
 const WS_RECONNECT_INTERVAL_MS = 10000;  // Try to reconnect WS every 10 seconds
 
+// Check if a JWT token is expired
+function isTokenExpired(token: string): boolean {
+    try {
+        const payload = JSON.parse(atob(token.split('.')[1]));
+        return payload.exp * 1000 < Date.now();
+    } catch {
+        return true; // Treat invalid tokens as expired
+    }
+}
+
+// Helper to handle API errors (auto-logout on 401)
+function handleApiError(e: unknown, context: string, logoutFn?: () => void): void {
+    const errStr = String(e);
+    console.error(`[Store] ${context}:`, e);
+    // Auto-logout if token is expired/invalid (Rust API returns error string containing status codes)
+    if (logoutFn && (errStr.includes('401') || errStr.includes('Unauthorized') || errStr.includes('InvalidToken'))) {
+        console.warn('[Store] ⚠️ Token expired or invalid, logging out...');
+        logoutFn();
+    }
+}
+
 interface AppState {
     // Auth
     token: string | null;
@@ -319,8 +340,17 @@ export const useAppStore = create<AppState>()(
                     for (const friend of friends) {
                         get().fetchFriendPublicKey(friend.id);
                     }
+
+                    // Also fetch online friends status (Bug #10)
+                    try {
+                        const onlineFriends = await invoke<string[]>('api_fetch_online_friends');
+                        set({ onlineFriends });
+                    } catch {
+                        // Endpoint might not be wired up yet, don't fail
+                        console.warn('[Store] Could not fetch online friends');
+                    }
                 } catch (e) {
-                    console.error('[Store] fetchFriends exception:', e);
+                    handleApiError(e, 'fetchFriends', get().logout);
                 }
             },
 
@@ -797,6 +827,15 @@ export const useAppStore = create<AppState>()(
                 keyPair: state.keyPair,
                 friendPublicKeys: state.friendPublicKeys,
             }),
+            onRehydrate: (_state) => {
+                // Bug #13: Validate token on app reload
+                return (state) => {
+                    if (state?.token && isTokenExpired(state.token)) {
+                        console.warn('[Store] ⚠️ Persisted token is expired, logging out...');
+                        state.logout();
+                    }
+                };
+            },
         }
     )
 );

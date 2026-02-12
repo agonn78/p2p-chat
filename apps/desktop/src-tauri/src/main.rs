@@ -142,6 +142,12 @@ async fn complete_call_handshake(
 async fn decline_call(state: State<'_, AppState>, caller_id: String) -> Result<(), String> {
     println!("❌ Declining call from {}", caller_id);
     
+    // Reset media engine (may have generated keypair)
+    {
+        let mut engine = state.media.lock().await;
+        engine.reset().await;
+    }
+    
     let msg = SignalingMessage::CallDecline { caller_id };
     signaling::send_signal(&state.ws_sender, msg).await
 }
@@ -151,6 +157,12 @@ async fn decline_call(state: State<'_, AppState>, caller_id: String) -> Result<(
 async fn end_call(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
     println!("📴 Ending call with {}", peer_id);
     
+    // Reset media engine for next call
+    {
+        let mut engine = state.media.lock().await;
+        engine.reset().await;
+    }
+    
     let msg = SignalingMessage::CallEnd { peer_id };
     signaling::send_signal(&state.ws_sender, msg).await
 }
@@ -159,6 +171,12 @@ async fn end_call(state: State<'_, AppState>, peer_id: String) -> Result<(), Str
 #[tauri::command]
 async fn cancel_call(state: State<'_, AppState>, target_id: String) -> Result<(), String> {
     println!("🚫 Cancelling call to {}", target_id);
+    
+    // Reset media engine
+    {
+        let mut engine = state.media.lock().await;
+        engine.reset().await;
+    }
     
     let msg = SignalingMessage::CallCancel { target_id };
     signaling::send_signal(&state.ws_sender, msg).await
