@@ -46,6 +46,45 @@ const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
     audio_mode: 'headphones',
 };
 
+function coerceAudioSettings(input: unknown): AudioSettings {
+    if (!input || typeof input !== 'object') {
+        return { ...DEFAULT_AUDIO_SETTINGS };
+    }
+
+    const value = input as Partial<AudioSettings>;
+    const voiceMode = value.voice_mode;
+    const audioMode = value.audio_mode;
+
+    return {
+        mic_gain: typeof value.mic_gain === 'number' ? clamp(value.mic_gain, 0, 3) : DEFAULT_AUDIO_SETTINGS.mic_gain,
+        output_volume: typeof value.output_volume === 'number' ? clamp(value.output_volume, 0, 2) : DEFAULT_AUDIO_SETTINGS.output_volume,
+        remote_user_volume:
+            typeof value.remote_user_volume === 'number'
+                ? clamp(value.remote_user_volume, 0, 2)
+                : DEFAULT_AUDIO_SETTINGS.remote_user_volume,
+        voice_mode:
+            voiceMode === 'mute' || voiceMode === 'push_to_talk' || voiceMode === 'voice_activity'
+                ? voiceMode
+                : DEFAULT_AUDIO_SETTINGS.voice_mode,
+        vad_threshold:
+            typeof value.vad_threshold === 'number' ? clamp(value.vad_threshold, 0, 0.3) : DEFAULT_AUDIO_SETTINGS.vad_threshold,
+        noise_suppression:
+            typeof value.noise_suppression === 'boolean' ? value.noise_suppression : DEFAULT_AUDIO_SETTINGS.noise_suppression,
+        aec: typeof value.aec === 'boolean' ? value.aec : DEFAULT_AUDIO_SETTINGS.aec,
+        agc: typeof value.agc === 'boolean' ? value.agc : DEFAULT_AUDIO_SETTINGS.agc,
+        noise_gate: typeof value.noise_gate === 'boolean' ? value.noise_gate : DEFAULT_AUDIO_SETTINGS.noise_gate,
+        noise_gate_threshold:
+            typeof value.noise_gate_threshold === 'number'
+                ? clamp(value.noise_gate_threshold, 0, 0.2)
+                : DEFAULT_AUDIO_SETTINGS.noise_gate_threshold,
+        limiter: typeof value.limiter === 'boolean' ? value.limiter : DEFAULT_AUDIO_SETTINGS.limiter,
+        deafen: typeof value.deafen === 'boolean' ? value.deafen : DEFAULT_AUDIO_SETTINGS.deafen,
+        ptt_key: typeof value.ptt_key === 'string' && value.ptt_key.trim() ? value.ptt_key : DEFAULT_AUDIO_SETTINGS.ptt_key,
+        audio_mode:
+            audioMode === 'headphones' || audioMode === 'speakers' ? audioMode : DEFAULT_AUDIO_SETTINGS.audio_mode,
+    };
+}
+
 function clamp(value: number, min: number, max: number): number {
     return Math.max(min, Math.min(max, value));
 }
@@ -72,7 +111,11 @@ export function CallOverlay() {
     const [vuLevel, setVuLevel] = useState(0);
     const [isPttPressed, setIsPttPressed] = useState(false);
 
-    const remoteName = activeCall?.peerName || 'Remote user';
+    const peerName = typeof activeCall?.peerName === 'string' && activeCall.peerName.trim()
+        ? activeCall.peerName
+        : 'Unknown';
+    const peerInitial = peerName.charAt(0).toUpperCase();
+    const remoteName = peerName;
 
     // Timer for call duration
     useEffect(() => {
@@ -110,9 +153,10 @@ export function CallOverlay() {
     const loadSettings = async () => {
         try {
             const audioSettings = await invoke<AudioSettings>('get_audio_settings');
-            setSettings(audioSettings);
+            setSettings(coerceAudioSettings(audioSettings));
         } catch (e) {
             console.warn('[CallOverlay] Using default audio settings:', e);
+            setSettings({ ...DEFAULT_AUDIO_SETTINGS });
         }
     };
 
@@ -154,10 +198,11 @@ export function CallOverlay() {
     }, [showSettings]);
 
     const saveSettings = async (next: AudioSettings) => {
-        setSettings(next);
+        const normalized = coerceAudioSettings(next);
+        setSettings(normalized);
         setIsSavingSettings(true);
         try {
-            await invoke('update_audio_settings', { settings: next });
+            await invoke('update_audio_settings', { settings: normalized });
         } catch (e) {
             console.error('[CallOverlay] Failed to update audio settings:', e);
         } finally {
@@ -166,7 +211,7 @@ export function CallOverlay() {
     };
 
     const updateSetting = <K extends keyof AudioSettings>(key: K, value: AudioSettings[K]) => {
-        void saveSettings({ ...settings, [key]: value });
+        void saveSettings(coerceAudioSettings({ ...settings, [key]: value }));
     };
 
     const switchInputDevice = async (nextDeviceId: string) => {
@@ -289,11 +334,11 @@ export function CallOverlay() {
             <div className="p-4 bg-gradient-to-r from-primary/20 to-secondary/20 border-b border-white/5">
                 <div className="flex items-center gap-3">
                     <div className="w-12 h-12 rounded-full bg-gradient-to-br from-primary to-secondary flex items-center justify-center flex-shrink-0">
-                        <span className="text-lg font-bold">{activeCall.peerName?.charAt(0).toUpperCase()}</span>
+                        <span className="text-lg font-bold">{peerInitial}</span>
                     </div>
 
                     <div className="flex-1 min-w-0">
-                        <h3 className="font-semibold truncate">{activeCall.peerName}</h3>
+                        <h3 className="font-semibold truncate">{peerName}</h3>
                         <div className="flex items-center gap-2 text-sm">
                             {activeCall.status === 'connected' ? (
                                 <>

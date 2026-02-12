@@ -10,7 +10,7 @@ import { ServerSidebar } from './components/ServerSidebar';
 import { ChannelList } from './components/ChannelList';
 import { MemberList } from './components/MemberList';
 import { IncomingCallModal } from './components/IncomingCallModal';
-import { CallOverlay } from './components/CallOverlay';
+import { SafeCallOverlay } from './components/SafeCallOverlay';
 import type { IncomingCallPayload, CallAcceptedPayload } from './types';
 
 // Slash commands
@@ -436,12 +436,13 @@ function App() {
     }
 
     const activeFriend = friends.find((f) => f.id === activeDM);
+    const callOverlayResetKey = activeCall ? `${activeCall.status}:${activeCall.peerId ?? 'none'}` : 'none';
 
     return (
         <div className="flex h-screen w-full bg-background text-white overflow-hidden font-sans">
             {/* Call UI Components */}
             <IncomingCallModal />
-            <CallOverlay />
+            <SafeCallOverlay resetKey={callOverlayResetKey} />
 
             {/* Far Left - Server Sidebar */}
             <ServerSidebar />
