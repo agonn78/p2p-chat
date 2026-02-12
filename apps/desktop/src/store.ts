@@ -92,6 +92,8 @@ interface AppState {
     removeMessage: (messageId: string) => void;
     deleteMessage: (messageId: string) => Promise<void>;
     deleteAllMessages: () => Promise<void>;
+    editMessage: (messageId: string, content: string) => Promise<void>;
+    updateMessage: (message: Message) => void;
     clearMessages: () => void;
     markAsRead: (friendId: string) => void;
     getUnreadCount: (friendId: string) => number;
@@ -541,6 +543,46 @@ export const useAppStore = create<AppState>()(
                 const { messages } = get();
                 set({ messages: messages.filter(m => m.id !== messageId) });
                 console.log(`[Store] Removed message ${messageId} from view`);
+            },
+
+            editMessage: async (messageId, content) => {
+                const { activeRoom, keyPair, activeFriendId, friendPublicKeys } = get();
+                if (!activeRoom) return;
+
+                let encryptedContent = content;
+                let nonce: string | undefined = undefined;
+
+                // Encrypt if we have keys
+                if (keyPair && activeFriendId && friendPublicKeys[activeFriendId]) {
+                    const sharedSecret = crypto.getSharedSecret(
+                        activeFriendId,
+                        keyPair.secretKey,
+                        friendPublicKeys[activeFriendId]
+                    );
+                    const encrypted = crypto.encryptMessage(content, sharedSecret);
+                    encryptedContent = encrypted.ciphertext;
+                    nonce = encrypted.nonce;
+                }
+
+                try {
+                    const updated = await invoke<Message>('api_edit_message', {
+                        roomId: activeRoom,
+                        messageId,
+                        content: encryptedContent,
+                        nonce
+                    });
+                    updated._decryptedContent = content;
+                    get().updateMessage(updated);
+                } catch (e) {
+                    console.error('[Store] editMessage exception:', e);
+                }
+            },
+
+            updateMessage: (message) => {
+                const { messages } = get();
+                set({
+                    messages: messages.map(m => m.id === message.id ? { ...m, ...message } : m)
+                });
             },
 
             deleteMessage: async (messageId) => {

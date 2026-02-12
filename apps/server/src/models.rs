@@ -60,6 +60,7 @@ pub struct Message {
     pub content: String,
     pub nonce: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
+    pub edited_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -107,4 +108,5 @@ pub struct ChannelMessage {
     pub content: String,
     pub nonce: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
+    pub edited_at: Option<DateTime<Utc>>,
 }

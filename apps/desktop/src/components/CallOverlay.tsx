@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react';
-import { Phone, PhoneOff, Mic, MicOff, Settings, ChevronDown } from 'lucide-react';
+import { PhoneOff, Mic, MicOff, Settings, ChevronDown } from 'lucide-react';
 import { useAppStore } from '../store';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 
 interface AudioDevice {
     id: string;
@@ -19,6 +20,7 @@ export function CallOverlay() {
     const [audioDevices, setAudioDevices] = useState<AudioDevice[]>([]);
     const [selectedDevice, setSelectedDevice] = useState<string>('');
     const [isLoadingDevices, setIsLoadingDevices] = useState(false);
+    const [vuLevel, setVuLevel] = useState(0);
 
     // Timer for call duration
     useEffect(() => {
@@ -30,6 +32,28 @@ export function CallOverlay() {
         }
         setCallDuration(0);
     }, [activeCall?.status, activeCall?.startTime]);
+
+    // Listen for VU meter events
+    useEffect(() => {
+        if (activeCall?.status !== 'connected') return;
+
+        let unlisten: (() => void) | null = null;
+        listen<number>('vu-level', (event) => {
+            // Convert RMS to a 0-1 scale (clamp)
+            const level = Math.min(1, event.payload * 5); // Amplify for visibility
+            setVuLevel(level);
+        }).then(fn => { unlisten = fn; });
+
+        // Start the VU meter backend
+        invoke('start_vu_meter').catch(e => {
+            console.warn('[CallOverlay] VU meter not available:', e);
+        });
+
+        return () => {
+            if (unlisten) unlisten();
+            setVuLevel(0);
+        };
+    }, [activeCall?.status]);
 
     // Load audio devices when settings opened
     useEffect(() => {
@@ -44,10 +68,9 @@ export function CallOverlay() {
             const devices = await invoke<AudioDevice[]>('list_audio_devices');
             setAudioDevices(devices);
 
-            // Get default device
-            const defaultDevice = await invoke<string>('get_default_audio_device');
+            const defaultDevice = await invoke<AudioDevice>('get_default_audio_device');
             if (!selectedDevice && devices.length > 0) {
-                setSelectedDevice(defaultDevice || devices[0].id);
+                setSelectedDevice(defaultDevice?.name || devices[0].id);
             }
         } catch (err) {
             console.error('Failed to load audio devices:', err);
@@ -75,11 +98,19 @@ export function CallOverlay() {
         setShowSettings(false);
     };
 
-    const toggleMute = () => {
-        setIsMuted(!isMuted);
-        // TODO: Actually mute the audio stream
-        console.log('[Audio] Mute toggled:', !isMuted);
+    const toggleMute = async () => {
+        try {
+            const muted = await invoke<boolean>('toggle_mute');
+            setIsMuted(muted);
+        } catch (e) {
+            console.error('[CallOverlay] toggle_mute failed:', e);
+            // Fallback to local toggle if command fails
+            setIsMuted(prev => !prev);
+        }
     };
+
+    // VU meter bar width (percentage)
+    const vuWidth = Math.max(2, vuLevel * 100);
 
     return (
         <div className="fixed top-4 right-4 z-50 w-80 bg-surface/95 backdrop-blur-lg rounded-xl border border-white/10 shadow-2xl overflow-hidden">
@@ -121,6 +152,28 @@ export function CallOverlay() {
                 </div>
             </div>
 
+            {/* VU Meter */}
+            {activeCall.status === 'connected' && (
+                <div className="px-4 pt-3">
+                    <div className="flex items-center gap-2">
+                        <Mic className="w-3 h-3 text-gray-400 flex-shrink-0" />
+                        <div className="flex-1 h-2 bg-white/5 rounded-full overflow-hidden">
+                            <div
+                                className="h-full rounded-full transition-all duration-75"
+                                style={{
+                                    width: `${vuWidth}%`,
+                                    background: vuLevel > 0.7
+                                        ? 'linear-gradient(90deg, #22c55e, #ef4444)'
+                                        : vuLevel > 0.3
+                                            ? 'linear-gradient(90deg, #22c55e, #eab308)'
+                                            : '#22c55e',
+                                }}
+                            />
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Audio Settings Panel */}
             {showSettings && (
                 <div className="p-3 border-b border-white/5 bg-white/5">
@@ -131,7 +184,6 @@ export function CallOverlay() {
                             onChange={(e) => {
                                 setSelectedDevice(e.target.value);
                                 console.log('[Audio] Selected device:', e.target.value);
-                                // TODO: Actually switch audio device
                             }}
                             className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-sm appearance-none cursor-pointer focus:outline-none focus:border-primary/50"
                             disabled={isLoadingDevices}

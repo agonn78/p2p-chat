@@ -18,6 +18,7 @@ pub struct Message {
     pub content: String,
     pub nonce: Option<String>,
     pub created_at: Option<String>,
+    pub edited_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -168,4 +169,42 @@ pub async fn api_delete_all_messages(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EditMessageRequest {
+    content: String,
+    nonce: Option<String>,
+}
+
+#[tauri::command]
+pub async fn api_edit_message(
+    state: State<'_, ApiState>,
+    room_id: String,
+    message_id: String,
+    content: String,
+    nonce: Option<String>,
+) -> Result<Message, String> {
+    let token = state.get_token().await
+        .ok_or("Not authenticated")?;
+    
+    let url = format!("{}/chat/{}/messages/{}", state.base_url, room_id, message_id);
+    
+    let res = state.client
+        .put(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&EditMessageRequest { content, nonce })
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Failed to edit message: {}", text));
+    }
+
+    let message: Message = res.json().await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    Ok(message)
 }

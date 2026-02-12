@@ -354,10 +354,45 @@ async fn start_call_audio(state: State<'_, AppState>) -> Result<(), String> {
         return Err("E2EE key exchange not completed".to_string());
     }
     
-    // For now, just log that we're ready
-    // The actual audio streaming requires WebRTC or similar transport
-    println!("🔊 [AUDIO] ✅ Audio is ready - E2EE context available");
-    println!("🔊 [AUDIO] Note: Full audio streaming requires WebRTC transport (TODO)");
+    // Create the audio DataChannel (Offerer side)
+    // This sets up capture → encode → encrypt → send pipeline
+    engine.create_audio_channel().await.map_err(|e| format!("Failed to create audio channel: {}", e))?;
+    
+    println!("🔊 [AUDIO] ✅ Audio DataChannel created, capture will start when channel opens");
+    
+    Ok(())
+}
+
+/// Toggle mute/unmute for audio capture
+#[tauri::command]
+async fn toggle_mute(state: State<'_, AppState>) -> Result<bool, String> {
+    let engine = state.media.lock().await;
+    let muted = engine.toggle_mute();
+    println!("🔊 [AUDIO] Mute toggled: {}", muted);
+    Ok(muted)
+}
+
+/// Start VU meter — emits `vu-level` events to the frontend
+#[tauri::command]
+async fn start_vu_meter(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let engine = state.media.lock().await;
+    let mut rms_rx = engine.take_rms_receiver()
+        .ok_or_else(|| "RMS receiver not available (already taken or no capture)".to_string())?;
+    drop(engine); // Release the lock before spawning
+
+    // Spawn a background task to forward RMS levels to the frontend
+    tauri::async_runtime::spawn(async move {
+        use std::time::{Duration, Instant};
+        let mut last_emit = Instant::now();
+        let throttle = Duration::from_millis(50); // ~20 FPS for smooth animation
+
+        while let Some(rms) = rms_rx.recv().await {
+            if last_emit.elapsed() >= throttle {
+                let _ = app.emit("vu-level", rms);
+                last_emit = Instant::now();
+            }
+        }
+    });
     
     Ok(())
 }
@@ -415,6 +450,9 @@ fn main() {
             // Audio commands
             list_audio_devices,
             get_default_audio_device,
+            toggle_mute,
+            start_vu_meter,
+            start_call_audio,
             init_audio_call,
             handle_audio_offer,
             handle_audio_answer,
@@ -435,6 +473,7 @@ fn main() {
             api::chat::api_send_message,
             api::chat::api_delete_message,
             api::chat::api_delete_all_messages,
+            api::chat::api_edit_message,
             api::servers::api_fetch_servers,
             api::servers::api_create_server,
             api::servers::api_join_server,

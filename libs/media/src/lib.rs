@@ -119,6 +119,27 @@ impl MediaEngine {
         self.crypto_ctx.is_some()
     }
 
+    /// Toggle mute on/off. Returns the new mute state.
+    pub fn toggle_mute(&self) -> bool {
+        if let Some(capture) = &self.audio_capture {
+            let new_state = !capture.is_muted();
+            capture.set_muted(new_state);
+            new_state
+        } else {
+            false
+        }
+    }
+
+    /// Get current mute state
+    pub fn is_muted(&self) -> bool {
+        self.audio_capture.as_ref().map(|c| c.is_muted()).unwrap_or(false)
+    }
+
+    /// Take the RMS receiver for VU meter updates
+    pub fn take_rms_receiver(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<f32>> {
+        self.audio_capture.as_ref().and_then(|c| c.take_rms_receiver())
+    }
+
     /// List available input (microphone) devices
     pub fn list_input_devices() -> Result<Vec<(String, String)>> {
         let host = cpal::default_host();
@@ -351,12 +372,23 @@ impl MediaEngine {
         }));
 
         let dc_clone = dc.clone();
+        let playback_started = self.playback_started.clone();
         dc.on_open(Box::new(move || {
             tracing::info!("DataChannel 'audio' opened (Offerer)");
             let dc = dc_clone.clone();
             let capture = audio_capture.clone();
+            let playback = audio_playback.clone();
+            let ps = playback_started.clone();
             
             Box::pin(async move {
+                // Start playback stream once (Offerer side)
+                if !ps.swap(true, Ordering::SeqCst) {
+                    match playback.start() {
+                        Ok(_stream) => tracing::info!("Playback stream started (Offerer)"),
+                        Err(e) => tracing::error!("Failed to start playback: {}", e),
+                    }
+                }
+
                 // Start capture stream locally
                 if let Err(e) = capture.start() {
                     tracing::error!("Failed to start capture: {}", e);

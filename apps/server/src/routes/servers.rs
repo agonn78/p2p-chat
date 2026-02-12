@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,7 @@ pub fn router() -> Router<AppState> {
         .route("/:id/members", get(get_members))
         .route("/:id/channels", post(create_channel))
         .route("/:id/channels/:channel_id/messages", get(get_channel_messages).post(send_channel_message))
+        .route("/:id/channels/:channel_id/messages/:message_id", put(edit_channel_message))
         .route("/join/:code", post(join_server))
         .route("/:id/leave", post(leave_server))
 }
@@ -416,7 +417,7 @@ async fn send_channel_message(
         r#"
         INSERT INTO messages (channel_id, sender_id, content, nonce)
         VALUES ($1, $2, $3, $4)
-        RETURNING id, channel_id, sender_id, content, nonce, created_at
+        RETURNING id, channel_id, sender_id, content, nonce, created_at, edited_at
         "#
     )
     .bind(channel_id)
@@ -453,4 +454,74 @@ async fn send_channel_message(
     }
 
     Ok(Json(message))
+}
+
+/// Edit a channel message (only original sender can edit)
+async fn edit_channel_message(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((server_id, _channel_id, message_id)): Path<(Uuid, Uuid, Uuid)>,
+    Json(req): Json<ChannelMessageRequest>,
+) -> Result<Json<ChannelMessage>, StatusCode> {
+    // Verify membership
+    let is_member = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM server_members WHERE server_id = $1 AND user_id = $2"
+    )
+    .bind(server_id)
+    .bind(user.id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0) > 0;
+
+    if !is_member {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Verify sender ownership
+    let existing = sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT sender_id FROM messages WHERE id = $1"
+    )
+    .bind(message_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    if existing != Some(user.id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let updated = sqlx::query_as::<_, ChannelMessage>(
+        "UPDATE messages SET content = $1, nonce = $2, edited_at = NOW() WHERE id = $3 RETURNING id, channel_id, sender_id, content, nonce, created_at, edited_at"
+    )
+    .bind(&req.content)
+    .bind(&req.nonce)
+    .bind(message_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Broadcast to server members
+    let members = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM server_members WHERE server_id = $1"
+    )
+    .bind(server_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let ws_payload = serde_json::json!({
+        "type": "CHANNEL_MESSAGE_EDITED",
+        "server_id": server_id,
+        "message": updated
+    });
+    let ws_text = serde_json::to_string(&ws_payload).unwrap();
+
+    for member_id in members {
+        if let Some(peer_tx) = state.peers.get(&member_id.to_string()) {
+            let _ = peer_tx.send(WsMessage::Text(ws_text.clone()));
+        }
+    }
+
+    Ok(Json(updated))
 }

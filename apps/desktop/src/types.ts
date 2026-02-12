@@ -27,6 +27,7 @@ export interface Message {
     content: string;
     nonce?: string | null;  // For E2EE - if present, content is encrypted
     created_at: string;
+    edited_at?: string | null;
     _decryptedContent?: string;  // Client-side only - cached decrypted content
 }
 
@@ -88,6 +89,7 @@ export interface ChannelMessage {
     content: string;
     nonce?: string | null;
     created_at: string;
+    edited_at?: string | null;
     _decryptedContent?: string;
 }
 

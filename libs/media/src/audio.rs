@@ -88,7 +88,11 @@ pub struct AudioCapture {
     seq: Arc<std::sync::atomic::AtomicU32>,
     // Flag to signal the capture thread to stop
     running: Arc<AtomicBool>,
-    // Thread handle (not stored in struct since we don't need to join)
+    // Mute flag - when true, send silence instead of mic data
+    muted: Arc<AtomicBool>,
+    // VU meter RMS emission
+    rms_tx: mpsc::UnboundedSender<f32>,
+    rms_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<f32>>>>,
 }
 
 impl AudioCapture {
@@ -96,6 +100,7 @@ impl AudioCapture {
         crypto: Arc<CryptoContext>,
     ) -> Result<Self> {
         let (packet_tx, packet_rx) = mpsc::unbounded_channel();
+        let (rms_tx, rms_rx) = mpsc::unbounded_channel();
         Ok(Self {
             encoder: Arc::new(Mutex::new(OpusEncoder::new()?)),
             crypto,
@@ -103,6 +108,9 @@ impl AudioCapture {
             packet_rx: Arc::new(Mutex::new(Some(packet_rx))),
             seq: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             running: Arc::new(AtomicBool::new(false)),
+            muted: Arc::new(AtomicBool::new(false)),
+            rms_tx,
+            rms_rx: Arc::new(Mutex::new(Some(rms_rx))),
         })
     }
 
@@ -110,7 +118,26 @@ impl AudioCapture {
          self.packet_rx.lock().unwrap().take()
     }
 
+    pub fn take_rms_receiver(&self) -> Option<mpsc::UnboundedReceiver<f32>> {
+        self.rms_rx.lock().unwrap().take()
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::SeqCst);
+        tracing::info!("Audio capture muted: {}", muted);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::SeqCst)
+    }
+
+    /// Start capture with the default input device
     pub fn start(&self) -> Result<()> {
+        self.start_with_device(None)
+    }
+
+    /// Start capture with a specific device by name, or default if None
+    pub fn start_with_device(&self, device_name: Option<&str>) -> Result<()> {
         // Prevent starting twice
         if self.running.swap(true, Ordering::SeqCst) {
             return Ok(()); // Already running
@@ -121,15 +148,33 @@ impl AudioCapture {
         let packet_tx = self.packet_tx.clone();
         let seq = self.seq.clone();
         let running = self.running.clone();
+        let muted = self.muted.clone();
+        let rms_tx = self.rms_tx.clone();
+        let device_name_owned = device_name.map(|s| s.to_string());
 
         // Spawn audio capture in a dedicated thread (cpal::Stream is not Send)
         thread::spawn(move || {
             let host = cpal::default_host();
-            let device = match host.default_input_device() {
-                Some(d) => d,
-                None => {
-                    tracing::error!("No input device");
-                    return;
+            let device = if let Some(ref name) = device_name_owned {
+                // Find device by name
+                match host.input_devices() {
+                    Ok(devices) => {
+                        devices.into_iter()
+                            .find(|d| d.name().map(|n| n == *name).unwrap_or(false))
+                            .unwrap_or_else(|| {
+                                tracing::warn!("Device '{}' not found, using default", name);
+                                host.default_input_device().expect("No input device")
+                            })
+                    }
+                    Err(_) => host.default_input_device().expect("No input device"),
+                }
+            } else {
+                match host.default_input_device() {
+                    Some(d) => d,
+                    None => {
+                        tracing::error!("No input device");
+                        return;
+                    }
                 }
             };
 
@@ -146,10 +191,18 @@ impl AudioCapture {
             let stream = match device.build_input_stream(
                 &config,
                 move |data: &[f32], _info| {
-                    // Convert f32 to i16
-                    let samples: Vec<i16> = data.iter()
-                        .map(|&s| (s * 32767.0) as i16)
-                        .collect();
+                    // Calculate RMS for VU meter (always, even when muted)
+                    let rms = calculate_rms(data);
+                    let _ = rms_tx.send(rms);
+
+                    // If muted, use silence instead of real audio
+                    let samples: Vec<i16> = if muted.load(Ordering::Relaxed) {
+                        vec![0i16; data.len()]
+                    } else {
+                        data.iter()
+                            .map(|&s| (s * 32767.0) as i16)
+                            .collect()
+                    };
 
                     let mut buffer = sample_buffer.lock().unwrap();
                     buffer.extend_from_slice(&samples);

@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, post, delete},
+    routing::{get, post, delete, put},
     Json, Router,
     http::StatusCode,
 };
@@ -16,7 +16,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/dm", post(create_or_get_dm))
         .route("/:room_id/messages", get(get_messages).post(send_message).delete(delete_all_messages))
-        .route("/:room_id/messages/:message_id", delete(delete_message))
+        .route("/:room_id/messages/:message_id", delete(delete_message).put(edit_message))
 }
 
 #[derive(Deserialize)]
@@ -34,6 +34,12 @@ struct SendMessageRequest {
 struct PaginationParams {
     before: Option<String>,  // cursor: message ID to fetch before
     limit: Option<i64>,      // max messages to return (default 50, max 100)
+}
+
+#[derive(Deserialize)]
+struct EditMessageRequest {
+    content: String,
+    nonce: Option<String>,
 }
 
 /// Create or get existing DM room with a friend
@@ -320,4 +326,61 @@ async fn delete_all_messages(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Edit a message (only the original sender can edit)
+async fn edit_message(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((room_id, message_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<EditMessageRequest>,
+) -> Result<Json<Message>, (StatusCode, String)> {
+    // Verify the message exists and belongs to this user
+    let existing = sqlx::query_as::<_, Message>(
+        "SELECT * FROM messages WHERE id = $1 AND room_id = $2"
+    )
+    .bind(message_id)
+    .bind(room_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Message not found".to_string()))?;
+
+    if existing.sender_id != Some(user.user_id) {
+        return Err((StatusCode::FORBIDDEN, "You can only edit your own messages".to_string()));
+    }
+
+    // Update the message
+    let updated = sqlx::query_as::<_, Message>(
+        "UPDATE messages SET content = $1, nonce = $2, edited_at = NOW() WHERE id = $3 RETURNING *"
+    )
+    .bind(&req.content)
+    .bind(&req.nonce)
+    .bind(message_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Broadcast edit to room members via WebSocket
+    let member_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM room_members WHERE room_id = $1"
+    )
+    .bind(room_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let ws_payload = serde_json::json!({
+        "type": "MESSAGE_EDITED",
+        "message": updated
+    });
+    let ws_text = serde_json::to_string(&ws_payload).unwrap();
+
+    for member_id in member_ids {
+        if let Some(peer_tx) = state.peers.get(&member_id.to_string()) {
+            let _ = peer_tx.send(WsMessage::Text(ws_text.clone()));
+        }
+    }
+
+    Ok(Json(updated))
 }
