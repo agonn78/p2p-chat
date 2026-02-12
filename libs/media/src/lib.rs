@@ -299,7 +299,9 @@ impl MediaEngine {
                                 tokio::spawn(async move {
                                     while let Some(packet) = rx.recv().await {
                                         if let Ok(bytes) = bincode::serialize(&packet) {
-                                            let _ = dc.send(&bytes.into()).await;
+                                            if let Err(e) = dc.send(&bytes.into()).await {
+                                                tracing::warn!("Failed to send audio packet (Answerer): {}", e);
+                                            }
                                         }
                                     }
                                 });
@@ -311,7 +313,9 @@ impl MediaEngine {
                         let playback = playback.clone();
                         Box::pin(async move {
                            if let Ok(packet) = bincode::deserialize::<AudioPacket>(&msg.data) {
-                               let _ = playback.process_packet(packet);
+                               if let Err(e) = playback.process_packet(packet) {
+                                   tracing::warn!("Failed to process incoming audio packet (Answerer): {}", e);
+                               }
                            }
                         })
                     }));
@@ -399,7 +403,9 @@ impl MediaEngine {
             let playback = playback_clone.clone();
             Box::pin(async move {
                 if let Ok(packet) = bincode::deserialize::<AudioPacket>(&msg.data) {
-                    let _ = playback.process_packet(packet);
+                    if let Err(e) = playback.process_packet(packet) {
+                        tracing::warn!("Failed to process incoming audio packet (Offerer): {}", e);
+                    }
                 }
             })
         }));
@@ -435,7 +441,9 @@ impl MediaEngine {
                     tokio::spawn(async move {
                         while let Some(packet) = rx.recv().await {
                             if let Ok(bytes) = bincode::serialize(&packet) {
-                                let _ = dc.send(&bytes.into()).await;
+                                if let Err(e) = dc.send(&bytes.into()).await {
+                                    tracing::warn!("Failed to send audio packet (Offerer): {}", e);
+                                }
                             }
                         }
                     });

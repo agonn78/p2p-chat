@@ -156,6 +156,44 @@ async fn ws_handler(
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
+fn rewrite_offer_for_peer(target_id: String, sdp: String, from_id: &str) -> (String, SignalingMessage) {
+    (
+        target_id,
+        SignalingMessage::Offer {
+            target_id: from_id.to_string(),
+            sdp,
+        },
+    )
+}
+
+fn rewrite_answer_for_peer(target_id: String, sdp: String, from_id: &str) -> (String, SignalingMessage) {
+    (
+        target_id,
+        SignalingMessage::Answer {
+            target_id: from_id.to_string(),
+            sdp,
+        },
+    )
+}
+
+fn rewrite_candidate_for_peer(
+    target_id: String,
+    candidate: String,
+    sdp_mid: Option<String>,
+    sdp_m_line_index: Option<u16>,
+    from_id: &str,
+) -> (String, SignalingMessage) {
+    (
+        target_id,
+        SignalingMessage::Candidate {
+            target_id: from_id.to_string(),
+            candidate,
+            sdp_mid,
+            sdp_m_line_index,
+        },
+    )
+}
+
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -209,11 +247,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             }
                         };
 
+                        let (target_id, forwarded) = rewrite_offer_for_peer(target_id, sdp, &from_id);
+
                         if let Some(peer_tx) = state.peers.get(&target_id) {
-                            let forwarded = SignalingMessage::Offer {
-                                target_id: from_id,
-                                sdp,
-                            };
                             if let Ok(msg) = serde_json::to_string(&forwarded) {
                                 let _ = peer_tx.send(Message::Text(msg));
                             }
@@ -230,11 +266,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             }
                         };
 
+                        let (target_id, forwarded) = rewrite_answer_for_peer(target_id, sdp, &from_id);
+
                         if let Some(peer_tx) = state.peers.get(&target_id) {
-                            let forwarded = SignalingMessage::Answer {
-                                target_id: from_id,
-                                sdp,
-                            };
                             if let Ok(msg) = serde_json::to_string(&forwarded) {
                                 let _ = peer_tx.send(Message::Text(msg));
                             }
@@ -251,13 +285,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             }
                         };
 
+                        let (target_id, forwarded) = rewrite_candidate_for_peer(
+                            target_id,
+                            candidate,
+                            sdp_mid,
+                            sdp_m_line_index,
+                            &from_id,
+                        );
+
                         if let Some(peer_tx) = state.peers.get(&target_id) {
-                            let forwarded = SignalingMessage::Candidate {
-                                target_id: from_id,
-                                candidate,
-                                sdp_mid,
-                                sdp_m_line_index,
-                            };
                             if let Ok(msg) = serde_json::to_string(&forwarded) {
                                 let _ = peer_tx.send(Message::Text(msg));
                             }
@@ -388,6 +424,74 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         
         state.peers.remove(&id);
         tracing::info!("User disconnected: {}", id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_offer_uses_sender_as_peer_id() {
+        let (target, forwarded) = rewrite_offer_for_peer(
+            "receiver-id".to_string(),
+            "offer-sdp".to_string(),
+            "sender-id",
+        );
+
+        assert_eq!(target, "receiver-id");
+        match forwarded {
+            SignalingMessage::Offer { target_id, sdp } => {
+                assert_eq!(target_id, "sender-id");
+                assert_eq!(sdp, "offer-sdp");
+            }
+            _ => panic!("Expected SignalingMessage::Offer"),
+        }
+    }
+
+    #[test]
+    fn rewrite_answer_uses_sender_as_peer_id() {
+        let (target, forwarded) = rewrite_answer_for_peer(
+            "receiver-id".to_string(),
+            "answer-sdp".to_string(),
+            "sender-id",
+        );
+
+        assert_eq!(target, "receiver-id");
+        match forwarded {
+            SignalingMessage::Answer { target_id, sdp } => {
+                assert_eq!(target_id, "sender-id");
+                assert_eq!(sdp, "answer-sdp");
+            }
+            _ => panic!("Expected SignalingMessage::Answer"),
+        }
+    }
+
+    #[test]
+    fn rewrite_candidate_uses_sender_as_peer_id() {
+        let (target, forwarded) = rewrite_candidate_for_peer(
+            "receiver-id".to_string(),
+            "candidate-a".to_string(),
+            Some("0".to_string()),
+            Some(1),
+            "sender-id",
+        );
+
+        assert_eq!(target, "receiver-id");
+        match forwarded {
+            SignalingMessage::Candidate {
+                target_id,
+                candidate,
+                sdp_mid,
+                sdp_m_line_index,
+            } => {
+                assert_eq!(target_id, "sender-id");
+                assert_eq!(candidate, "candidate-a");
+                assert_eq!(sdp_mid.as_deref(), Some("0"));
+                assert_eq!(sdp_m_line_index, Some(1));
+            }
+            _ => panic!("Expected SignalingMessage::Candidate"),
+        }
     }
 }
 

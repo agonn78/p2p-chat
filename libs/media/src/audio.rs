@@ -279,6 +279,36 @@ impl AudioCapture {
                         None,
                     )
                 }
+                SampleFormat::F64 => {
+                    let encoder = encoder.clone();
+                    let crypto = crypto.clone();
+                    let packet_tx = packet_tx.clone();
+                    let seq = seq.clone();
+                    let muted = muted.clone();
+                    let rms_tx = rms_tx.clone();
+                    let pipeline_state = pipeline_state.clone();
+                    device.build_input_stream(
+                        &stream_config,
+                        move |data: &[f64], _info| {
+                            let mono = downmix_f64_to_f32(data, input_channels);
+                            if let Ok(mut state) = pipeline_state.lock() {
+                                process_mono_samples(
+                                    &mono,
+                                    input_rate,
+                                    muted.load(Ordering::Relaxed),
+                                    &rms_tx,
+                                    &encoder,
+                                    &crypto,
+                                    &seq,
+                                    &packet_tx,
+                                    &mut state,
+                                );
+                            }
+                        },
+                        |err| tracing::error!("Capture stream error: {}", err),
+                        None,
+                    )
+                }
                 SampleFormat::I16 => {
                     let encoder = encoder.clone();
                     let crypto = crypto.clone();
@@ -309,6 +339,66 @@ impl AudioCapture {
                         None,
                     )
                 }
+                SampleFormat::I8 => {
+                    let encoder = encoder.clone();
+                    let crypto = crypto.clone();
+                    let packet_tx = packet_tx.clone();
+                    let seq = seq.clone();
+                    let muted = muted.clone();
+                    let rms_tx = rms_tx.clone();
+                    let pipeline_state = pipeline_state.clone();
+                    device.build_input_stream(
+                        &stream_config,
+                        move |data: &[i8], _info| {
+                            let mono = downmix_i8_to_f32(data, input_channels);
+                            if let Ok(mut state) = pipeline_state.lock() {
+                                process_mono_samples(
+                                    &mono,
+                                    input_rate,
+                                    muted.load(Ordering::Relaxed),
+                                    &rms_tx,
+                                    &encoder,
+                                    &crypto,
+                                    &seq,
+                                    &packet_tx,
+                                    &mut state,
+                                );
+                            }
+                        },
+                        |err| tracing::error!("Capture stream error: {}", err),
+                        None,
+                    )
+                }
+                SampleFormat::I32 => {
+                    let encoder = encoder.clone();
+                    let crypto = crypto.clone();
+                    let packet_tx = packet_tx.clone();
+                    let seq = seq.clone();
+                    let muted = muted.clone();
+                    let rms_tx = rms_tx.clone();
+                    let pipeline_state = pipeline_state.clone();
+                    device.build_input_stream(
+                        &stream_config,
+                        move |data: &[i32], _info| {
+                            let mono = downmix_i32_to_f32(data, input_channels);
+                            if let Ok(mut state) = pipeline_state.lock() {
+                                process_mono_samples(
+                                    &mono,
+                                    input_rate,
+                                    muted.load(Ordering::Relaxed),
+                                    &rms_tx,
+                                    &encoder,
+                                    &crypto,
+                                    &seq,
+                                    &packet_tx,
+                                    &mut state,
+                                );
+                            }
+                        },
+                        |err| tracing::error!("Capture stream error: {}", err),
+                        None,
+                    )
+                }
                 SampleFormat::U16 => {
                     let encoder = encoder.clone();
                     let crypto = crypto.clone();
@@ -321,6 +411,66 @@ impl AudioCapture {
                         &stream_config,
                         move |data: &[u16], _info| {
                             let mono = downmix_u16_to_f32(data, input_channels);
+                            if let Ok(mut state) = pipeline_state.lock() {
+                                process_mono_samples(
+                                    &mono,
+                                    input_rate,
+                                    muted.load(Ordering::Relaxed),
+                                    &rms_tx,
+                                    &encoder,
+                                    &crypto,
+                                    &seq,
+                                    &packet_tx,
+                                    &mut state,
+                                );
+                            }
+                        },
+                        |err| tracing::error!("Capture stream error: {}", err),
+                        None,
+                    )
+                }
+                SampleFormat::U8 => {
+                    let encoder = encoder.clone();
+                    let crypto = crypto.clone();
+                    let packet_tx = packet_tx.clone();
+                    let seq = seq.clone();
+                    let muted = muted.clone();
+                    let rms_tx = rms_tx.clone();
+                    let pipeline_state = pipeline_state.clone();
+                    device.build_input_stream(
+                        &stream_config,
+                        move |data: &[u8], _info| {
+                            let mono = downmix_u8_to_f32(data, input_channels);
+                            if let Ok(mut state) = pipeline_state.lock() {
+                                process_mono_samples(
+                                    &mono,
+                                    input_rate,
+                                    muted.load(Ordering::Relaxed),
+                                    &rms_tx,
+                                    &encoder,
+                                    &crypto,
+                                    &seq,
+                                    &packet_tx,
+                                    &mut state,
+                                );
+                            }
+                        },
+                        |err| tracing::error!("Capture stream error: {}", err),
+                        None,
+                    )
+                }
+                SampleFormat::U32 => {
+                    let encoder = encoder.clone();
+                    let crypto = crypto.clone();
+                    let packet_tx = packet_tx.clone();
+                    let seq = seq.clone();
+                    let muted = muted.clone();
+                    let rms_tx = rms_tx.clone();
+                    let pipeline_state = pipeline_state.clone();
+                    device.build_input_stream(
+                        &stream_config,
+                        move |data: &[u32], _info| {
+                            let mono = downmix_u32_to_f32(data, input_channels);
                             if let Ok(mut state) = pipeline_state.lock() {
                                 process_mono_samples(
                                     &mono,
@@ -435,6 +585,31 @@ fn downmix_f32(input: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
+fn downmix_f64_to_f32(input: &[f64], channels: usize) -> Vec<f32> {
+    if channels <= 1 {
+        return input.iter().map(|&s| s as f32).collect();
+    }
+
+    input
+        .chunks_exact(channels)
+        .map(|frame| (frame.iter().sum::<f64>() / channels as f64) as f32)
+        .collect()
+}
+
+fn downmix_i8_to_f32(input: &[i8], channels: usize) -> Vec<f32> {
+    if channels <= 1 {
+        return input.iter().map(|&s| s as f32 / 128.0).collect();
+    }
+
+    input
+        .chunks_exact(channels)
+        .map(|frame| {
+            let sum: f32 = frame.iter().map(|&s| s as f32 / 128.0).sum();
+            sum / channels as f32
+        })
+        .collect()
+}
+
 fn downmix_i16_to_f32(input: &[i16], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         return input.iter().map(|&s| s as f32 / 32768.0).collect();
@@ -444,6 +619,37 @@ fn downmix_i16_to_f32(input: &[i16], channels: usize) -> Vec<f32> {
         .chunks_exact(channels)
         .map(|frame| {
             let sum: f32 = frame.iter().map(|&s| s as f32 / 32768.0).sum();
+            sum / channels as f32
+        })
+        .collect()
+}
+
+fn downmix_i32_to_f32(input: &[i32], channels: usize) -> Vec<f32> {
+    if channels <= 1 {
+        return input.iter().map(|&s| s as f32 / 2147483648.0).collect();
+    }
+
+    input
+        .chunks_exact(channels)
+        .map(|frame| {
+            let sum: f32 = frame.iter().map(|&s| s as f32 / 2147483648.0).sum();
+            sum / channels as f32
+        })
+        .collect()
+}
+
+fn downmix_u8_to_f32(input: &[u8], channels: usize) -> Vec<f32> {
+    if channels <= 1 {
+        return input
+            .iter()
+            .map(|&s| (s as f32 / 255.0) * 2.0 - 1.0)
+            .collect();
+    }
+
+    input
+        .chunks_exact(channels)
+        .map(|frame| {
+            let sum: f32 = frame.iter().map(|&s| (s as f32 / 255.0) * 2.0 - 1.0).sum();
             sum / channels as f32
         })
         .collect()
@@ -465,6 +671,26 @@ fn downmix_u16_to_f32(input: &[u16], channels: usize) -> Vec<f32> {
                 .map(|&s| (s as f32 / 65535.0) * 2.0 - 1.0)
                 .sum();
             sum / channels as f32
+        })
+        .collect()
+}
+
+fn downmix_u32_to_f32(input: &[u32], channels: usize) -> Vec<f32> {
+    if channels <= 1 {
+        return input
+            .iter()
+            .map(|&s| (s as f64 / 4294967295.0 * 2.0 - 1.0) as f32)
+            .collect();
+    }
+
+    input
+        .chunks_exact(channels)
+        .map(|frame| {
+            let sum: f64 = frame
+                .iter()
+                .map(|&s| s as f64 / 4294967295.0 * 2.0 - 1.0)
+                .sum();
+            (sum / channels as f64) as f32
         })
         .collect()
 }
@@ -605,33 +831,102 @@ impl AudioPlayback {
                 }
             };
 
-            tracing::info!("Using output device: {:?}", device.name());
-
-            let config = cpal::StreamConfig {
-                channels: CHANNELS,
-                sample_rate: cpal::SampleRate(SAMPLE_RATE),
-                buffer_size: cpal::BufferSize::Fixed(FRAME_SIZE as u32),
+            let config = match pick_output_config(&device) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to pick output config: {}", e);
+                    running.store(false, Ordering::SeqCst);
+                    return;
+                }
             };
 
-            let stream = match device.build_output_stream(
-                &config,
-                move |data: &mut [f32], _info| {
-                    let mut queue = match sample_queue.lock() {
-                        Ok(q) => q,
-                        Err(_) => return,
-                    };
+            let sample_format = config.sample_format();
+            let stream_config: StreamConfig = config.into();
+            let output_channels = stream_config.channels as usize;
 
-                    for sample in data.iter_mut() {
-                        if let Some(s) = queue.pop_front() {
-                            *sample = (s as f32) / 32767.0;
-                        } else {
-                            *sample = 0.0;
-                        }
-                    }
-                },
-                |err| tracing::error!("Playback stream error: {}", err),
-                None,
-            ) {
+            tracing::info!(
+                "Using output device '{}' ({:?}, {}ch @ {}Hz)",
+                device.name().unwrap_or_else(|_| "unknown".to_string()),
+                sample_format,
+                output_channels,
+                stream_config.sample_rate.0
+            );
+
+            let stream_result = match sample_format {
+                SampleFormat::F32 => {
+                    let sample_queue = sample_queue.clone();
+                    device.build_output_stream(
+                        &stream_config,
+                        move |data: &mut [f32], _info| {
+                            fill_output_f32(data, output_channels, &sample_queue);
+                        },
+                        |err| tracing::error!("Playback stream error: {}", err),
+                        None,
+                    )
+                }
+                SampleFormat::F64 => {
+                    let sample_queue = sample_queue.clone();
+                    device.build_output_stream(
+                        &stream_config,
+                        move |data: &mut [f64], _info| {
+                            fill_output_f64(data, output_channels, &sample_queue);
+                        },
+                        |err| tracing::error!("Playback stream error: {}", err),
+                        None,
+                    )
+                }
+                SampleFormat::I16 => {
+                    let sample_queue = sample_queue.clone();
+                    device.build_output_stream(
+                        &stream_config,
+                        move |data: &mut [i16], _info| {
+                            fill_output_i16(data, output_channels, &sample_queue);
+                        },
+                        |err| tracing::error!("Playback stream error: {}", err),
+                        None,
+                    )
+                }
+                SampleFormat::I32 => {
+                    let sample_queue = sample_queue.clone();
+                    device.build_output_stream(
+                        &stream_config,
+                        move |data: &mut [i32], _info| {
+                            fill_output_i32(data, output_channels, &sample_queue);
+                        },
+                        |err| tracing::error!("Playback stream error: {}", err),
+                        None,
+                    )
+                }
+                SampleFormat::U16 => {
+                    let sample_queue = sample_queue.clone();
+                    device.build_output_stream(
+                        &stream_config,
+                        move |data: &mut [u16], _info| {
+                            fill_output_u16(data, output_channels, &sample_queue);
+                        },
+                        |err| tracing::error!("Playback stream error: {}", err),
+                        None,
+                    )
+                }
+                SampleFormat::U32 => {
+                    let sample_queue = sample_queue.clone();
+                    device.build_output_stream(
+                        &stream_config,
+                        move |data: &mut [u32], _info| {
+                            fill_output_u32(data, output_channels, &sample_queue);
+                        },
+                        |err| tracing::error!("Playback stream error: {}", err),
+                        None,
+                    )
+                }
+                _ => {
+                    tracing::error!("Unsupported output sample format: {:?}", sample_format);
+                    running.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            let stream = match stream_result {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("Failed to build output stream: {}", e);
@@ -662,6 +957,169 @@ impl AudioPlayback {
     }
 }
 
+fn pick_output_config(device: &cpal::Device) -> Result<SupportedStreamConfig> {
+    let mut best_48k: Option<SupportedStreamConfig> = None;
+
+    if let Ok(configs) = device.supported_output_configs() {
+        for cfg in configs {
+            if cfg.min_sample_rate().0 <= SAMPLE_RATE && cfg.max_sample_rate().0 >= SAMPLE_RATE {
+                let candidate = cfg.with_sample_rate(cpal::SampleRate(SAMPLE_RATE));
+                let better = match &best_48k {
+                    None => true,
+                    Some(best) => {
+                        if candidate.channels() >= CHANNELS {
+                            best.channels() < CHANNELS
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if better {
+                    best_48k = Some(candidate);
+                }
+            }
+        }
+    }
+
+    if let Some(cfg) = best_48k {
+        return Ok(cfg);
+    }
+
+    device
+        .default_output_config()
+        .map_err(|e| anyhow::anyhow!("No usable output config: {}", e))
+}
+
+fn next_i16_sample(queue: &mut VecDeque<i16>) -> i16 {
+    queue.pop_front().unwrap_or(0)
+}
+
+fn fill_output_f32(data: &mut [f32], channels: usize, sample_queue: &Arc<Mutex<VecDeque<i16>>>) {
+    let mut queue = match sample_queue.lock() {
+        Ok(q) => q,
+        Err(_) => return,
+    };
+
+    if channels <= 1 {
+        for sample in data.iter_mut() {
+            *sample = next_i16_sample(&mut queue) as f32 / 32767.0;
+        }
+        return;
+    }
+
+    for frame in data.chunks_mut(channels) {
+        let value = next_i16_sample(&mut queue) as f32 / 32767.0;
+        for out in frame.iter_mut() {
+            *out = value;
+        }
+    }
+}
+
+fn fill_output_f64(data: &mut [f64], channels: usize, sample_queue: &Arc<Mutex<VecDeque<i16>>>) {
+    let mut queue = match sample_queue.lock() {
+        Ok(q) => q,
+        Err(_) => return,
+    };
+
+    if channels <= 1 {
+        for sample in data.iter_mut() {
+            *sample = next_i16_sample(&mut queue) as f64 / 32767.0;
+        }
+        return;
+    }
+
+    for frame in data.chunks_mut(channels) {
+        let value = next_i16_sample(&mut queue) as f64 / 32767.0;
+        for out in frame.iter_mut() {
+            *out = value;
+        }
+    }
+}
+
+fn fill_output_i16(data: &mut [i16], channels: usize, sample_queue: &Arc<Mutex<VecDeque<i16>>>) {
+    let mut queue = match sample_queue.lock() {
+        Ok(q) => q,
+        Err(_) => return,
+    };
+
+    if channels <= 1 {
+        for sample in data.iter_mut() {
+            *sample = next_i16_sample(&mut queue);
+        }
+        return;
+    }
+
+    for frame in data.chunks_mut(channels) {
+        let value = next_i16_sample(&mut queue);
+        for out in frame.iter_mut() {
+            *out = value;
+        }
+    }
+}
+
+fn fill_output_i32(data: &mut [i32], channels: usize, sample_queue: &Arc<Mutex<VecDeque<i16>>>) {
+    let mut queue = match sample_queue.lock() {
+        Ok(q) => q,
+        Err(_) => return,
+    };
+
+    if channels <= 1 {
+        for sample in data.iter_mut() {
+            *sample = (next_i16_sample(&mut queue) as i32) << 16;
+        }
+        return;
+    }
+
+    for frame in data.chunks_mut(channels) {
+        let value = (next_i16_sample(&mut queue) as i32) << 16;
+        for out in frame.iter_mut() {
+            *out = value;
+        }
+    }
+}
+
+fn fill_output_u16(data: &mut [u16], channels: usize, sample_queue: &Arc<Mutex<VecDeque<i16>>>) {
+    let mut queue = match sample_queue.lock() {
+        Ok(q) => q,
+        Err(_) => return,
+    };
+
+    if channels <= 1 {
+        for sample in data.iter_mut() {
+            *sample = (next_i16_sample(&mut queue) as i32 + 32768) as u16;
+        }
+        return;
+    }
+
+    for frame in data.chunks_mut(channels) {
+        let value = (next_i16_sample(&mut queue) as i32 + 32768) as u16;
+        for out in frame.iter_mut() {
+            *out = value;
+        }
+    }
+}
+
+fn fill_output_u32(data: &mut [u32], channels: usize, sample_queue: &Arc<Mutex<VecDeque<i16>>>) {
+    let mut queue = match sample_queue.lock() {
+        Ok(q) => q,
+        Err(_) => return,
+    };
+
+    if channels <= 1 {
+        for sample in data.iter_mut() {
+            *sample = ((next_i16_sample(&mut queue) as i32 + 32768) as u32) << 16;
+        }
+        return;
+    }
+
+    for frame in data.chunks_mut(channels) {
+        let value = ((next_i16_sample(&mut queue) as i32 + 32768) as u32) << 16;
+        for out in frame.iter_mut() {
+            *out = value;
+        }
+    }
+}
+
 /// Calculate RMS volume from samples (for VU meter)
 pub fn calculate_rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
@@ -677,4 +1135,82 @@ pub fn rms_to_db(rms: f32) -> f32 {
         return -100.0;
     }
     20.0 * rms.log10()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::KeyPair;
+    use std::f32::consts::PI;
+
+    #[test]
+    fn downmix_stereo_f32_to_mono() {
+        let stereo = vec![1.0f32, -1.0f32, 0.5f32, 0.5f32];
+        let mono = downmix_f32(&stereo, 2);
+        assert_eq!(mono.len(), 2);
+        assert!((mono[0] - 0.0).abs() < 1e-6);
+        assert!((mono[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resample_44100_to_48000_produces_expected_count() {
+        let input = vec![0.0f32; 441]; // ~10ms at 44.1kHz
+        let mut pos = 0.0;
+        let out = resample_to_48k(&input, 44_100, &mut pos);
+        assert!((470..=490).contains(&out.len()));
+    }
+
+    #[test]
+    fn fill_output_duplicates_mono_to_stereo() {
+        let queue = Arc::new(Mutex::new(VecDeque::from(vec![1000i16, -1000i16])));
+        let mut out = vec![0.0f32; 4]; // 2 frames, 2 channels
+        fill_output_f32(&mut out, 2, &queue);
+
+        assert!((out[0] - out[1]).abs() < 1e-6);
+        assert!((out[2] - out[3]).abs() < 1e-6);
+        assert!(out[0] > 0.0);
+        assert!(out[2] < 0.0);
+    }
+
+    #[test]
+    fn process_pipeline_produces_decryptable_opus_packet() {
+        let alice = KeyPair::generate().expect("alice keypair");
+        let bob = KeyPair::generate().expect("bob keypair");
+        let alice_pub = alice.public_key_bytes.clone();
+        let bob_pub = bob.public_key_bytes.clone();
+
+        let sender_ctx = Arc::new(alice.derive_shared_secret(&bob_pub).expect("sender ctx"));
+        let receiver_ctx = bob.derive_shared_secret(&alice_pub).expect("receiver ctx");
+
+        let encoder = Arc::new(Mutex::new(OpusEncoder::new().expect("opus encoder")));
+        let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
+        let (rms_tx, _rms_rx) = mpsc::unbounded_channel();
+        let seq = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut state = CapturePipelineState::new();
+
+        let input: Vec<f32> = (0..FRAME_SIZE)
+            .map(|i| ((i as f32 * 2.0 * PI) / FRAME_SIZE as f32).sin() * 0.2)
+            .collect();
+
+        process_mono_samples(
+            &input,
+            SAMPLE_RATE,
+            false,
+            &rms_tx,
+            &encoder,
+            &sender_ctx,
+            &seq,
+            &packet_tx,
+            &mut state,
+        );
+
+        let packet = packet_rx.try_recv().expect("expected one packet");
+        let decrypted = receiver_ctx
+            .decrypt(&packet.data)
+            .expect("packet decryptable by peer");
+
+        let mut decoder = OpusDecoder::new().expect("opus decoder");
+        let decoded = decoder.decode(&decrypted).expect("opus decodes");
+        assert!(!decoded.is_empty());
+    }
 }
