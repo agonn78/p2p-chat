@@ -1,9 +1,14 @@
 use crate::crypto::CryptoContext;
 use anyhow::Result;
-use audiopus::{coder::Decoder, coder::Encoder, packet::Packet, Channels, MutSignals, SampleRate, Application};
+use audiopus::{
+    coder::Decoder, coder::Encoder, packet::Packet, Application, Channels, MutSignals, SampleRate,
+};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::collections::VecDeque;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use tokio::sync::mpsc;
 
@@ -19,19 +24,17 @@ pub struct OpusEncoder {
 
 impl OpusEncoder {
     pub fn new() -> Result<Self> {
-        let encoder = Encoder::new(
-            SampleRate::Hz48000,
-            Channels::Mono,
-            Application::Voip,
-        ).map_err(|e| anyhow::anyhow!("Failed to create Opus encoder: {:?}", e))?;
-        
+        let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)
+            .map_err(|e| anyhow::anyhow!("Failed to create Opus encoder: {:?}", e))?;
+
         Ok(Self { encoder })
     }
 
     /// Encode audio samples to Opus
     pub fn encode(&mut self, samples: &[i16]) -> Result<Vec<u8>> {
         let mut output = vec![0u8; 1024]; // Max Opus packet size
-        let len = self.encoder
+        let len = self
+            .encoder
             .encode(samples, &mut output[..])
             .map_err(|e| anyhow::anyhow!("Encode error: {:?}", e))?;
         output.truncate(len);
@@ -46,22 +49,21 @@ pub struct OpusDecoder {
 
 impl OpusDecoder {
     pub fn new() -> Result<Self> {
-        let decoder = Decoder::new(
-            SampleRate::Hz48000,
-            Channels::Mono,
-        ).map_err(|e| anyhow::anyhow!("Failed to create Opus decoder: {:?}", e))?;
-        
+        let decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono)
+            .map_err(|e| anyhow::anyhow!("Failed to create Opus decoder: {:?}", e))?;
+
         Ok(Self { decoder })
     }
 
     /// Decode Opus packet to audio samples
     pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<i16>> {
         let mut output = vec![0i16; FRAME_SIZE];
-        let opus_packet = Packet::try_from(packet)
-            .map_err(|e| anyhow::anyhow!("Invalid packet: {:?}", e))?;
+        let opus_packet =
+            Packet::try_from(packet).map_err(|e| anyhow::anyhow!("Invalid packet: {:?}", e))?;
         let signals = MutSignals::try_from(&mut output[..])
             .map_err(|e| anyhow::anyhow!("Signal buffer error: {:?}", e))?;
-        let len = self.decoder
+        let len = self
+            .decoder
             .decode(Some(opus_packet), signals, false)
             .map_err(|e| anyhow::anyhow!("Decode error: {:?}", e))?;
         output.truncate(len);
@@ -96,9 +98,7 @@ pub struct AudioCapture {
 }
 
 impl AudioCapture {
-    pub fn new(
-        crypto: Arc<CryptoContext>,
-    ) -> Result<Self> {
+    pub fn new(crypto: Arc<CryptoContext>) -> Result<Self> {
         let (packet_tx, packet_rx) = mpsc::unbounded_channel();
         let (rms_tx, rms_rx) = mpsc::unbounded_channel();
         Ok(Self {
@@ -115,7 +115,7 @@ impl AudioCapture {
     }
 
     pub fn take_packet_receiver(&self) -> Option<mpsc::UnboundedReceiver<AudioPacket>> {
-         self.packet_rx.lock().unwrap().take()
+        self.packet_rx.lock().unwrap().take()
     }
 
     pub fn take_rms_receiver(&self) -> Option<mpsc::UnboundedReceiver<f32>> {
@@ -158,14 +158,13 @@ impl AudioCapture {
             let device = if let Some(ref name) = device_name_owned {
                 // Find device by name
                 match host.input_devices() {
-                    Ok(devices) => {
-                        devices.into_iter()
-                            .find(|d| d.name().map(|n| n == *name).unwrap_or(false))
-                            .unwrap_or_else(|| {
-                                tracing::warn!("Device '{}' not found, using default", name);
-                                host.default_input_device().expect("No input device")
-                            })
-                    }
+                    Ok(devices) => devices
+                        .into_iter()
+                        .find(|d| d.name().map(|n| n == *name).unwrap_or(false))
+                        .unwrap_or_else(|| {
+                            tracing::warn!("Device '{}' not found, using default", name);
+                            host.default_input_device().expect("No input device")
+                        }),
                     Err(_) => host.default_input_device().expect("No input device"),
                 }
             } else {
@@ -199,9 +198,7 @@ impl AudioCapture {
                     let samples: Vec<i16> = if muted.load(Ordering::Relaxed) {
                         vec![0i16; data.len()]
                     } else {
-                        data.iter()
-                            .map(|&s| (s * 32767.0) as i16)
-                            .collect()
+                        data.iter().map(|&s| (s * 32767.0) as i16).collect()
                     };
 
                     let mut buffer = sample_buffer.lock().unwrap();
@@ -210,7 +207,7 @@ impl AudioCapture {
                     // Process frames
                     while buffer.len() >= FRAME_SIZE {
                         let frame: Vec<i16> = buffer.drain(..FRAME_SIZE).collect();
-                        
+
                         if let Ok(mut enc) = encoder.lock() {
                             if let Ok(encoded) = enc.encode(&frame) {
                                 if let Ok(encrypted) = crypto.encrypt(&encoded) {
@@ -261,6 +258,8 @@ pub struct AudioPlayback {
     crypto: Arc<CryptoContext>,
     // Buffer for decoded samples waiting to be played
     sample_queue: Arc<Mutex<VecDeque<i16>>>,
+    // Flag to keep playback thread alive
+    running: Arc<AtomicBool>,
 }
 
 impl AudioPlayback {
@@ -269,66 +268,112 @@ impl AudioPlayback {
             decoder: Arc::new(Mutex::new(OpusDecoder::new()?)),
             crypto,
             sample_queue: Arc::new(Mutex::new(VecDeque::with_capacity(FRAME_SIZE * 10))),
+            running: Arc::new(AtomicBool::new(false)),
         })
     }
 
     /// Process incoming encrypted packet
     pub fn process_packet(&self, packet: AudioPacket) -> Result<()> {
-        let decrypted = self.crypto.decrypt(&packet.data)
+        let decrypted = self
+            .crypto
+            .decrypt(&packet.data)
             .map_err(|e| anyhow::anyhow!("Decrypt error: {:?}", e))?;
-            
-        let mut decoder = self.decoder.lock().map_err(|_| anyhow::anyhow!("Lock error"))?;
+
+        let mut decoder = self
+            .decoder
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Lock error"))?;
         let samples = decoder.decode(&decrypted)?;
-        
-        let mut queue = self.sample_queue.lock().map_err(|_| anyhow::anyhow!("Lock error"))?;
-        
+
+        let mut queue = self
+            .sample_queue
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Lock error"))?;
+
         // Simple buffer management - avoid unlimited growth
-        if queue.len() > FRAME_SIZE * 50 { // ~1s buffer max
-             // If too full, drain half to catch up (latency optimization)
-             queue.drain(..FRAME_SIZE * 25);
+        if queue.len() > FRAME_SIZE * 50 {
+            // ~1s buffer max
+            // If too full, drain half to catch up (latency optimization)
+            queue.drain(..FRAME_SIZE * 25);
         }
-        
+
         queue.extend(samples);
         Ok(())
     }
 
-    pub fn start(&self) -> Result<cpal::Stream> {
-        let host = cpal::default_host();
-        let device = host.default_output_device()
-            .ok_or_else(|| anyhow::anyhow!("No output device"))?;
-
-        tracing::info!("Using output device: {:?}", device.name());
-
-        let config = cpal::StreamConfig {
-            channels: CHANNELS,
-            sample_rate: cpal::SampleRate(SAMPLE_RATE),
-            buffer_size: cpal::BufferSize::Fixed(FRAME_SIZE as u32),
-        };
+    pub fn start(&self) -> Result<()> {
+        if self.running.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
 
         let sample_queue = self.sample_queue.clone();
+        let running = self.running.clone();
 
-        let stream = device.build_output_stream(
-            &config,
-            move |data: &mut [f32], _info| {
-                let mut queue = match sample_queue.lock() {
-                    Ok(q) => q,
-                    Err(_) => return, // Should not happen often
-                };
-
-                for sample in data.iter_mut() {
-                    if let Some(s) = queue.pop_front() {
-                        *sample = (s as f32) / 32767.0;
-                    } else {
-                        *sample = 0.0; // Silence if underflow
-                    }
+        thread::spawn(move || {
+            let host = cpal::default_host();
+            let device = match host.default_output_device() {
+                Some(d) => d,
+                None => {
+                    tracing::error!("No output device");
+                    running.store(false, Ordering::SeqCst);
+                    return;
                 }
-            },
-            |err| tracing::error!("Playback stream error: {}", err),
-            None,
-        )?;
+            };
 
-        stream.play()?;
-        Ok(stream)
+            tracing::info!("Using output device: {:?}", device.name());
+
+            let config = cpal::StreamConfig {
+                channels: CHANNELS,
+                sample_rate: cpal::SampleRate(SAMPLE_RATE),
+                buffer_size: cpal::BufferSize::Fixed(FRAME_SIZE as u32),
+            };
+
+            let stream = match device.build_output_stream(
+                &config,
+                move |data: &mut [f32], _info| {
+                    let mut queue = match sample_queue.lock() {
+                        Ok(q) => q,
+                        Err(_) => return,
+                    };
+
+                    for sample in data.iter_mut() {
+                        if let Some(s) = queue.pop_front() {
+                            *sample = (s as f32) / 32767.0;
+                        } else {
+                            *sample = 0.0;
+                        }
+                    }
+                },
+                |err| tracing::error!("Playback stream error: {}", err),
+                None,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Failed to build output stream: {}", e);
+                    running.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            if let Err(e) = stream.play() {
+                tracing::error!("Failed to play output stream: {}", e);
+                running.store(false, Ordering::SeqCst);
+                return;
+            }
+
+            while running.load(Ordering::SeqCst) {
+                thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+
+        Ok(())
+    }
+
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        if let Ok(mut queue) = self.sample_queue.lock() {
+            queue.clear();
+        }
     }
 }
 

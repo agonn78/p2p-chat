@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Mic, Video, Settings, Hash, Send, UserPlus, Phone, LogOut, MicOff, UserCircle, Calendar, Wifi, WifiOff, Trash2, Copy, Pencil } from 'lucide-react';
+import { Mic, Video, Settings, Hash, Send, UserPlus, Phone, LogOut, MicOff, UserCircle, Calendar, Wifi, WifiOff, Trash2, Copy, Pencil, Check, X } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore, POLL_INTERVAL_MS } from './store';
@@ -49,7 +49,9 @@ function App() {
     const sendMessage = useAppStore((s) => s.sendMessage);
     const addMessage = useAppStore((s) => s.addMessage);
     const removeMessage = useAppStore((s) => s.removeMessage);
+    const updateMessage = useAppStore((s) => s.updateMessage);
     const deleteMessage = useAppStore((s) => s.deleteMessage);
+    const editMessage = useAppStore((s) => s.editMessage);
     const deleteAllMessages = useAppStore((s) => s.deleteAllMessages);
     const clearMessages = useAppStore((s) => s.clearMessages);
     const getUnreadCount = useAppStore((s) => s.getUnreadCount);
@@ -62,6 +64,7 @@ function App() {
     // Connection state
     const wsConnected = useAppStore((s) => s.wsConnected);
     const setWsConnected = useAppStore((s) => s.setWsConnected);
+    const onlineFriends = useAppStore((s) => s.onlineFriends);
 
     const [activeDM, setActiveDM] = useState<string | null>(null);
     const [msgInput, setMsgInput] = useState('');
@@ -69,6 +72,8 @@ function App() {
     const [isMuted, setIsMuted] = useState(false);
     const [hoveredMessageId, setHoveredMessageId] = useState<string | null>(null);
     const [showCommandHint, setShowCommandHint] = useState(false);
+    const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+    const [editInput, setEditInput] = useState('');
 
     // Ref for auto-scrolling to bottom
     const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -104,6 +109,9 @@ function App() {
                         if (payload.type === 'NEW_MESSAGE') {
                             console.log('[App] ✉️ NEW_MESSAGE via WebSocket');
                             addMessage(payload.message);
+                        } else if (payload.type === 'MESSAGE_EDITED') {
+                            console.log('[App] ✏️ MESSAGE_EDITED via WebSocket');
+                            updateMessage(payload.message);
                         } else if (payload.type === 'MESSAGE_DELETED') {
                             console.log('[App] 🗑️ MESSAGE_DELETED via WebSocket');
                             removeMessage(payload.message_id);
@@ -112,6 +120,23 @@ function App() {
                             if (payload.room_id === activeRoom) {
                                 clearMessages();
                             }
+                        } else if (payload.type === 'NEW_CHANNEL_MESSAGE') {
+                            if (payload.channel_id === activeChannel) {
+                                useAppStore.setState((state) => {
+                                    if (state.channelMessages.some((m) => m.id === payload.message.id)) {
+                                        return state;
+                                    }
+                                    return {
+                                        channelMessages: [...state.channelMessages, payload.message],
+                                    };
+                                });
+                            }
+                        } else if (payload.type === 'CHANNEL_MESSAGE_EDITED') {
+                            useAppStore.setState((state) => ({
+                                channelMessages: state.channelMessages.map((m) =>
+                                    m.id === payload.message.id ? { ...m, ...payload.message } : m
+                                ),
+                            }));
                         }
                     } catch (e) {
                         console.error('[App] ❌ Failed to parse WS message:', e);
@@ -124,12 +149,24 @@ function App() {
                     setWsConnected(event.payload);
                 });
 
+                const unlistenReconnected = await listen<boolean>('ws-reconnected', async () => {
+                    if (user?.id) {
+                        try {
+                            await invoke('identify_user', { userId: user.id });
+                            console.log('[App] 🔁 Re-identified user after WS reconnect');
+                        } catch (err) {
+                            console.error('[App] Failed to re-identify after reconnect:', err);
+                        }
+                    }
+                });
+
                 console.log('[App] ✅ WebSocket listeners attached');
                 setWsConnected(true);
 
                 return () => {
                     unlisten();
                     unlistenStatus();
+                    unlistenReconnected();
                 };
             } catch (error) {
                 console.error('[App] ❌ Failed to setup WS listener:', error);
@@ -148,7 +185,7 @@ function App() {
             console.log('[App] 🔌 Cleaning up WebSocket listener');
             if (cleanup) cleanup();
         };
-    }, [isAuthenticated, activeRoom]);
+    }, [isAuthenticated, activeRoom, activeChannel, user?.id]);
 
     // Call event listeners
     useEffect(() => {
@@ -363,6 +400,22 @@ function App() {
         navigator.clipboard.writeText(content);
     };
 
+    const startEditingMessage = (messageId: string, content: string) => {
+        setEditingMessageId(messageId);
+        setEditInput(content);
+    };
+
+    const cancelEditingMessage = () => {
+        setEditingMessageId(null);
+        setEditInput('');
+    };
+
+    const saveEditedMessage = async () => {
+        if (!editingMessageId || !editInput.trim()) return;
+        await editMessage(editingMessageId, editInput.trim());
+        cancelEditingMessage();
+    };
+
     const getSenderName = (senderId: string | undefined) => {
         if (!senderId) return 'Unknown';
         if (senderId === user?.id) return 'Me';
@@ -454,6 +507,7 @@ function App() {
                             {friends.map((friend) => {
                                 const unreadCount = getUnreadCount(friend.id);
                                 const isActive = activeDM === friend.id;
+                                const isOnline = onlineFriends.includes(friend.id);
                                 return (
                                     <button
                                         key={friend.id}
@@ -463,12 +517,14 @@ function App() {
                                     >
                                         <div className="relative flex-shrink-0">
                                             <div className="w-12 h-12 rounded-full bg-gradient-to-br from-primary to-secondary" />
-                                            <div className="absolute bottom-0 right-0 w-3.5 h-3.5 bg-green-500 rounded-full border-2 border-surface" />
+                                            <div className={`absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full border-2 border-surface ${isOnline ? 'bg-green-500' : 'bg-gray-500'}`} />
                                         </div>
 
                                         <div className="flex-1 text-left">
                                             <div className="font-medium text-sm">{friend.username}</div>
-                                            <div className="text-xs text-gray-400">Online</div>
+                                            <div className={`text-xs ${isOnline ? 'text-green-400' : 'text-gray-500'}`}>
+                                                {isOnline ? 'Online' : 'Offline'}
+                                            </div>
                                         </div>
 
                                         {unreadCount > 0 && (
@@ -535,6 +591,7 @@ function App() {
                                                 const displayContent = msg._decryptedContent || decryptMessageContent(msg);
                                                 const isOwn = msg.sender_id === user?.id;
                                                 const isHovered = hoveredMessageId === msg.id;
+                                                const isEditing = editingMessageId === msg.id;
 
                                                 return (
                                                     <div
@@ -558,9 +615,38 @@ function App() {
                                                                     </span>
                                                                 )}
                                                             </div>
-                                                            <div className="text-gray-300">
-                                                                <MessageContent content={displayContent} isEncrypted={!!msg.nonce} />
-                                                            </div>
+                                                            {isEditing ? (
+                                                                <div className="mt-1 flex items-center gap-2">
+                                                                    <input
+                                                                        value={editInput}
+                                                                        onChange={(e) => setEditInput(e.target.value)}
+                                                                        className="flex-1 bg-black/30 border border-white/10 rounded px-2 py-1 text-sm outline-none focus:border-primary/50"
+                                                                        onKeyDown={(e) => {
+                                                                            if (e.key === 'Enter') saveEditedMessage();
+                                                                            if (e.key === 'Escape') cancelEditingMessage();
+                                                                        }}
+                                                                        autoFocus
+                                                                    />
+                                                                    <button
+                                                                        onClick={saveEditedMessage}
+                                                                        className="p-1.5 hover:bg-green-500/20 rounded text-green-400 transition"
+                                                                        title="Save edit"
+                                                                    >
+                                                                        <Check className="w-4 h-4" />
+                                                                    </button>
+                                                                    <button
+                                                                        onClick={cancelEditingMessage}
+                                                                        className="p-1.5 hover:bg-red-500/20 rounded text-red-400 transition"
+                                                                        title="Cancel edit"
+                                                                    >
+                                                                        <X className="w-4 h-4" />
+                                                                    </button>
+                                                                </div>
+                                                            ) : (
+                                                                <div className="text-gray-300">
+                                                                    <MessageContent content={displayContent} isEncrypted={!!msg.nonce} />
+                                                                </div>
+                                                            )}
                                                         </div>
 
                                                         {/* Action buttons on hover */}
@@ -573,6 +659,15 @@ function App() {
                                                                 >
                                                                     <Copy className="w-4 h-4" />
                                                                 </button>
+                                                                {isOwn && (
+                                                                    <button
+                                                                        onClick={() => startEditingMessage(msg.id, displayContent)}
+                                                                        className="p-1.5 hover:bg-white/10 rounded text-gray-400 hover:text-white transition"
+                                                                        title="Edit message"
+                                                                    >
+                                                                        <Pencil className="w-4 h-4" />
+                                                                    </button>
+                                                                )}
                                                                 {isOwn && (
                                                                     <button
                                                                         onClick={() => handleDeleteMessage(msg.id)}

@@ -5,7 +5,7 @@ mod api;
 mod config;
 mod signaling;
 
-use tauri::{State, Manager};
+use tauri::{State, Manager, Emitter};
 use media::MediaEngine;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -466,6 +466,7 @@ fn main() {
             api::users::api_fetch_user_public_key,
             api::friends::api_fetch_friends,
             api::friends::api_fetch_pending_requests,
+            api::friends::api_fetch_online_friends,
             api::friends::api_send_friend_request,
             api::friends::api_accept_friend,
             api::chat::api_create_or_get_dm,

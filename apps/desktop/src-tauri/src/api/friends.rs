@@ -104,7 +104,7 @@ pub async fn api_accept_friend(
     let token = state.get_token().await
         .ok_or("Not authenticated")?;
     
-    let url = format!("{}/friends/{}/accept", state.base_url, friend_id);
+    let url = format!("{}/friends/accept/{}", state.base_url, friend_id);
     
     let res = state.client
         .post(&url)
@@ -119,4 +119,31 @@ pub async fn api_accept_friend(
     }
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn api_fetch_online_friends(
+    state: State<'_, ApiState>,
+) -> Result<Vec<String>, String> {
+    let token = state.get_token().await
+        .ok_or("Not authenticated")?;
+
+    let url = format!("{}/friends/online", state.base_url);
+
+    let res = state.client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Failed to fetch online friends: {}", text));
+    }
+
+    let online: Vec<String> = res.json().await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    Ok(online)
 }

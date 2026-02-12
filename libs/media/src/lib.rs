@@ -43,8 +43,6 @@ pub struct MediaEngine {
     audio_playback: Option<Arc<AudioPlayback>>,
     /// Track whether playback stream has been started
     playback_started: Arc<AtomicBool>,
-    /// Hold the playback stream to prevent it from being dropped
-    _playback_stream: Option<cpal::Stream>,
 }
 
 impl Default for MediaEngine {
@@ -62,7 +60,6 @@ impl MediaEngine {
             audio_capture: None,
             audio_playback: None,
             playback_started: Arc::new(AtomicBool::new(false)),
-            _playback_stream: None,
         }
     }
 
@@ -72,6 +69,11 @@ impl MediaEngine {
         // Stop audio capture
         if let Some(capture) = &self.audio_capture {
             capture.stop();
+        }
+
+        // Stop audio playback
+        if let Some(playback) = &self.audio_playback {
+            playback.stop();
         }
         
         // Close WebRTC connection
@@ -84,7 +86,6 @@ impl MediaEngine {
         self.crypto_ctx = None;
         self.audio_capture = None;
         self.audio_playback = None;
-        self._playback_stream = None;
         self.playback_started.store(false, Ordering::SeqCst);
         tracing::info!("MediaEngine reset for next call");
     }
@@ -246,7 +247,7 @@ impl MediaEngine {
                             // Start playback stream once
                             if !ps.swap(true, Ordering::SeqCst) {
                                 match playback.start() {
-                                    Ok(_stream) => tracing::info!("Playback stream started (Answerer)"),
+                                    Ok(()) => tracing::info!("Playback stream started (Answerer)"),
                                     Err(e) => tracing::error!("Failed to start playback: {}", e),
                                 }
                             }
@@ -384,7 +385,7 @@ impl MediaEngine {
                 // Start playback stream once (Offerer side)
                 if !ps.swap(true, Ordering::SeqCst) {
                     match playback.start() {
-                        Ok(_stream) => tracing::info!("Playback stream started (Offerer)"),
+                        Ok(()) => tracing::info!("Playback stream started (Offerer)"),
                         Err(e) => tracing::error!("Failed to start playback: {}", e),
                     }
                 }

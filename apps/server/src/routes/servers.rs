@@ -49,6 +49,12 @@ pub struct SendMessageRequest {
     pub nonce: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct EditChannelMessageRequest {
+    pub content: String,
+    pub nonce: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct ServerWithChannels {
     #[serde(flatten)]
@@ -374,7 +380,7 @@ async fn get_channel_messages(
 
     let messages = sqlx::query_as::<_, ChannelMessage>(
         r#"
-        SELECT id, channel_id, sender_id, content, nonce, created_at
+        SELECT id, channel_id, sender_id, content, nonce, created_at, edited_at
         FROM messages
         WHERE channel_id = $1
         ORDER BY created_at ASC
@@ -461,7 +467,7 @@ async fn edit_channel_message(
     State(state): State<AppState>,
     user: AuthUser,
     Path((server_id, _channel_id, message_id)): Path<(Uuid, Uuid, Uuid)>,
-    Json(req): Json<ChannelMessageRequest>,
+    Json(req): Json<EditChannelMessageRequest>,
 ) -> Result<Json<ChannelMessage>, StatusCode> {
     // Verify membership
     let is_member = sqlx::query_scalar::<_, i64>(

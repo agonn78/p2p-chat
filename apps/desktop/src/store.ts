@@ -869,9 +869,9 @@ export const useAppStore = create<AppState>()(
                 keyPair: state.keyPair,
                 friendPublicKeys: state.friendPublicKeys,
             }),
-            onRehydrate: (_state) => {
+            onRehydrateStorage: (_state) => {
                 // Bug #13: Validate token on app reload
-                return (state) => {
+                return (state?: AppState) => {
                     if (state?.token && isTokenExpired(state.token)) {
                         console.warn('[Store] ⚠️ Persisted token is expired, logging out...');
                         state.logout();

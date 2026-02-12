@@ -49,7 +49,16 @@ pub async fn connect(server_url: &str, app_handle: tauri::AppHandle) -> Result<W
             println!("🔄 Reconnecting in {}s...", backoff_secs);
             tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
             
-            match connect_async(url::Url::parse(&server_url_owned).unwrap()).await {
+            let reconnect_url = match url::Url::parse(&server_url_owned) {
+                Ok(url) => url,
+                Err(e) => {
+                    eprintln!("❌ Invalid reconnect URL: {}", e);
+                    backoff_secs = (backoff_secs * 2).min(max_backoff);
+                    continue;
+                }
+            };
+
+            match connect_async(reconnect_url).await {
                 Ok((new_ws_stream, _)) => {
                     println!("✅ WebSocket reconnected!");
                     let (new_write, mut new_read) = new_ws_stream.split();
