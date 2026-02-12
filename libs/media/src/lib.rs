@@ -25,8 +25,54 @@ use webrtc::peer_connection::RTCPeerConnection;
 // Required for ICE candidate methods
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 
-pub use audio::{AudioCapture, AudioPacket, AudioPlayback};
+pub use audio::{AudioCapture, AudioPacket, AudioPlayback, VoiceMode};
 pub use crypto::{CryptoContext, KeyPair};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioMode {
+    Headphones,
+    Speakers,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AudioSettings {
+    pub mic_gain: f32,
+    pub output_volume: f32,
+    pub remote_user_volume: f32,
+    pub voice_mode: String,
+    pub vad_threshold: f32,
+    pub noise_suppression: bool,
+    pub aec: bool,
+    pub agc: bool,
+    pub noise_gate: bool,
+    pub noise_gate_threshold: f32,
+    pub limiter: bool,
+    pub deafen: bool,
+    pub ptt_key: String,
+    pub audio_mode: AudioMode,
+}
+
+impl Default for AudioSettings {
+    fn default() -> Self {
+        Self {
+            mic_gain: 1.0,
+            output_volume: 1.0,
+            remote_user_volume: 1.0,
+            voice_mode: "voice_activity".to_string(),
+            vad_threshold: 0.02,
+            noise_suppression: true,
+            aec: true,
+            agc: true,
+            noise_gate: true,
+            noise_gate_threshold: 0.01,
+            limiter: true,
+            deafen: false,
+            ptt_key: "V".to_string(),
+            audio_mode: AudioMode::Headphones,
+        }
+    }
+}
 
 /// Media engine state
 pub struct MediaEngine {
@@ -43,6 +89,10 @@ pub struct MediaEngine {
     audio_playback: Option<Arc<AudioPlayback>>,
     // Preferred input device name chosen by user
     selected_input_device: Option<String>,
+    // Preferred output device name chosen by user
+    selected_output_device: Option<String>,
+    // Runtime audio settings
+    audio_settings: AudioSettings,
     /// Track whether playback stream has been started
     playback_started: Arc<AtomicBool>,
 }
@@ -62,6 +112,8 @@ impl MediaEngine {
             audio_capture: None,
             audio_playback: None,
             selected_input_device: None,
+            selected_output_device: None,
+            audio_settings: AudioSettings::default(),
             playback_started: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -196,6 +248,113 @@ impl MediaEngine {
         Ok(())
     }
 
+    /// List available output (speaker/headphone) devices
+    pub fn list_output_devices() -> Result<Vec<(String, String)>> {
+        let host = cpal::default_host();
+        let mut devices = Vec::new();
+
+        for device in host.output_devices()? {
+            if let Ok(name) = device.name() {
+                devices.push((name.clone(), name));
+            }
+        }
+
+        Ok(devices)
+    }
+
+    /// Get the default output device name
+    pub fn default_output_device_name() -> Result<String> {
+        let host = cpal::default_host();
+        let device = host.default_output_device()
+            .ok_or_else(|| anyhow::anyhow!("No default output device"))?;
+        device.name().map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// Return currently selected output device (if set by user)
+    pub fn selected_output_device(&self) -> Option<String> {
+        self.selected_output_device.clone()
+    }
+
+    /// Set preferred output device and hot-switch playback if already running
+    pub fn set_output_device(&mut self, device_name: Option<String>) -> Result<()> {
+        let normalized = device_name
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty());
+
+        self.selected_output_device = normalized;
+
+        if let Some(playback) = &self.audio_playback {
+            let was_running = playback.is_running();
+            if was_running {
+                playback.stop();
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                playback.start_with_device(self.selected_output_device.as_deref())?;
+                tracing::info!(
+                    "Output device switched to {:?}",
+                    self.selected_output_device.as_deref().unwrap_or("default")
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn parse_voice_mode(mode: &str) -> VoiceMode {
+        match mode {
+            "mute" => VoiceMode::Mute,
+            "push_to_talk" => VoiceMode::PushToTalk,
+            _ => VoiceMode::VoiceActivity,
+        }
+    }
+
+    fn apply_audio_settings_to_runtime(&self) {
+        let effective_aec = match self.audio_settings.audio_mode {
+            AudioMode::Headphones => false,
+            AudioMode::Speakers => self.audio_settings.aec,
+        };
+
+        if let Some(capture) = &self.audio_capture {
+            capture.set_input_gain(self.audio_settings.mic_gain);
+            capture.set_voice_mode(Self::parse_voice_mode(&self.audio_settings.voice_mode));
+            capture.set_vad_threshold(self.audio_settings.vad_threshold);
+            capture.set_noise_suppression(self.audio_settings.noise_suppression);
+            capture.set_aec_enabled(effective_aec);
+            capture.set_agc_enabled(self.audio_settings.agc);
+            capture.set_noise_gate_enabled(self.audio_settings.noise_gate);
+            capture.set_noise_gate_threshold(self.audio_settings.noise_gate_threshold);
+            capture.set_muted(self.audio_settings.deafen || self.audio_settings.voice_mode == "mute");
+        }
+
+        if let Some(playback) = &self.audio_playback {
+            playback.set_output_volume(self.audio_settings.output_volume);
+            playback.set_remote_volume(self.audio_settings.remote_user_volume);
+            playback.set_limiter_enabled(self.audio_settings.limiter);
+            playback.set_muted(self.audio_settings.deafen);
+        }
+    }
+
+    pub fn get_audio_settings(&self) -> AudioSettings {
+        self.audio_settings.clone()
+    }
+
+    pub fn update_audio_settings(&mut self, settings: AudioSettings) {
+        self.audio_settings = settings;
+        self.apply_audio_settings_to_runtime();
+    }
+
+    pub fn set_ptt_active(&self, active: bool) {
+        if let Some(capture) = &self.audio_capture {
+            capture.set_ptt_active(active);
+        }
+    }
+
+    pub fn set_remote_user_volume(&mut self, volume: f32) {
+        self.audio_settings.remote_user_volume = volume.clamp(0.0, 2.0);
+        if let Some(playback) = &self.audio_playback {
+            playback.set_remote_volume(self.audio_settings.remote_user_volume);
+        }
+    }
+
     // === WebRTC Implementation ===
 
     /// Initialize WebRTC PeerConnection
@@ -246,25 +405,31 @@ impl MediaEngine {
             // Setup Playback
             let playback = Arc::new(AudioPlayback::new(ctx.clone())?);
             self.audio_playback = Some(playback.clone());
-            
+            let shared_playback_rms = playback.output_rms_shared();
+             
             // Setup Capture
-            let capture = Arc::new(AudioCapture::new(ctx.clone())?);
+            let capture = Arc::new(AudioCapture::new(ctx.clone(), shared_playback_rms)?);
             self.audio_capture = Some(capture.clone());
+
+            self.apply_audio_settings_to_runtime();
 
             // Clone for on_data_channel closures
             let playback_started_clone = self.playback_started.clone();
             let preferred_input_device = self.selected_input_device.clone();
+            let preferred_output_device = self.selected_output_device.clone();
 
             // Handle incoming DataChannel (Answerer side receives channel created by Offerer)
             let playback_clone = playback.clone();
             let capture_clone = capture.clone();
             let preferred_input_device_clone = preferred_input_device.clone();
+            let preferred_output_device_clone = preferred_output_device.clone();
             
             pc.on_data_channel(Box::new(move |d_channel: Arc<RTCDataChannel>| {
                 let playback = playback_clone.clone();
                 let capture = capture_clone.clone();
                 let playback_started = playback_started_clone.clone();
                 let preferred_input_device = preferred_input_device_clone.clone();
+                let preferred_output_device = preferred_output_device_clone.clone();
                 
                 Box::pin(async move {
                     tracing::info!("New DataChannel {} {}", d_channel.label(), d_channel.id());
@@ -273,6 +438,7 @@ impl MediaEngine {
                     let playback_for_open = playback.clone();
                     let ps_for_open = playback_started.clone();
                     let preferred_input_for_open = preferred_input_device.clone();
+                    let preferred_output_for_open = preferred_output_device.clone();
                     d_channel.on_open(Box::new(move || {
                         tracing::info!("Data channel opened (Answerer)");
                         let dc = d_channel_clone.clone();
@@ -280,10 +446,11 @@ impl MediaEngine {
                         let playback = playback_for_open.clone();
                         let ps = ps_for_open.clone();
                         let preferred_input = preferred_input_for_open.clone();
+                        let preferred_output = preferred_output_for_open.clone();
                         Box::pin(async move {
                             // Start playback stream once
                             if !ps.swap(true, Ordering::SeqCst) {
-                                match playback.start() {
+                                match playback.start_with_device(preferred_output.as_deref()) {
                                     Ok(()) => tracing::info!("Playback stream started (Answerer)"),
                                     Err(e) => tracing::error!("Failed to start playback: {}", e),
                                 }
@@ -396,6 +563,7 @@ impl MediaEngine {
         let audio_playback = self.audio_playback.clone()
             .ok_or_else(|| anyhow::anyhow!("Audio playback not initialized"))?;
         let preferred_input_device = self.selected_input_device.clone();
+        let preferred_output_device = self.selected_output_device.clone();
 
         // Handle incoming messages on this channel too (Answerer audio)
         let playback_clone = audio_playback.clone();
@@ -413,6 +581,7 @@ impl MediaEngine {
         let dc_clone = dc.clone();
         let playback_started = self.playback_started.clone();
         let preferred_input_for_open = preferred_input_device.clone();
+        let preferred_output_for_open = preferred_output_device.clone();
         dc.on_open(Box::new(move || {
             tracing::info!("DataChannel 'audio' opened (Offerer)");
             let dc = dc_clone.clone();
@@ -420,11 +589,12 @@ impl MediaEngine {
             let playback = audio_playback.clone();
             let ps = playback_started.clone();
             let preferred_input = preferred_input_for_open.clone();
+            let preferred_output = preferred_output_for_open.clone();
             
             Box::pin(async move {
                 // Start playback stream once (Offerer side)
                 if !ps.swap(true, Ordering::SeqCst) {
-                    match playback.start() {
+                    match playback.start_with_device(preferred_output.as_deref()) {
                         Ok(()) => tracing::info!("Playback stream started (Offerer)"),
                         Err(e) => tracing::error!("Failed to start playback: {}", e),
                     }

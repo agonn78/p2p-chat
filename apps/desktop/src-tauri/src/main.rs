@@ -6,7 +6,7 @@ mod config;
 mod signaling;
 
 use tauri::{State, Manager, Emitter};
-use media::MediaEngine;
+use media::{MediaEngine, AudioSettings};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use signaling::WsSender;
@@ -225,6 +225,70 @@ async fn set_audio_device(state: State<'_, AppState>, device_id: String) -> Resu
         .set_input_device(Some(device_id.clone()))
         .map_err(|e| format!("Failed to set audio device: {}", e))?;
     println!("🔊 [AUDIO] Input device set to: {}", device_id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_output_devices() -> Result<Vec<AudioDevice>, String> {
+    MediaEngine::list_output_devices()
+        .map(|devices| {
+            devices
+                .into_iter()
+                .map(|(id, name)| AudioDevice { id, name })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_default_output_device() -> Result<AudioDevice, String> {
+    MediaEngine::default_output_device_name()
+        .map(|name| AudioDevice { id: name.clone(), name })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_selected_output_device(state: State<'_, AppState>) -> Result<Option<AudioDevice>, String> {
+    let engine = state.media.lock().await;
+    Ok(engine
+        .selected_output_device()
+        .map(|name| AudioDevice { id: name.clone(), name }))
+}
+
+#[tauri::command]
+async fn set_output_device(state: State<'_, AppState>, device_id: String) -> Result<(), String> {
+    let mut engine = state.media.lock().await;
+    engine
+        .set_output_device(Some(device_id.clone()))
+        .map_err(|e| format!("Failed to set output device: {}", e))?;
+    println!("🔊 [AUDIO] Output device set to: {}", device_id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_audio_settings(state: State<'_, AppState>) -> Result<AudioSettings, String> {
+    let engine = state.media.lock().await;
+    Ok(engine.get_audio_settings())
+}
+
+#[tauri::command]
+async fn update_audio_settings(state: State<'_, AppState>, settings: AudioSettings) -> Result<(), String> {
+    let mut engine = state.media.lock().await;
+    engine.update_audio_settings(settings);
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_ptt_active(state: State<'_, AppState>, active: bool) -> Result<(), String> {
+    let engine = state.media.lock().await;
+    engine.set_ptt_active(active);
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_remote_user_volume(state: State<'_, AppState>, volume: f32) -> Result<(), String> {
+    let mut engine = state.media.lock().await;
+    engine.set_remote_user_volume(volume);
     Ok(())
 }
 
@@ -482,6 +546,14 @@ fn main() {
             get_default_audio_device,
             get_selected_audio_device,
             set_audio_device,
+            list_output_devices,
+            get_default_output_device,
+            get_selected_output_device,
+            set_output_device,
+            get_audio_settings,
+            update_audio_settings,
+            set_ptt_active,
+            set_remote_user_volume,
             toggle_mute,
             start_vu_meter,
             start_call_audio,

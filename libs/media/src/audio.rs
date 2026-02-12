@@ -7,7 +7,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig, SupportedStreamConfig};
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
     Arc, Mutex,
 };
 use std::thread;
@@ -18,9 +18,49 @@ pub const SAMPLE_RATE: u32 = 48000;
 pub const CHANNELS: u16 = 1; // Mono
 pub const FRAME_SIZE: usize = 960; // 20ms at 48kHz
 
+const VOICE_MODE_MUTE: u8 = 0;
+const VOICE_MODE_PTT: u8 = 1;
+const VOICE_MODE_VAD: u8 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceMode {
+    Mute,
+    PushToTalk,
+    VoiceActivity,
+}
+
+impl VoiceMode {
+    fn to_u8(self) -> u8 {
+        match self {
+            VoiceMode::Mute => VOICE_MODE_MUTE,
+            VoiceMode::PushToTalk => VOICE_MODE_PTT,
+            VoiceMode::VoiceActivity => VOICE_MODE_VAD,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CaptureControls {
+    input_gain_bits: AtomicU32,
+    vad_threshold_bits: AtomicU32,
+    noise_gate_threshold_bits: AtomicU32,
+    voice_mode: AtomicU8,
+    ptt_active: AtomicBool,
+    noise_suppression: AtomicBool,
+    aec_enabled: AtomicBool,
+    agc_enabled: AtomicBool,
+    noise_gate_enabled: AtomicBool,
+    shared_playback_rms_bits: Arc<AtomicU32>,
+}
+
 struct CapturePipelineState {
     sample_buffer: Vec<i16>,
     resample_pos: f64,
+    dc_prev_x: f32,
+    dc_prev_y: f32,
+    lowpass_prev: f32,
+    agc_gain: f32,
+    gate_gain: f32,
 }
 
 impl CapturePipelineState {
@@ -28,6 +68,11 @@ impl CapturePipelineState {
         Self {
             sample_buffer: Vec::with_capacity(FRAME_SIZE * 3),
             resample_pos: 0.0,
+            dc_prev_x: 0.0,
+            dc_prev_y: 0.0,
+            lowpass_prev: 0.0,
+            agc_gain: 1.0,
+            gate_gain: 1.0,
         }
     }
 }
@@ -99,6 +144,7 @@ pub struct AudioPacket {
 pub struct AudioCapture {
     encoder: Arc<Mutex<OpusEncoder>>,
     crypto: Arc<CryptoContext>,
+    controls: Arc<CaptureControls>,
     packet_tx: mpsc::UnboundedSender<AudioPacket>,
     // We hold the receiver until it's taken by the WebRTC engine
     packet_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<AudioPacket>>>>,
@@ -115,12 +161,28 @@ pub struct AudioCapture {
 }
 
 impl AudioCapture {
-    pub fn new(crypto: Arc<CryptoContext>) -> Result<Self> {
+    pub fn new(
+        crypto: Arc<CryptoContext>,
+        shared_playback_rms_bits: Arc<AtomicU32>,
+    ) -> Result<Self> {
         let (packet_tx, packet_rx) = mpsc::unbounded_channel();
         let (rms_tx, rms_rx) = mpsc::unbounded_channel();
+        let controls = Arc::new(CaptureControls {
+            input_gain_bits: AtomicU32::new(1.0f32.to_bits()),
+            vad_threshold_bits: AtomicU32::new(0.02f32.to_bits()),
+            noise_gate_threshold_bits: AtomicU32::new(0.01f32.to_bits()),
+            voice_mode: AtomicU8::new(VOICE_MODE_VAD),
+            ptt_active: AtomicBool::new(false),
+            noise_suppression: AtomicBool::new(true),
+            aec_enabled: AtomicBool::new(true),
+            agc_enabled: AtomicBool::new(true),
+            noise_gate_enabled: AtomicBool::new(true),
+            shared_playback_rms_bits,
+        });
         Ok(Self {
             encoder: Arc::new(Mutex::new(OpusEncoder::new()?)),
             crypto,
+            controls,
             packet_tx,
             packet_rx: Arc::new(Mutex::new(Some(packet_rx))),
             seq: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -149,6 +211,97 @@ impl AudioCapture {
         self.muted.load(Ordering::SeqCst)
     }
 
+    pub fn set_input_gain(&self, gain: f32) {
+        let clamped = gain.clamp(0.0, 6.0);
+        self.controls
+            .input_gain_bits
+            .store(clamped.to_bits(), Ordering::SeqCst);
+    }
+
+    pub fn input_gain(&self) -> f32 {
+        f32::from_bits(self.controls.input_gain_bits.load(Ordering::SeqCst))
+    }
+
+    pub fn set_voice_mode(&self, mode: VoiceMode) {
+        self.controls
+            .voice_mode
+            .store(mode.to_u8(), Ordering::SeqCst);
+    }
+
+    pub fn voice_mode(&self) -> VoiceMode {
+        match self.controls.voice_mode.load(Ordering::SeqCst) {
+            VOICE_MODE_MUTE => VoiceMode::Mute,
+            VOICE_MODE_PTT => VoiceMode::PushToTalk,
+            _ => VoiceMode::VoiceActivity,
+        }
+    }
+
+    pub fn set_ptt_active(&self, active: bool) {
+        self.controls.ptt_active.store(active, Ordering::SeqCst);
+    }
+
+    pub fn set_vad_threshold(&self, threshold: f32) {
+        let clamped = threshold.clamp(0.0, 0.3);
+        self.controls
+            .vad_threshold_bits
+            .store(clamped.to_bits(), Ordering::SeqCst);
+    }
+
+    pub fn vad_threshold(&self) -> f32 {
+        f32::from_bits(self.controls.vad_threshold_bits.load(Ordering::SeqCst))
+    }
+
+    pub fn set_noise_gate_threshold(&self, threshold: f32) {
+        let clamped = threshold.clamp(0.0, 0.2);
+        self.controls
+            .noise_gate_threshold_bits
+            .store(clamped.to_bits(), Ordering::SeqCst);
+    }
+
+    pub fn noise_gate_threshold(&self) -> f32 {
+        f32::from_bits(
+            self.controls
+                .noise_gate_threshold_bits
+                .load(Ordering::SeqCst),
+        )
+    }
+
+    pub fn set_noise_suppression(&self, enabled: bool) {
+        self.controls
+            .noise_suppression
+            .store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn noise_suppression(&self) -> bool {
+        self.controls.noise_suppression.load(Ordering::SeqCst)
+    }
+
+    pub fn set_aec_enabled(&self, enabled: bool) {
+        self.controls.aec_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn aec_enabled(&self) -> bool {
+        self.controls.aec_enabled.load(Ordering::SeqCst)
+    }
+
+    pub fn set_agc_enabled(&self, enabled: bool) {
+        self.controls.agc_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn agc_enabled(&self) -> bool {
+        self.controls.agc_enabled.load(Ordering::SeqCst)
+    }
+
+    pub fn set_noise_gate_enabled(&self, enabled: bool) {
+        self.controls
+            .noise_gate_enabled
+            .store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn noise_gate_enabled(&self) -> bool {
+        self.controls.noise_gate_enabled.load(Ordering::SeqCst)
+    }
+
     /// Start capture with the default input device
     pub fn start(&self) -> Result<()> {
         self.start_with_device(None)
@@ -167,6 +320,7 @@ impl AudioCapture {
         let running = self.running.clone();
         let run_token = self.run_token.clone();
         let muted = self.muted.clone();
+        let controls = self.controls.clone();
         let rms_tx = self.rms_tx.clone();
         let device_name_owned = device_name.map(|s| s.to_string());
         let current_token = run_token.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
@@ -257,6 +411,7 @@ impl AudioCapture {
                     let muted = muted.clone();
                     let rms_tx = rms_tx.clone();
                     let pipeline_state = pipeline_state.clone();
+                    let controls = controls.clone();
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[f32], _info| {
@@ -271,6 +426,7 @@ impl AudioCapture {
                                     &crypto,
                                     &seq,
                                     &packet_tx,
+                                    &controls,
                                     &mut state,
                                 );
                             }
@@ -287,6 +443,7 @@ impl AudioCapture {
                     let muted = muted.clone();
                     let rms_tx = rms_tx.clone();
                     let pipeline_state = pipeline_state.clone();
+                    let controls = controls.clone();
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[f64], _info| {
@@ -301,6 +458,7 @@ impl AudioCapture {
                                     &crypto,
                                     &seq,
                                     &packet_tx,
+                                    &controls,
                                     &mut state,
                                 );
                             }
@@ -317,6 +475,7 @@ impl AudioCapture {
                     let muted = muted.clone();
                     let rms_tx = rms_tx.clone();
                     let pipeline_state = pipeline_state.clone();
+                    let controls = controls.clone();
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[i16], _info| {
@@ -331,6 +490,7 @@ impl AudioCapture {
                                     &crypto,
                                     &seq,
                                     &packet_tx,
+                                    &controls,
                                     &mut state,
                                 );
                             }
@@ -347,6 +507,7 @@ impl AudioCapture {
                     let muted = muted.clone();
                     let rms_tx = rms_tx.clone();
                     let pipeline_state = pipeline_state.clone();
+                    let controls = controls.clone();
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[i8], _info| {
@@ -361,6 +522,7 @@ impl AudioCapture {
                                     &crypto,
                                     &seq,
                                     &packet_tx,
+                                    &controls,
                                     &mut state,
                                 );
                             }
@@ -377,6 +539,7 @@ impl AudioCapture {
                     let muted = muted.clone();
                     let rms_tx = rms_tx.clone();
                     let pipeline_state = pipeline_state.clone();
+                    let controls = controls.clone();
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[i32], _info| {
@@ -391,6 +554,7 @@ impl AudioCapture {
                                     &crypto,
                                     &seq,
                                     &packet_tx,
+                                    &controls,
                                     &mut state,
                                 );
                             }
@@ -407,6 +571,7 @@ impl AudioCapture {
                     let muted = muted.clone();
                     let rms_tx = rms_tx.clone();
                     let pipeline_state = pipeline_state.clone();
+                    let controls = controls.clone();
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[u16], _info| {
@@ -421,6 +586,7 @@ impl AudioCapture {
                                     &crypto,
                                     &seq,
                                     &packet_tx,
+                                    &controls,
                                     &mut state,
                                 );
                             }
@@ -437,6 +603,7 @@ impl AudioCapture {
                     let muted = muted.clone();
                     let rms_tx = rms_tx.clone();
                     let pipeline_state = pipeline_state.clone();
+                    let controls = controls.clone();
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[u8], _info| {
@@ -451,6 +618,7 @@ impl AudioCapture {
                                     &crypto,
                                     &seq,
                                     &packet_tx,
+                                    &controls,
                                     &mut state,
                                 );
                             }
@@ -467,6 +635,7 @@ impl AudioCapture {
                     let muted = muted.clone();
                     let rms_tx = rms_tx.clone();
                     let pipeline_state = pipeline_state.clone();
+                    let controls = controls.clone();
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[u32], _info| {
@@ -481,6 +650,7 @@ impl AudioCapture {
                                     &crypto,
                                     &seq,
                                     &packet_tx,
+                                    &controls,
                                     &mut state,
                                 );
                             }
@@ -718,6 +888,21 @@ fn resample_to_48k(input: &[f32], input_rate: u32, pos: &mut f64) -> Vec<f32> {
     out
 }
 
+fn apply_noise_suppression(samples: &mut [f32], state: &mut CapturePipelineState) {
+    for sample in samples.iter_mut() {
+        // DC blocker
+        let hp = *sample - state.dc_prev_x + 0.995 * state.dc_prev_y;
+        state.dc_prev_x = *sample;
+        state.dc_prev_y = hp;
+
+        // Gentle low-pass to reduce high-frequency hiss/squeal artifacts
+        let lp = 0.22 * hp + 0.78 * state.lowpass_prev;
+        state.lowpass_prev = lp;
+
+        *sample = lp;
+    }
+}
+
 fn process_mono_samples(
     mono_samples: &[f32],
     input_rate: u32,
@@ -727,20 +912,75 @@ fn process_mono_samples(
     crypto: &Arc<CryptoContext>,
     seq: &Arc<std::sync::atomic::AtomicU32>,
     packet_tx: &mpsc::UnboundedSender<AudioPacket>,
+    controls: &Arc<CaptureControls>,
     state: &mut CapturePipelineState,
 ) {
-    let rms = calculate_rms(mono_samples);
-    let _ = rms_tx.send(rms);
-
-    let resampled = resample_to_48k(mono_samples, input_rate, &mut state.resample_pos);
-    if resampled.is_empty() {
+    let mut processed = resample_to_48k(mono_samples, input_rate, &mut state.resample_pos);
+    if processed.is_empty() {
         return;
     }
 
-    if muted {
-        state.sample_buffer.extend(vec![0i16; resampled.len()]);
+    if controls.noise_suppression.load(Ordering::Relaxed) {
+        apply_noise_suppression(&mut processed, state);
+    }
+
+    let rms = calculate_rms(&processed);
+    let _ = rms_tx.send(rms);
+
+    let input_gain = f32::from_bits(controls.input_gain_bits.load(Ordering::Relaxed));
+
+    if controls.agc_enabled.load(Ordering::Relaxed) {
+        let measured = rms.max(1e-4);
+        let desired = (0.12 / measured).clamp(0.3, 3.5);
+        state.agc_gain += (desired - state.agc_gain) * 0.08;
     } else {
-        state.sample_buffer.extend(resampled.into_iter().map(|s| {
+        state.agc_gain += (1.0 - state.agc_gain) * 0.12;
+    }
+
+    let mut total_gain = (input_gain * state.agc_gain).clamp(0.0, 8.0);
+
+    if controls.aec_enabled.load(Ordering::Relaxed) {
+        let playback_rms =
+            f32::from_bits(controls.shared_playback_rms_bits.load(Ordering::Relaxed));
+        let duck = (1.0 - (playback_rms * 1.6)).clamp(0.25, 1.0);
+        total_gain *= duck;
+    }
+
+    for sample in &mut processed {
+        *sample = (*sample * total_gain).clamp(-1.0, 1.0);
+    }
+
+    if controls.noise_gate_enabled.load(Ordering::Relaxed) {
+        let gate_threshold =
+            f32::from_bits(controls.noise_gate_threshold_bits.load(Ordering::Relaxed));
+        let desired_gate = if rms >= gate_threshold { 1.0 } else { 0.0 };
+        let slew = if desired_gate > state.gate_gain {
+            0.35
+        } else {
+            0.15
+        };
+        state.gate_gain += (desired_gate - state.gate_gain) * slew;
+
+        for sample in &mut processed {
+            *sample *= state.gate_gain;
+        }
+    }
+
+    let mode = controls.voice_mode.load(Ordering::Relaxed);
+    let ptt_active = controls.ptt_active.load(Ordering::Relaxed);
+    let vad_threshold = f32::from_bits(controls.vad_threshold_bits.load(Ordering::Relaxed));
+    let transmit_by_mode = match mode {
+        VOICE_MODE_MUTE => false,
+        VOICE_MODE_PTT => ptt_active,
+        _ => rms >= vad_threshold,
+    };
+
+    let should_send_audio = !muted && transmit_by_mode;
+
+    if !should_send_audio {
+        state.sample_buffer.extend(vec![0i16; processed.len()]);
+    } else {
+        state.sample_buffer.extend(processed.into_iter().map(|s| {
             let clamped = s.clamp(-1.0, 1.0);
             (clamped * 32767.0) as i16
         }));
@@ -771,6 +1011,15 @@ pub struct AudioPlayback {
     sample_queue: Arc<Mutex<VecDeque<i16>>>,
     // Flag to keep playback thread alive
     running: Arc<AtomicBool>,
+    // Monotonic token to invalidate old playback threads
+    run_token: Arc<AtomicU64>,
+    // Runtime controls
+    output_volume_bits: Arc<AtomicU32>,
+    remote_volume_bits: Arc<AtomicU32>,
+    limiter_enabled: Arc<AtomicBool>,
+    muted: Arc<AtomicBool>,
+    // Shared RMS for pseudo AEC feedback
+    output_rms_bits: Arc<AtomicU32>,
 }
 
 impl AudioPlayback {
@@ -780,6 +1029,12 @@ impl AudioPlayback {
             crypto,
             sample_queue: Arc::new(Mutex::new(VecDeque::with_capacity(FRAME_SIZE * 10))),
             running: Arc::new(AtomicBool::new(false)),
+            run_token: Arc::new(AtomicU64::new(0)),
+            output_volume_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            remote_volume_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            limiter_enabled: Arc::new(AtomicBool::new(true)),
+            muted: Arc::new(AtomicBool::new(false)),
+            output_rms_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
         })
     }
 
@@ -813,21 +1068,73 @@ impl AudioPlayback {
     }
 
     pub fn start(&self) -> Result<()> {
+        self.start_with_device(None)
+    }
+
+    pub fn start_with_device(&self, device_name: Option<&str>) -> Result<()> {
         if self.running.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
 
         let sample_queue = self.sample_queue.clone();
         let running = self.running.clone();
+        let run_token = self.run_token.clone();
+        let output_volume_bits = self.output_volume_bits.clone();
+        let remote_volume_bits = self.remote_volume_bits.clone();
+        let limiter_enabled = self.limiter_enabled.clone();
+        let muted = self.muted.clone();
+        let output_rms_bits = self.output_rms_bits.clone();
+        let device_name_owned = device_name.map(|s| s.to_string());
+        let current_token = run_token.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
 
         thread::spawn(move || {
             let host = cpal::default_host();
-            let device = match host.default_output_device() {
-                Some(d) => d,
-                None => {
-                    tracing::error!("No output device");
-                    running.store(false, Ordering::SeqCst);
-                    return;
+            let device = if let Some(ref name) = device_name_owned {
+                match host.output_devices() {
+                    Ok(devices) => {
+                        if let Some(device) = devices
+                            .into_iter()
+                            .find(|d| d.name().map(|n| n == *name).unwrap_or(false))
+                        {
+                            device
+                        } else {
+                            tracing::warn!("Output device '{}' not found, using default", name);
+                            match host.default_output_device() {
+                                Some(d) => d,
+                                None => {
+                                    tracing::error!("No output device available");
+                                    if run_token.load(Ordering::SeqCst) == current_token {
+                                        running.store(false, Ordering::SeqCst);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to enumerate output devices: {}", e);
+                        match host.default_output_device() {
+                            Some(d) => d,
+                            None => {
+                                tracing::error!("No output device available");
+                                if run_token.load(Ordering::SeqCst) == current_token {
+                                    running.store(false, Ordering::SeqCst);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+            } else {
+                match host.default_output_device() {
+                    Some(d) => d,
+                    None => {
+                        tracing::error!("No output device available");
+                        if run_token.load(Ordering::SeqCst) == current_token {
+                            running.store(false, Ordering::SeqCst);
+                        }
+                        return;
+                    }
                 }
             };
 
@@ -835,7 +1142,9 @@ impl AudioPlayback {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("Failed to pick output config: {}", e);
-                    running.store(false, Ordering::SeqCst);
+                    if run_token.load(Ordering::SeqCst) == current_token {
+                        running.store(false, Ordering::SeqCst);
+                    }
                     return;
                 }
             };
@@ -855,10 +1164,24 @@ impl AudioPlayback {
             let stream_result = match sample_format {
                 SampleFormat::F32 => {
                     let sample_queue = sample_queue.clone();
+                    let output_volume_bits = output_volume_bits.clone();
+                    let remote_volume_bits = remote_volume_bits.clone();
+                    let limiter_enabled = limiter_enabled.clone();
+                    let muted = muted.clone();
+                    let output_rms_bits = output_rms_bits.clone();
                     device.build_output_stream(
                         &stream_config,
                         move |data: &mut [f32], _info| {
-                            fill_output_f32(data, output_channels, &sample_queue);
+                            fill_output_f32(
+                                data,
+                                output_channels,
+                                &sample_queue,
+                                &output_volume_bits,
+                                &remote_volume_bits,
+                                &limiter_enabled,
+                                &muted,
+                                &output_rms_bits,
+                            );
                         },
                         |err| tracing::error!("Playback stream error: {}", err),
                         None,
@@ -866,10 +1189,24 @@ impl AudioPlayback {
                 }
                 SampleFormat::F64 => {
                     let sample_queue = sample_queue.clone();
+                    let output_volume_bits = output_volume_bits.clone();
+                    let remote_volume_bits = remote_volume_bits.clone();
+                    let limiter_enabled = limiter_enabled.clone();
+                    let muted = muted.clone();
+                    let output_rms_bits = output_rms_bits.clone();
                     device.build_output_stream(
                         &stream_config,
                         move |data: &mut [f64], _info| {
-                            fill_output_f64(data, output_channels, &sample_queue);
+                            fill_output_f64(
+                                data,
+                                output_channels,
+                                &sample_queue,
+                                &output_volume_bits,
+                                &remote_volume_bits,
+                                &limiter_enabled,
+                                &muted,
+                                &output_rms_bits,
+                            );
                         },
                         |err| tracing::error!("Playback stream error: {}", err),
                         None,
@@ -877,10 +1214,24 @@ impl AudioPlayback {
                 }
                 SampleFormat::I16 => {
                     let sample_queue = sample_queue.clone();
+                    let output_volume_bits = output_volume_bits.clone();
+                    let remote_volume_bits = remote_volume_bits.clone();
+                    let limiter_enabled = limiter_enabled.clone();
+                    let muted = muted.clone();
+                    let output_rms_bits = output_rms_bits.clone();
                     device.build_output_stream(
                         &stream_config,
                         move |data: &mut [i16], _info| {
-                            fill_output_i16(data, output_channels, &sample_queue);
+                            fill_output_i16(
+                                data,
+                                output_channels,
+                                &sample_queue,
+                                &output_volume_bits,
+                                &remote_volume_bits,
+                                &limiter_enabled,
+                                &muted,
+                                &output_rms_bits,
+                            );
                         },
                         |err| tracing::error!("Playback stream error: {}", err),
                         None,
@@ -888,10 +1239,24 @@ impl AudioPlayback {
                 }
                 SampleFormat::I32 => {
                     let sample_queue = sample_queue.clone();
+                    let output_volume_bits = output_volume_bits.clone();
+                    let remote_volume_bits = remote_volume_bits.clone();
+                    let limiter_enabled = limiter_enabled.clone();
+                    let muted = muted.clone();
+                    let output_rms_bits = output_rms_bits.clone();
                     device.build_output_stream(
                         &stream_config,
                         move |data: &mut [i32], _info| {
-                            fill_output_i32(data, output_channels, &sample_queue);
+                            fill_output_i32(
+                                data,
+                                output_channels,
+                                &sample_queue,
+                                &output_volume_bits,
+                                &remote_volume_bits,
+                                &limiter_enabled,
+                                &muted,
+                                &output_rms_bits,
+                            );
                         },
                         |err| tracing::error!("Playback stream error: {}", err),
                         None,
@@ -899,10 +1264,24 @@ impl AudioPlayback {
                 }
                 SampleFormat::U16 => {
                     let sample_queue = sample_queue.clone();
+                    let output_volume_bits = output_volume_bits.clone();
+                    let remote_volume_bits = remote_volume_bits.clone();
+                    let limiter_enabled = limiter_enabled.clone();
+                    let muted = muted.clone();
+                    let output_rms_bits = output_rms_bits.clone();
                     device.build_output_stream(
                         &stream_config,
                         move |data: &mut [u16], _info| {
-                            fill_output_u16(data, output_channels, &sample_queue);
+                            fill_output_u16(
+                                data,
+                                output_channels,
+                                &sample_queue,
+                                &output_volume_bits,
+                                &remote_volume_bits,
+                                &limiter_enabled,
+                                &muted,
+                                &output_rms_bits,
+                            );
                         },
                         |err| tracing::error!("Playback stream error: {}", err),
                         None,
@@ -910,10 +1289,24 @@ impl AudioPlayback {
                 }
                 SampleFormat::U32 => {
                     let sample_queue = sample_queue.clone();
+                    let output_volume_bits = output_volume_bits.clone();
+                    let remote_volume_bits = remote_volume_bits.clone();
+                    let limiter_enabled = limiter_enabled.clone();
+                    let muted = muted.clone();
+                    let output_rms_bits = output_rms_bits.clone();
                     device.build_output_stream(
                         &stream_config,
                         move |data: &mut [u32], _info| {
-                            fill_output_u32(data, output_channels, &sample_queue);
+                            fill_output_u32(
+                                data,
+                                output_channels,
+                                &sample_queue,
+                                &output_volume_bits,
+                                &remote_volume_bits,
+                                &limiter_enabled,
+                                &muted,
+                                &output_rms_bits,
+                            );
                         },
                         |err| tracing::error!("Playback stream error: {}", err),
                         None,
@@ -921,7 +1314,9 @@ impl AudioPlayback {
                 }
                 _ => {
                     tracing::error!("Unsupported output sample format: {:?}", sample_format);
-                    running.store(false, Ordering::SeqCst);
+                    if run_token.load(Ordering::SeqCst) == current_token {
+                        running.store(false, Ordering::SeqCst);
+                    }
                     return;
                 }
             };
@@ -930,30 +1325,91 @@ impl AudioPlayback {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("Failed to build output stream: {}", e);
-                    running.store(false, Ordering::SeqCst);
+                    if run_token.load(Ordering::SeqCst) == current_token {
+                        running.store(false, Ordering::SeqCst);
+                    }
                     return;
                 }
             };
 
             if let Err(e) = stream.play() {
                 tracing::error!("Failed to play output stream: {}", e);
-                running.store(false, Ordering::SeqCst);
+                if run_token.load(Ordering::SeqCst) == current_token {
+                    running.store(false, Ordering::SeqCst);
+                }
                 return;
             }
 
-            while running.load(Ordering::SeqCst) {
+            while running.load(Ordering::SeqCst)
+                && run_token.load(Ordering::SeqCst) == current_token
+            {
                 thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            if run_token.load(Ordering::SeqCst) == current_token {
+                running.store(false, Ordering::SeqCst);
             }
         });
 
         Ok(())
     }
 
+    pub fn set_output_volume(&self, volume: f32) {
+        let clamped = volume.clamp(0.0, 2.0);
+        self.output_volume_bits
+            .store(clamped.to_bits(), Ordering::SeqCst);
+    }
+
+    pub fn output_volume(&self) -> f32 {
+        f32::from_bits(self.output_volume_bits.load(Ordering::SeqCst))
+    }
+
+    pub fn set_remote_volume(&self, volume: f32) {
+        let clamped = volume.clamp(0.0, 2.0);
+        self.remote_volume_bits
+            .store(clamped.to_bits(), Ordering::SeqCst);
+    }
+
+    pub fn remote_volume(&self) -> f32 {
+        f32::from_bits(self.remote_volume_bits.load(Ordering::SeqCst))
+    }
+
+    pub fn set_limiter_enabled(&self, enabled: bool) {
+        self.limiter_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn limiter_enabled(&self) -> bool {
+        self.limiter_enabled.load(Ordering::SeqCst)
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::SeqCst);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::SeqCst)
+    }
+
+    pub fn output_rms_shared(&self) -> Arc<AtomicU32> {
+        self.output_rms_bits.clone()
+    }
+
+    pub fn output_rms(&self) -> f32 {
+        f32::from_bits(self.output_rms_bits.load(Ordering::SeqCst))
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        self.run_token.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut queue) = self.sample_queue.lock() {
             queue.clear();
         }
+        self.output_rms_bits
+            .store(0.0f32.to_bits(), Ordering::SeqCst);
     }
 }
 
@@ -994,130 +1450,360 @@ fn next_i16_sample(queue: &mut VecDeque<i16>) -> i16 {
     queue.pop_front().unwrap_or(0)
 }
 
-fn fill_output_f32(data: &mut [f32], channels: usize, sample_queue: &Arc<Mutex<VecDeque<i16>>>) {
-    let mut queue = match sample_queue.lock() {
-        Ok(q) => q,
-        Err(_) => return,
-    };
-
-    if channels <= 1 {
-        for sample in data.iter_mut() {
-            *sample = next_i16_sample(&mut queue) as f32 / 32767.0;
-        }
-        return;
-    }
-
-    for frame in data.chunks_mut(channels) {
-        let value = next_i16_sample(&mut queue) as f32 / 32767.0;
-        for out in frame.iter_mut() {
-            *out = value;
-        }
-    }
+fn apply_limiter(sample: f32) -> f32 {
+    (sample * 1.6).tanh() / 1.6_f32.tanh()
 }
 
-fn fill_output_f64(data: &mut [f64], channels: usize, sample_queue: &Arc<Mutex<VecDeque<i16>>>) {
-    let mut queue = match sample_queue.lock() {
-        Ok(q) => q,
-        Err(_) => return,
-    };
-
-    if channels <= 1 {
-        for sample in data.iter_mut() {
-            *sample = next_i16_sample(&mut queue) as f64 / 32767.0;
-        }
-        return;
+fn playback_sample_from_queue(
+    queue: &mut VecDeque<i16>,
+    output_volume_bits: &Arc<AtomicU32>,
+    remote_volume_bits: &Arc<AtomicU32>,
+    limiter_enabled: &Arc<AtomicBool>,
+    muted: &Arc<AtomicBool>,
+) -> f32 {
+    if muted.load(Ordering::Relaxed) {
+        return 0.0;
     }
 
-    for frame in data.chunks_mut(channels) {
-        let value = next_i16_sample(&mut queue) as f64 / 32767.0;
-        for out in frame.iter_mut() {
-            *out = value;
-        }
+    let sample = next_i16_sample(queue) as f32 / 32767.0;
+    let output_volume = f32::from_bits(output_volume_bits.load(Ordering::Relaxed));
+    let remote_volume = f32::from_bits(remote_volume_bits.load(Ordering::Relaxed));
+    let mut out = sample * output_volume * remote_volume;
+    if limiter_enabled.load(Ordering::Relaxed) {
+        out = apply_limiter(out);
     }
+    out.clamp(-1.0, 1.0)
 }
 
-fn fill_output_i16(data: &mut [i16], channels: usize, sample_queue: &Arc<Mutex<VecDeque<i16>>>) {
-    let mut queue = match sample_queue.lock() {
-        Ok(q) => q,
-        Err(_) => return,
+fn store_output_rms(output_rms_bits: &Arc<AtomicU32>, squared_sum: f32, sample_count: usize) {
+    let rms = if sample_count == 0 {
+        0.0
+    } else {
+        (squared_sum / sample_count as f32).sqrt()
     };
-
-    if channels <= 1 {
-        for sample in data.iter_mut() {
-            *sample = next_i16_sample(&mut queue);
-        }
-        return;
-    }
-
-    for frame in data.chunks_mut(channels) {
-        let value = next_i16_sample(&mut queue);
-        for out in frame.iter_mut() {
-            *out = value;
-        }
-    }
+    output_rms_bits.store(rms.to_bits(), Ordering::Relaxed);
 }
 
-fn fill_output_i32(data: &mut [i32], channels: usize, sample_queue: &Arc<Mutex<VecDeque<i16>>>) {
+fn fill_output_f32(
+    data: &mut [f32],
+    channels: usize,
+    sample_queue: &Arc<Mutex<VecDeque<i16>>>,
+    output_volume_bits: &Arc<AtomicU32>,
+    remote_volume_bits: &Arc<AtomicU32>,
+    limiter_enabled: &Arc<AtomicBool>,
+    muted: &Arc<AtomicBool>,
+    output_rms_bits: &Arc<AtomicU32>,
+) {
     let mut queue = match sample_queue.lock() {
         Ok(q) => q,
         Err(_) => return,
     };
 
+    let mut sq_sum = 0.0f32;
+    let mut count = 0usize;
+
     if channels <= 1 {
         for sample in data.iter_mut() {
-            *sample = (next_i16_sample(&mut queue) as i32) << 16;
+            let value = playback_sample_from_queue(
+                &mut queue,
+                output_volume_bits,
+                remote_volume_bits,
+                limiter_enabled,
+                muted,
+            );
+            sq_sum += value * value;
+            count += 1;
+            *sample = value;
         }
+        store_output_rms(output_rms_bits, sq_sum, count);
         return;
     }
 
     for frame in data.chunks_mut(channels) {
-        let value = (next_i16_sample(&mut queue) as i32) << 16;
+        let value = playback_sample_from_queue(
+            &mut queue,
+            output_volume_bits,
+            remote_volume_bits,
+            limiter_enabled,
+            muted,
+        );
+        sq_sum += value * value;
+        count += 1;
         for out in frame.iter_mut() {
             *out = value;
         }
     }
+
+    store_output_rms(output_rms_bits, sq_sum, count);
 }
 
-fn fill_output_u16(data: &mut [u16], channels: usize, sample_queue: &Arc<Mutex<VecDeque<i16>>>) {
+fn fill_output_f64(
+    data: &mut [f64],
+    channels: usize,
+    sample_queue: &Arc<Mutex<VecDeque<i16>>>,
+    output_volume_bits: &Arc<AtomicU32>,
+    remote_volume_bits: &Arc<AtomicU32>,
+    limiter_enabled: &Arc<AtomicBool>,
+    muted: &Arc<AtomicBool>,
+    output_rms_bits: &Arc<AtomicU32>,
+) {
     let mut queue = match sample_queue.lock() {
         Ok(q) => q,
         Err(_) => return,
     };
 
+    let mut sq_sum = 0.0f32;
+    let mut count = 0usize;
+
     if channels <= 1 {
         for sample in data.iter_mut() {
-            *sample = (next_i16_sample(&mut queue) as i32 + 32768) as u16;
+            let value = playback_sample_from_queue(
+                &mut queue,
+                output_volume_bits,
+                remote_volume_bits,
+                limiter_enabled,
+                muted,
+            );
+            sq_sum += value * value;
+            count += 1;
+            *sample = value as f64;
         }
+        store_output_rms(output_rms_bits, sq_sum, count);
         return;
     }
 
     for frame in data.chunks_mut(channels) {
-        let value = (next_i16_sample(&mut queue) as i32 + 32768) as u16;
+        let value = playback_sample_from_queue(
+            &mut queue,
+            output_volume_bits,
+            remote_volume_bits,
+            limiter_enabled,
+            muted,
+        );
+        sq_sum += value * value;
+        count += 1;
         for out in frame.iter_mut() {
-            *out = value;
+            *out = value as f64;
         }
     }
+
+    store_output_rms(output_rms_bits, sq_sum, count);
 }
 
-fn fill_output_u32(data: &mut [u32], channels: usize, sample_queue: &Arc<Mutex<VecDeque<i16>>>) {
+fn fill_output_i16(
+    data: &mut [i16],
+    channels: usize,
+    sample_queue: &Arc<Mutex<VecDeque<i16>>>,
+    output_volume_bits: &Arc<AtomicU32>,
+    remote_volume_bits: &Arc<AtomicU32>,
+    limiter_enabled: &Arc<AtomicBool>,
+    muted: &Arc<AtomicBool>,
+    output_rms_bits: &Arc<AtomicU32>,
+) {
     let mut queue = match sample_queue.lock() {
         Ok(q) => q,
         Err(_) => return,
     };
 
+    let mut sq_sum = 0.0f32;
+    let mut count = 0usize;
+
     if channels <= 1 {
         for sample in data.iter_mut() {
-            *sample = ((next_i16_sample(&mut queue) as i32 + 32768) as u32) << 16;
+            let value = playback_sample_from_queue(
+                &mut queue,
+                output_volume_bits,
+                remote_volume_bits,
+                limiter_enabled,
+                muted,
+            );
+            sq_sum += value * value;
+            count += 1;
+            *sample = (value * 32767.0) as i16;
         }
+        store_output_rms(output_rms_bits, sq_sum, count);
         return;
     }
 
     for frame in data.chunks_mut(channels) {
-        let value = ((next_i16_sample(&mut queue) as i32 + 32768) as u32) << 16;
+        let value = playback_sample_from_queue(
+            &mut queue,
+            output_volume_bits,
+            remote_volume_bits,
+            limiter_enabled,
+            muted,
+        );
+        sq_sum += value * value;
+        count += 1;
+        let i16_val = (value * 32767.0) as i16;
         for out in frame.iter_mut() {
-            *out = value;
+            *out = i16_val;
         }
     }
+
+    store_output_rms(output_rms_bits, sq_sum, count);
+}
+
+fn fill_output_i32(
+    data: &mut [i32],
+    channels: usize,
+    sample_queue: &Arc<Mutex<VecDeque<i16>>>,
+    output_volume_bits: &Arc<AtomicU32>,
+    remote_volume_bits: &Arc<AtomicU32>,
+    limiter_enabled: &Arc<AtomicBool>,
+    muted: &Arc<AtomicBool>,
+    output_rms_bits: &Arc<AtomicU32>,
+) {
+    let mut queue = match sample_queue.lock() {
+        Ok(q) => q,
+        Err(_) => return,
+    };
+
+    let mut sq_sum = 0.0f32;
+    let mut count = 0usize;
+
+    if channels <= 1 {
+        for sample in data.iter_mut() {
+            let value = playback_sample_from_queue(
+                &mut queue,
+                output_volume_bits,
+                remote_volume_bits,
+                limiter_enabled,
+                muted,
+            );
+            sq_sum += value * value;
+            count += 1;
+            *sample = (value * 2_147_483_647.0) as i32;
+        }
+        store_output_rms(output_rms_bits, sq_sum, count);
+        return;
+    }
+
+    for frame in data.chunks_mut(channels) {
+        let value = playback_sample_from_queue(
+            &mut queue,
+            output_volume_bits,
+            remote_volume_bits,
+            limiter_enabled,
+            muted,
+        );
+        sq_sum += value * value;
+        count += 1;
+        let i32_val = (value * 2_147_483_647.0) as i32;
+        for out in frame.iter_mut() {
+            *out = i32_val;
+        }
+    }
+
+    store_output_rms(output_rms_bits, sq_sum, count);
+}
+
+fn fill_output_u16(
+    data: &mut [u16],
+    channels: usize,
+    sample_queue: &Arc<Mutex<VecDeque<i16>>>,
+    output_volume_bits: &Arc<AtomicU32>,
+    remote_volume_bits: &Arc<AtomicU32>,
+    limiter_enabled: &Arc<AtomicBool>,
+    muted: &Arc<AtomicBool>,
+    output_rms_bits: &Arc<AtomicU32>,
+) {
+    let mut queue = match sample_queue.lock() {
+        Ok(q) => q,
+        Err(_) => return,
+    };
+
+    let mut sq_sum = 0.0f32;
+    let mut count = 0usize;
+
+    if channels <= 1 {
+        for sample in data.iter_mut() {
+            let value = playback_sample_from_queue(
+                &mut queue,
+                output_volume_bits,
+                remote_volume_bits,
+                limiter_enabled,
+                muted,
+            );
+            sq_sum += value * value;
+            count += 1;
+            *sample = (((value * 0.5 + 0.5).clamp(0.0, 1.0)) * 65535.0) as u16;
+        }
+        store_output_rms(output_rms_bits, sq_sum, count);
+        return;
+    }
+
+    for frame in data.chunks_mut(channels) {
+        let value = playback_sample_from_queue(
+            &mut queue,
+            output_volume_bits,
+            remote_volume_bits,
+            limiter_enabled,
+            muted,
+        );
+        sq_sum += value * value;
+        count += 1;
+        let u16_val = (((value * 0.5 + 0.5).clamp(0.0, 1.0)) * 65535.0) as u16;
+        for out in frame.iter_mut() {
+            *out = u16_val;
+        }
+    }
+
+    store_output_rms(output_rms_bits, sq_sum, count);
+}
+
+fn fill_output_u32(
+    data: &mut [u32],
+    channels: usize,
+    sample_queue: &Arc<Mutex<VecDeque<i16>>>,
+    output_volume_bits: &Arc<AtomicU32>,
+    remote_volume_bits: &Arc<AtomicU32>,
+    limiter_enabled: &Arc<AtomicBool>,
+    muted: &Arc<AtomicBool>,
+    output_rms_bits: &Arc<AtomicU32>,
+) {
+    let mut queue = match sample_queue.lock() {
+        Ok(q) => q,
+        Err(_) => return,
+    };
+
+    let mut sq_sum = 0.0f32;
+    let mut count = 0usize;
+
+    if channels <= 1 {
+        for sample in data.iter_mut() {
+            let value = playback_sample_from_queue(
+                &mut queue,
+                output_volume_bits,
+                remote_volume_bits,
+                limiter_enabled,
+                muted,
+            );
+            sq_sum += value * value;
+            count += 1;
+            *sample = (((value * 0.5 + 0.5).clamp(0.0, 1.0)) * 4_294_967_295.0) as u32;
+        }
+        store_output_rms(output_rms_bits, sq_sum, count);
+        return;
+    }
+
+    for frame in data.chunks_mut(channels) {
+        let value = playback_sample_from_queue(
+            &mut queue,
+            output_volume_bits,
+            remote_volume_bits,
+            limiter_enabled,
+            muted,
+        );
+        sq_sum += value * value;
+        count += 1;
+        let u32_val = (((value * 0.5 + 0.5).clamp(0.0, 1.0)) * 4_294_967_295.0) as u32;
+        for out in frame.iter_mut() {
+            *out = u32_val;
+        }
+    }
+
+    store_output_rms(output_rms_bits, sq_sum, count);
 }
 
 /// Calculate RMS volume from samples (for VU meter)
@@ -1164,7 +1850,21 @@ mod tests {
     fn fill_output_duplicates_mono_to_stereo() {
         let queue = Arc::new(Mutex::new(VecDeque::from(vec![1000i16, -1000i16])));
         let mut out = vec![0.0f32; 4]; // 2 frames, 2 channels
-        fill_output_f32(&mut out, 2, &queue);
+        let output_volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let remote_volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let limiter = Arc::new(AtomicBool::new(false));
+        let muted = Arc::new(AtomicBool::new(false));
+        let output_rms = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+        fill_output_f32(
+            &mut out,
+            2,
+            &queue,
+            &output_volume,
+            &remote_volume,
+            &limiter,
+            &muted,
+            &output_rms,
+        );
 
         assert!((out[0] - out[1]).abs() < 1e-6);
         assert!((out[2] - out[3]).abs() < 1e-6);
@@ -1186,6 +1886,18 @@ mod tests {
         let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
         let (rms_tx, _rms_rx) = mpsc::unbounded_channel();
         let seq = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let controls = Arc::new(CaptureControls {
+            input_gain_bits: AtomicU32::new(1.0f32.to_bits()),
+            vad_threshold_bits: AtomicU32::new(0.01f32.to_bits()),
+            noise_gate_threshold_bits: AtomicU32::new(0.001f32.to_bits()),
+            voice_mode: AtomicU8::new(VOICE_MODE_VAD),
+            ptt_active: AtomicBool::new(true),
+            noise_suppression: AtomicBool::new(false),
+            aec_enabled: AtomicBool::new(false),
+            agc_enabled: AtomicBool::new(false),
+            noise_gate_enabled: AtomicBool::new(false),
+            shared_playback_rms_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+        });
         let mut state = CapturePipelineState::new();
 
         let input: Vec<f32> = (0..FRAME_SIZE)
@@ -1201,6 +1913,7 @@ mod tests {
             &sender_ctx,
             &seq,
             &packet_tx,
+            &controls,
             &mut state,
         );
 
