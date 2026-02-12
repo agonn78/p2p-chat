@@ -198,11 +198,69 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                     
                     // === WebRTC Signaling (forward to target) ===
-                    SignalingMessage::Offer { target_id, sdp: _ } |
-                    SignalingMessage::Answer { target_id, sdp: _ } |
-                    SignalingMessage::Candidate { target_id, .. } => {
+                    // Important: when forwarding, rewrite `target_id` to the sender id
+                    // so the receiver knows who to reply to.
+                    SignalingMessage::Offer { target_id, sdp } => {
+                        let from_id = match &my_id {
+                            Some(id) => id.clone(),
+                            None => {
+                                tracing::warn!("Received offer before identify");
+                                continue;
+                            }
+                        };
+
                         if let Some(peer_tx) = state.peers.get(&target_id) {
-                            let _ = peer_tx.send(Message::Text(text));
+                            let forwarded = SignalingMessage::Offer {
+                                target_id: from_id,
+                                sdp,
+                            };
+                            if let Ok(msg) = serde_json::to_string(&forwarded) {
+                                let _ = peer_tx.send(Message::Text(msg));
+                            }
+                        } else {
+                            tracing::warn!("Target peer {} not found", target_id);
+                        }
+                    }
+                    SignalingMessage::Answer { target_id, sdp } => {
+                        let from_id = match &my_id {
+                            Some(id) => id.clone(),
+                            None => {
+                                tracing::warn!("Received answer before identify");
+                                continue;
+                            }
+                        };
+
+                        if let Some(peer_tx) = state.peers.get(&target_id) {
+                            let forwarded = SignalingMessage::Answer {
+                                target_id: from_id,
+                                sdp,
+                            };
+                            if let Ok(msg) = serde_json::to_string(&forwarded) {
+                                let _ = peer_tx.send(Message::Text(msg));
+                            }
+                        } else {
+                            tracing::warn!("Target peer {} not found", target_id);
+                        }
+                    }
+                    SignalingMessage::Candidate { target_id, candidate, sdp_mid, sdp_m_line_index } => {
+                        let from_id = match &my_id {
+                            Some(id) => id.clone(),
+                            None => {
+                                tracing::warn!("Received candidate before identify");
+                                continue;
+                            }
+                        };
+
+                        if let Some(peer_tx) = state.peers.get(&target_id) {
+                            let forwarded = SignalingMessage::Candidate {
+                                target_id: from_id,
+                                candidate,
+                                sdp_mid,
+                                sdp_m_line_index,
+                            };
+                            if let Ok(msg) = serde_json::to_string(&forwarded) {
+                                let _ = peer_tx.send(Message::Text(msg));
+                            }
                         } else {
                             tracing::warn!("Target peer {} not found", target_id);
                         }

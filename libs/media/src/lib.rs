@@ -329,14 +329,11 @@ impl MediaEngine {
             .ok_or_else(|| anyhow::anyhow!("WebRTC not initialized"))?;
 
         let offer = pc.create_offer(None).await?;
-        pc.set_local_description(offer.clone()).await?;
+        pc.set_local_description(offer).await?;
 
-        // Block until ICE gathering is complete
-        let mut gather_complete = pc.gathering_complete_promise().await;
-        let _ = gather_complete.recv().await;
-
+        // Send the SDP immediately and rely on trickle ICE via on_ice_candidate.
         let local_desc = pc.local_description().await
-            .ok_or_else(|| anyhow::anyhow!("Failed to get local description after ICE gathering"))?;
+            .ok_or_else(|| anyhow::anyhow!("Failed to get local description"))?;
         
         Ok(serde_json::to_string(&local_desc)?)
     }
@@ -350,14 +347,11 @@ impl MediaEngine {
         pc.set_remote_description(offer).await?;
 
         let answer = pc.create_answer(None).await?;
-        pc.set_local_description(answer.clone()).await?;
+        pc.set_local_description(answer).await?;
 
-        // Block until ICE gathering is complete
-        let mut gather_complete = pc.gathering_complete_promise().await;
-        let _ = gather_complete.recv().await;
-
+        // Send the SDP immediately and rely on trickle ICE via on_ice_candidate.
         let local_desc = pc.local_description().await
-            .ok_or_else(|| anyhow::anyhow!("Failed to get local description after ICE gathering"))?;
+            .ok_or_else(|| anyhow::anyhow!("Failed to get local description"))?;
         
         Ok(serde_json::to_string(&local_desc)?)
     }
