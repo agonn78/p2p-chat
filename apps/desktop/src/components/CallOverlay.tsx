@@ -20,6 +20,7 @@ export function CallOverlay() {
     const [audioDevices, setAudioDevices] = useState<AudioDevice[]>([]);
     const [selectedDevice, setSelectedDevice] = useState<string>('');
     const [isLoadingDevices, setIsLoadingDevices] = useState(false);
+    const [isSwitchingDevice, setIsSwitchingDevice] = useState(false);
     const [vuLevel, setVuLevel] = useState(0);
 
     // Timer for call duration
@@ -68,14 +69,34 @@ export function CallOverlay() {
             const devices = await invoke<AudioDevice[]>('list_audio_devices');
             setAudioDevices(devices);
 
-            const defaultDevice = await invoke<AudioDevice>('get_default_audio_device');
-            if (!selectedDevice && devices.length > 0) {
-                setSelectedDevice(defaultDevice?.name || devices[0].id);
+            const selected = await invoke<AudioDevice | null>('get_selected_audio_device');
+            if (selected?.id && devices.some((d) => d.id === selected.id)) {
+                setSelectedDevice(selected.id);
+            } else {
+                const defaultDevice = await invoke<AudioDevice>('get_default_audio_device');
+                if (!selectedDevice && devices.length > 0) {
+                    setSelectedDevice(defaultDevice?.id || devices[0].id);
+                }
             }
         } catch (err) {
             console.error('Failed to load audio devices:', err);
         }
         setIsLoadingDevices(false);
+    };
+
+    const switchAudioDevice = async (nextDeviceId: string) => {
+        const previous = selectedDevice;
+        setSelectedDevice(nextDeviceId);
+        setIsSwitchingDevice(true);
+        try {
+            await invoke('set_audio_device', { deviceId: nextDeviceId });
+            console.log('[Audio] Switched device to:', nextDeviceId);
+        } catch (err) {
+            console.error('[Audio] Failed to switch device:', err);
+            setSelectedDevice(previous);
+        } finally {
+            setIsSwitchingDevice(false);
+        }
     };
 
     // Only show for calling, connecting, or connected states
@@ -181,14 +202,11 @@ export function CallOverlay() {
                     <div className="relative">
                         <select
                             value={selectedDevice}
-                            onChange={(e) => {
-                                setSelectedDevice(e.target.value);
-                                console.log('[Audio] Selected device:', e.target.value);
-                            }}
+                            onChange={(e) => void switchAudioDevice(e.target.value)}
                             className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-sm appearance-none cursor-pointer focus:outline-none focus:border-primary/50"
-                            disabled={isLoadingDevices}
+                            disabled={isLoadingDevices || isSwitchingDevice}
                         >
-                            {isLoadingDevices ? (
+                            {isLoadingDevices || isSwitchingDevice ? (
                                 <option>Loading...</option>
                             ) : audioDevices.length === 0 ? (
                                 <option>No devices found</option>
@@ -203,7 +221,7 @@ export function CallOverlay() {
                         <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
                     </div>
                     <div className="mt-2 text-xs text-gray-500">
-                        ⚠️ Device switching requires call restart
+                        {isSwitchingDevice ? 'Switching microphone...' : 'Device changes apply live during call'}
                     </div>
                 </div>
             )}

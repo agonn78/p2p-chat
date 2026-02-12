@@ -210,6 +210,24 @@ async fn get_default_audio_device() -> Result<AudioDevice, String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn get_selected_audio_device(state: State<'_, AppState>) -> Result<Option<AudioDevice>, String> {
+    let engine = state.media.lock().await;
+    Ok(engine
+        .selected_input_device()
+        .map(|name| AudioDevice { id: name.clone(), name }))
+}
+
+#[tauri::command]
+async fn set_audio_device(state: State<'_, AppState>, device_id: String) -> Result<(), String> {
+    let mut engine = state.media.lock().await;
+    engine
+        .set_input_device(Some(device_id.clone()))
+        .map_err(|e| format!("Failed to set audio device: {}", e))?;
+    println!("🔊 [AUDIO] Input device set to: {}", device_id);
+    Ok(())
+}
+
 #[derive(serde::Deserialize)]
 struct IceCandidatePayload {
     candidate: String,
@@ -375,10 +393,22 @@ async fn toggle_mute(state: State<'_, AppState>) -> Result<bool, String> {
 /// Start VU meter — emits `vu-level` events to the frontend
 #[tauri::command]
 async fn start_vu_meter(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let engine = state.media.lock().await;
-    let mut rms_rx = engine.take_rms_receiver()
-        .ok_or_else(|| "RMS receiver not available (already taken or no capture)".to_string())?;
-    drop(engine); // Release the lock before spawning
+    let mut rms_rx = None;
+    for _ in 0..20 {
+        {
+            let engine = state.media.lock().await;
+            rms_rx = engine.take_rms_receiver();
+        }
+
+        if rms_rx.is_some() {
+            break;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    let mut rms_rx = rms_rx
+        .ok_or_else(|| "RMS receiver not available (capture not started)".to_string())?;
 
     // Spawn a background task to forward RMS levels to the frontend
     tauri::async_runtime::spawn(async move {
@@ -450,6 +480,8 @@ fn main() {
             // Audio commands
             list_audio_devices,
             get_default_audio_device,
+            get_selected_audio_device,
+            set_audio_device,
             toggle_mute,
             start_vu_meter,
             start_call_audio,

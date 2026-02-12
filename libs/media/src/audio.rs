@@ -4,9 +4,10 @@ use audiopus::{
     coder::Decoder, coder::Encoder, packet::Packet, Application, Channels, MutSignals, SampleRate,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{SampleFormat, StreamConfig, SupportedStreamConfig};
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::thread;
@@ -16,6 +17,20 @@ use tokio::sync::mpsc;
 pub const SAMPLE_RATE: u32 = 48000;
 pub const CHANNELS: u16 = 1; // Mono
 pub const FRAME_SIZE: usize = 960; // 20ms at 48kHz
+
+struct CapturePipelineState {
+    sample_buffer: Vec<i16>,
+    resample_pos: f64,
+}
+
+impl CapturePipelineState {
+    fn new() -> Self {
+        Self {
+            sample_buffer: Vec::with_capacity(FRAME_SIZE * 3),
+            resample_pos: 0.0,
+        }
+    }
+}
 
 /// Opus encoder wrapper
 pub struct OpusEncoder {
@@ -90,6 +105,8 @@ pub struct AudioCapture {
     seq: Arc<std::sync::atomic::AtomicU32>,
     // Flag to signal the capture thread to stop
     running: Arc<AtomicBool>,
+    // Monotonic token used to invalidate old capture threads
+    run_token: Arc<AtomicU64>,
     // Mute flag - when true, send silence instead of mic data
     muted: Arc<AtomicBool>,
     // VU meter RMS emission
@@ -108,6 +125,7 @@ impl AudioCapture {
             packet_rx: Arc::new(Mutex::new(Some(packet_rx))),
             seq: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             running: Arc::new(AtomicBool::new(false)),
+            run_token: Arc::new(AtomicU64::new(0)),
             muted: Arc::new(AtomicBool::new(false)),
             rms_tx,
             rms_rx: Arc::new(Mutex::new(Some(rms_rx))),
@@ -138,9 +156,8 @@ impl AudioCapture {
 
     /// Start capture with a specific device by name, or default if None
     pub fn start_with_device(&self, device_name: Option<&str>) -> Result<()> {
-        // Prevent starting twice
         if self.running.swap(true, Ordering::SeqCst) {
-            return Ok(()); // Already running
+            return Ok(());
         }
 
         let encoder = self.encoder.clone();
@@ -148,100 +165,217 @@ impl AudioCapture {
         let packet_tx = self.packet_tx.clone();
         let seq = self.seq.clone();
         let running = self.running.clone();
+        let run_token = self.run_token.clone();
         let muted = self.muted.clone();
         let rms_tx = self.rms_tx.clone();
         let device_name_owned = device_name.map(|s| s.to_string());
+        let current_token = run_token.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
 
-        // Spawn audio capture in a dedicated thread (cpal::Stream is not Send)
         thread::spawn(move || {
             let host = cpal::default_host();
             let device = if let Some(ref name) = device_name_owned {
-                // Find device by name
                 match host.input_devices() {
-                    Ok(devices) => devices
-                        .into_iter()
-                        .find(|d| d.name().map(|n| n == *name).unwrap_or(false))
-                        .unwrap_or_else(|| {
-                            tracing::warn!("Device '{}' not found, using default", name);
-                            host.default_input_device().expect("No input device")
-                        }),
-                    Err(_) => host.default_input_device().expect("No input device"),
+                    Ok(devices) => {
+                        if let Some(device) = devices
+                            .into_iter()
+                            .find(|d| d.name().map(|n| n == *name).unwrap_or(false))
+                        {
+                            device
+                        } else {
+                            tracing::warn!("Input device '{}' not found, using default", name);
+                            match host.default_input_device() {
+                                Some(d) => d,
+                                None => {
+                                    tracing::error!("No input device available");
+                                    if run_token.load(Ordering::SeqCst) == current_token {
+                                        running.store(false, Ordering::SeqCst);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to enumerate input devices: {}", e);
+                        match host.default_input_device() {
+                            Some(d) => d,
+                            None => {
+                                tracing::error!("No input device available");
+                                if run_token.load(Ordering::SeqCst) == current_token {
+                                    running.store(false, Ordering::SeqCst);
+                                }
+                                return;
+                            }
+                        }
+                    }
                 }
             } else {
                 match host.default_input_device() {
                     Some(d) => d,
                     None => {
-                        tracing::error!("No input device");
+                        tracing::error!("No input device available");
+                        if run_token.load(Ordering::SeqCst) == current_token {
+                            running.store(false, Ordering::SeqCst);
+                        }
                         return;
                     }
                 }
             };
 
-            tracing::info!("Using input device: {:?}", device.name());
-
-            let config = cpal::StreamConfig {
-                channels: CHANNELS,
-                sample_rate: cpal::SampleRate(SAMPLE_RATE),
-                buffer_size: cpal::BufferSize::Fixed(FRAME_SIZE as u32),
+            let config = match pick_input_config(&device) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to pick input config: {}", e);
+                    if run_token.load(Ordering::SeqCst) == current_token {
+                        running.store(false, Ordering::SeqCst);
+                    }
+                    return;
+                }
             };
 
-            let sample_buffer = Arc::new(Mutex::new(Vec::with_capacity(FRAME_SIZE * 2)));
+            let sample_format = config.sample_format();
+            let stream_config: StreamConfig = config.into();
+            let input_channels = stream_config.channels as usize;
+            let input_rate = stream_config.sample_rate.0;
 
-            let stream = match device.build_input_stream(
-                &config,
-                move |data: &[f32], _info| {
-                    // Calculate RMS for VU meter (always, even when muted)
-                    let rms = calculate_rms(data);
-                    let _ = rms_tx.send(rms);
+            tracing::info!(
+                "Using input device '{}' ({:?}, {}ch @ {}Hz)",
+                device.name().unwrap_or_else(|_| "unknown".to_string()),
+                sample_format,
+                input_channels,
+                input_rate
+            );
 
-                    // If muted, use silence instead of real audio
-                    let samples: Vec<i16> = if muted.load(Ordering::Relaxed) {
-                        vec![0i16; data.len()]
-                    } else {
-                        data.iter().map(|&s| (s * 32767.0) as i16).collect()
-                    };
+            let pipeline_state = Arc::new(Mutex::new(CapturePipelineState::new()));
 
-                    let mut buffer = sample_buffer.lock().unwrap();
-                    buffer.extend_from_slice(&samples);
-
-                    // Process frames
-                    while buffer.len() >= FRAME_SIZE {
-                        let frame: Vec<i16> = buffer.drain(..FRAME_SIZE).collect();
-
-                        if let Ok(mut enc) = encoder.lock() {
-                            if let Ok(encoded) = enc.encode(&frame) {
-                                if let Ok(encrypted) = crypto.encrypt(&encoded) {
-                                    let sequence = seq.fetch_add(1, Ordering::SeqCst);
-                                    let packet = AudioPacket {
-                                        seq: sequence,
-                                        data: encrypted,
-                                    };
-                                    let _ = packet_tx.send(packet);
-                                }
+            let stream_result = match sample_format {
+                SampleFormat::F32 => {
+                    let encoder = encoder.clone();
+                    let crypto = crypto.clone();
+                    let packet_tx = packet_tx.clone();
+                    let seq = seq.clone();
+                    let muted = muted.clone();
+                    let rms_tx = rms_tx.clone();
+                    let pipeline_state = pipeline_state.clone();
+                    device.build_input_stream(
+                        &stream_config,
+                        move |data: &[f32], _info| {
+                            let mono = downmix_f32(data, input_channels);
+                            if let Ok(mut state) = pipeline_state.lock() {
+                                process_mono_samples(
+                                    &mono,
+                                    input_rate,
+                                    muted.load(Ordering::Relaxed),
+                                    &rms_tx,
+                                    &encoder,
+                                    &crypto,
+                                    &seq,
+                                    &packet_tx,
+                                    &mut state,
+                                );
                             }
-                        }
+                        },
+                        |err| tracing::error!("Capture stream error: {}", err),
+                        None,
+                    )
+                }
+                SampleFormat::I16 => {
+                    let encoder = encoder.clone();
+                    let crypto = crypto.clone();
+                    let packet_tx = packet_tx.clone();
+                    let seq = seq.clone();
+                    let muted = muted.clone();
+                    let rms_tx = rms_tx.clone();
+                    let pipeline_state = pipeline_state.clone();
+                    device.build_input_stream(
+                        &stream_config,
+                        move |data: &[i16], _info| {
+                            let mono = downmix_i16_to_f32(data, input_channels);
+                            if let Ok(mut state) = pipeline_state.lock() {
+                                process_mono_samples(
+                                    &mono,
+                                    input_rate,
+                                    muted.load(Ordering::Relaxed),
+                                    &rms_tx,
+                                    &encoder,
+                                    &crypto,
+                                    &seq,
+                                    &packet_tx,
+                                    &mut state,
+                                );
+                            }
+                        },
+                        |err| tracing::error!("Capture stream error: {}", err),
+                        None,
+                    )
+                }
+                SampleFormat::U16 => {
+                    let encoder = encoder.clone();
+                    let crypto = crypto.clone();
+                    let packet_tx = packet_tx.clone();
+                    let seq = seq.clone();
+                    let muted = muted.clone();
+                    let rms_tx = rms_tx.clone();
+                    let pipeline_state = pipeline_state.clone();
+                    device.build_input_stream(
+                        &stream_config,
+                        move |data: &[u16], _info| {
+                            let mono = downmix_u16_to_f32(data, input_channels);
+                            if let Ok(mut state) = pipeline_state.lock() {
+                                process_mono_samples(
+                                    &mono,
+                                    input_rate,
+                                    muted.load(Ordering::Relaxed),
+                                    &rms_tx,
+                                    &encoder,
+                                    &crypto,
+                                    &seq,
+                                    &packet_tx,
+                                    &mut state,
+                                );
+                            }
+                        },
+                        |err| tracing::error!("Capture stream error: {}", err),
+                        None,
+                    )
+                }
+                _ => {
+                    tracing::error!("Unsupported input sample format: {:?}", sample_format);
+                    if run_token.load(Ordering::SeqCst) == current_token {
+                        running.store(false, Ordering::SeqCst);
                     }
-                },
-                |err| tracing::error!("Capture stream error: {}", err),
-                None,
-            ) {
+                    return;
+                }
+            };
+
+            let stream = match stream_result {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("Failed to build input stream: {}", e);
+                    if run_token.load(Ordering::SeqCst) == current_token {
+                        running.store(false, Ordering::SeqCst);
+                    }
                     return;
                 }
             };
 
             if let Err(e) = stream.play() {
-                tracing::error!("Failed to play stream: {}", e);
+                tracing::error!("Failed to play input stream: {}", e);
+                if run_token.load(Ordering::SeqCst) == current_token {
+                    running.store(false, Ordering::SeqCst);
+                }
                 return;
             }
 
-            // Keep the thread alive while running is true
-            while running.load(Ordering::SeqCst) {
+            while running.load(Ordering::SeqCst)
+                && run_token.load(Ordering::SeqCst) == current_token
+            {
                 thread::sleep(std::time::Duration::from_millis(100));
             }
-            // Stream is dropped here, stopping capture
+
+            if run_token.load(Ordering::SeqCst) == current_token {
+                running.store(false, Ordering::SeqCst);
+            }
         });
 
         Ok(())
@@ -249,6 +383,157 @@ impl AudioCapture {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        self.run_token.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+}
+
+fn pick_input_config(device: &cpal::Device) -> Result<SupportedStreamConfig> {
+    let mut best_48k: Option<SupportedStreamConfig> = None;
+
+    if let Ok(configs) = device.supported_input_configs() {
+        for cfg in configs {
+            if cfg.min_sample_rate().0 <= SAMPLE_RATE && cfg.max_sample_rate().0 >= SAMPLE_RATE {
+                let candidate = cfg.with_sample_rate(cpal::SampleRate(SAMPLE_RATE));
+                let better = match &best_48k {
+                    None => true,
+                    Some(best) => {
+                        if candidate.channels() == CHANNELS {
+                            best.channels() != CHANNELS
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if better {
+                    best_48k = Some(candidate);
+                }
+            }
+        }
+    }
+
+    if let Some(cfg) = best_48k {
+        return Ok(cfg);
+    }
+
+    device
+        .default_input_config()
+        .map_err(|e| anyhow::anyhow!("No usable input config: {}", e))
+}
+
+fn downmix_f32(input: &[f32], channels: usize) -> Vec<f32> {
+    if channels <= 1 {
+        return input.to_vec();
+    }
+
+    input
+        .chunks_exact(channels)
+        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .collect()
+}
+
+fn downmix_i16_to_f32(input: &[i16], channels: usize) -> Vec<f32> {
+    if channels <= 1 {
+        return input.iter().map(|&s| s as f32 / 32768.0).collect();
+    }
+
+    input
+        .chunks_exact(channels)
+        .map(|frame| {
+            let sum: f32 = frame.iter().map(|&s| s as f32 / 32768.0).sum();
+            sum / channels as f32
+        })
+        .collect()
+}
+
+fn downmix_u16_to_f32(input: &[u16], channels: usize) -> Vec<f32> {
+    if channels <= 1 {
+        return input
+            .iter()
+            .map(|&s| (s as f32 / 65535.0) * 2.0 - 1.0)
+            .collect();
+    }
+
+    input
+        .chunks_exact(channels)
+        .map(|frame| {
+            let sum: f32 = frame
+                .iter()
+                .map(|&s| (s as f32 / 65535.0) * 2.0 - 1.0)
+                .sum();
+            sum / channels as f32
+        })
+        .collect()
+}
+
+fn resample_to_48k(input: &[f32], input_rate: u32, pos: &mut f64) -> Vec<f32> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+    if input_rate == SAMPLE_RATE {
+        return input.to_vec();
+    }
+
+    let step = input_rate as f64 / SAMPLE_RATE as f64;
+    let mut out = Vec::with_capacity(
+        ((input.len() as u64 * SAMPLE_RATE as u64) / input_rate as u64 + 2) as usize,
+    );
+
+    while *pos < input.len() as f64 {
+        let idx = (*pos).floor() as usize;
+        out.push(input[idx]);
+        *pos += step;
+    }
+
+    *pos -= input.len() as f64;
+    out
+}
+
+fn process_mono_samples(
+    mono_samples: &[f32],
+    input_rate: u32,
+    muted: bool,
+    rms_tx: &mpsc::UnboundedSender<f32>,
+    encoder: &Arc<Mutex<OpusEncoder>>,
+    crypto: &Arc<CryptoContext>,
+    seq: &Arc<std::sync::atomic::AtomicU32>,
+    packet_tx: &mpsc::UnboundedSender<AudioPacket>,
+    state: &mut CapturePipelineState,
+) {
+    let rms = calculate_rms(mono_samples);
+    let _ = rms_tx.send(rms);
+
+    let resampled = resample_to_48k(mono_samples, input_rate, &mut state.resample_pos);
+    if resampled.is_empty() {
+        return;
+    }
+
+    if muted {
+        state.sample_buffer.extend(vec![0i16; resampled.len()]);
+    } else {
+        state.sample_buffer.extend(resampled.into_iter().map(|s| {
+            let clamped = s.clamp(-1.0, 1.0);
+            (clamped * 32767.0) as i16
+        }));
+    }
+
+    while state.sample_buffer.len() >= FRAME_SIZE {
+        let frame: Vec<i16> = state.sample_buffer.drain(..FRAME_SIZE).collect();
+        if let Ok(mut enc) = encoder.lock() {
+            if let Ok(encoded) = enc.encode(&frame) {
+                if let Ok(encrypted) = crypto.encrypt(&encoded) {
+                    let sequence = seq.fetch_add(1, Ordering::SeqCst);
+                    let packet = AudioPacket {
+                        seq: sequence,
+                        data: encrypted,
+                    };
+                    let _ = packet_tx.send(packet);
+                }
+            }
+        }
     }
 }
 

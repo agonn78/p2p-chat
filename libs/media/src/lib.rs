@@ -41,6 +41,8 @@ pub struct MediaEngine {
     // Audio components
     audio_capture: Option<Arc<AudioCapture>>,
     audio_playback: Option<Arc<AudioPlayback>>,
+    // Preferred input device name chosen by user
+    selected_input_device: Option<String>,
     /// Track whether playback stream has been started
     playback_started: Arc<AtomicBool>,
 }
@@ -59,6 +61,7 @@ impl MediaEngine {
             rtc_connection: None,
             audio_capture: None,
             audio_playback: None,
+            selected_input_device: None,
             playback_started: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -164,6 +167,35 @@ impl MediaEngine {
         device.name().map_err(|e| anyhow::anyhow!(e))
     }
 
+    /// Return currently selected input device (if set by user)
+    pub fn selected_input_device(&self) -> Option<String> {
+        self.selected_input_device.clone()
+    }
+
+    /// Set preferred input device and hot-switch capture if already running
+    pub fn set_input_device(&mut self, device_name: Option<String>) -> Result<()> {
+        let normalized = device_name
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty());
+
+        self.selected_input_device = normalized;
+
+        if let Some(capture) = &self.audio_capture {
+            let was_running = capture.is_running();
+            if was_running {
+                capture.stop();
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                capture.start_with_device(self.selected_input_device.as_deref())?;
+                tracing::info!(
+                    "Input device switched to {:?}",
+                    self.selected_input_device.as_deref().unwrap_or("default")
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     // === WebRTC Implementation ===
 
     /// Initialize WebRTC PeerConnection
@@ -221,15 +253,18 @@ impl MediaEngine {
 
             // Clone for on_data_channel closures
             let playback_started_clone = self.playback_started.clone();
+            let preferred_input_device = self.selected_input_device.clone();
 
             // Handle incoming DataChannel (Answerer side receives channel created by Offerer)
             let playback_clone = playback.clone();
             let capture_clone = capture.clone();
+            let preferred_input_device_clone = preferred_input_device.clone();
             
             pc.on_data_channel(Box::new(move |d_channel: Arc<RTCDataChannel>| {
                 let playback = playback_clone.clone();
                 let capture = capture_clone.clone();
                 let playback_started = playback_started_clone.clone();
+                let preferred_input_device = preferred_input_device_clone.clone();
                 
                 Box::pin(async move {
                     tracing::info!("New DataChannel {} {}", d_channel.label(), d_channel.id());
@@ -237,12 +272,14 @@ impl MediaEngine {
                     let d_channel_clone = d_channel.clone();
                     let playback_for_open = playback.clone();
                     let ps_for_open = playback_started.clone();
+                    let preferred_input_for_open = preferred_input_device.clone();
                     d_channel.on_open(Box::new(move || {
                         tracing::info!("Data channel opened (Answerer)");
                         let dc = d_channel_clone.clone();
                         let capture = capture.clone();
                         let playback = playback_for_open.clone();
                         let ps = ps_for_open.clone();
+                        let preferred_input = preferred_input_for_open.clone();
                         Box::pin(async move {
                             // Start playback stream once
                             if !ps.swap(true, Ordering::SeqCst) {
@@ -253,7 +290,7 @@ impl MediaEngine {
                             }
                             
                             // Start capture
-                            if let Err(e) = capture.start() {
+                            if let Err(e) = capture.start_with_device(preferred_input.as_deref()) {
                                 tracing::error!("Failed to start capture: {}", e);
                             }
                             
@@ -360,6 +397,7 @@ impl MediaEngine {
             .ok_or_else(|| anyhow::anyhow!("Audio capture not initialized"))?;
         let audio_playback = self.audio_playback.clone()
             .ok_or_else(|| anyhow::anyhow!("Audio playback not initialized"))?;
+        let preferred_input_device = self.selected_input_device.clone();
 
         // Handle incoming messages on this channel too (Answerer audio)
         let playback_clone = audio_playback.clone();
@@ -374,12 +412,14 @@ impl MediaEngine {
 
         let dc_clone = dc.clone();
         let playback_started = self.playback_started.clone();
+        let preferred_input_for_open = preferred_input_device.clone();
         dc.on_open(Box::new(move || {
             tracing::info!("DataChannel 'audio' opened (Offerer)");
             let dc = dc_clone.clone();
             let capture = audio_capture.clone();
             let playback = audio_playback.clone();
             let ps = playback_started.clone();
+            let preferred_input = preferred_input_for_open.clone();
             
             Box::pin(async move {
                 // Start playback stream once (Offerer side)
@@ -391,7 +431,7 @@ impl MediaEngine {
                 }
 
                 // Start capture stream locally
-                if let Err(e) = capture.start() {
+                if let Err(e) = capture.start_with_device(preferred_input.as_deref()) {
                     tracing::error!("Failed to start capture: {}", e);
                     return;
                 }
