@@ -97,6 +97,7 @@ function App() {
         if (isAuthenticated) {
             fetchFriends();
             fetchServers();
+            invoke<number>('api_drain_outbox', { limit: 200 }).catch(() => undefined);
         }
     }, [isAuthenticated, fetchFriends, fetchServers]);
 
@@ -203,6 +204,15 @@ function App() {
                         } catch (err) {
                             console.error('[App] Failed to re-identify after reconnect:', err);
                         }
+                    }
+
+                    try {
+                        const retried = await invoke<number>('api_drain_outbox', { limit: 200 });
+                        if (retried > 0) {
+                            console.log(`[App] 🔁 Drained ${retried} queued messages after reconnect`);
+                        }
+                    } catch (err) {
+                        console.warn('[App] Failed to drain outbox after reconnect:', err);
                     }
                 });
 

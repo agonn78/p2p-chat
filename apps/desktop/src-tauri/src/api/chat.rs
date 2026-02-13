@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use crate::api::ApiState;
+use crate::api::servers::ChannelMessage;
 use crate::messaging::domain::{ConversationKind, MessageStatus as LocalMessageStatus, PersistedMessage};
 use crate::MessagingState;
 use chrono::Utc;
@@ -302,6 +303,201 @@ pub async fn api_send_message(
     }
 
     Ok(message)
+}
+
+#[tauri::command]
+pub async fn api_drain_outbox(
+    state: State<'_, ApiState>,
+    messaging: State<'_, MessagingState>,
+    limit: Option<i64>,
+) -> Result<u32, String> {
+    let token = state
+        .get_token()
+        .await
+        .ok_or("Not authenticated")?;
+
+    let limit = limit.unwrap_or(200).clamp(1, 1000);
+    let outbox_items = messaging
+        .service
+        .list_outbox(limit)
+        .await
+        .map_err(|e| format!("Failed to list outbox: {}", e))?;
+
+    let mut delivered = 0u32;
+
+    for item in outbox_items {
+        match item.target_kind {
+            ConversationKind::Dm => {
+                let url = format!("{}/chat/{}/messages", state.base_url, item.target_id);
+
+                let response = state
+                    .client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .json(&SendMessageRequest {
+                        content: item.content.clone(),
+                        nonce: item.nonce.clone(),
+                        client_id: Some(item.client_id.clone()),
+                    })
+                    .send()
+                    .await;
+
+                match response {
+                    Ok(res) if res.status().is_success() => {
+                        let mut message: Message = match res.json().await {
+                            Ok(message) => message,
+                            Err(err) => {
+                                let reason = format!("Failed to parse DM retry response: {}", err);
+                                let _ = messaging
+                                    .service
+                                    .mark_send_failed(&item.client_id, &reason)
+                                    .await;
+                                continue;
+                            }
+                        };
+
+                        if message.client_id.is_none() {
+                            message.client_id = Some(item.client_id.clone());
+                        }
+                        if message.status.is_none() {
+                            message.status = Some("sent".to_string());
+                        }
+
+                        if let Err(err) = messaging
+                            .service
+                            .mark_send_success(
+                                ConversationKind::Dm,
+                                &item.target_id,
+                                message.id.clone(),
+                                message.client_id.clone(),
+                                message.sender_id.clone(),
+                                None,
+                                message.content.clone(),
+                                message.nonce.clone(),
+                                message
+                                    .created_at
+                                    .clone()
+                                    .unwrap_or_else(|| Utc::now().to_rfc3339()),
+                                message.edited_at.clone(),
+                                parse_local_status(message.status.as_deref()),
+                            )
+                            .await
+                        {
+                            eprintln!("[Messaging] Failed to persist retried DM message: {}", err);
+                        } else {
+                            delivered += 1;
+                        }
+                    }
+                    Ok(res) => {
+                        let text = res.text().await.unwrap_or_default();
+                        let _ = messaging
+                            .service
+                            .mark_send_failed(&item.client_id, &text)
+                            .await;
+                    }
+                    Err(err) => {
+                        let reason = format!("Network error: {}", err);
+                        let _ = messaging
+                            .service
+                            .mark_send_failed(&item.client_id, &reason)
+                            .await;
+                        break;
+                    }
+                }
+            }
+            ConversationKind::Channel => {
+                let Some(server_id) = item.server_scope_id.clone() else {
+                    let _ = messaging
+                        .service
+                        .mark_send_failed(&item.client_id, "Missing server_scope_id for channel outbox message")
+                        .await;
+                    continue;
+                };
+
+                let url = format!(
+                    "{}/servers/{}/channels/{}/messages",
+                    state.base_url, server_id, item.target_id
+                );
+
+                let response = state
+                    .client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .json(&serde_json::json!({
+                        "content": item.content.clone(),
+                        "nonce": item.nonce.clone(),
+                        "client_id": item.client_id.clone(),
+                    }))
+                    .send()
+                    .await;
+
+                match response {
+                    Ok(res) if res.status().is_success() => {
+                        let mut message: ChannelMessage = match res.json().await {
+                            Ok(message) => message,
+                            Err(err) => {
+                                let reason = format!("Failed to parse channel retry response: {}", err);
+                                let _ = messaging
+                                    .service
+                                    .mark_send_failed(&item.client_id, &reason)
+                                    .await;
+                                continue;
+                            }
+                        };
+
+                        if message.client_id.is_none() {
+                            message.client_id = Some(item.client_id.clone());
+                        }
+                        if message.status.is_none() {
+                            message.status = Some("sent".to_string());
+                        }
+
+                        if let Err(err) = messaging
+                            .service
+                            .mark_send_success(
+                                ConversationKind::Channel,
+                                &item.target_id,
+                                message.id.clone(),
+                                message.client_id.clone(),
+                                message.sender_id.clone(),
+                                message.sender_username.clone(),
+                                message.content.clone(),
+                                message.nonce.clone(),
+                                message
+                                    .created_at
+                                    .clone()
+                                    .unwrap_or_else(|| Utc::now().to_rfc3339()),
+                                message.edited_at.clone(),
+                                parse_local_status(message.status.as_deref()),
+                            )
+                            .await
+                        {
+                            eprintln!("[Messaging] Failed to persist retried channel message: {}", err);
+                        } else {
+                            delivered += 1;
+                        }
+                    }
+                    Ok(res) => {
+                        let text = res.text().await.unwrap_or_default();
+                        let _ = messaging
+                            .service
+                            .mark_send_failed(&item.client_id, &text)
+                            .await;
+                    }
+                    Err(err) => {
+                        let reason = format!("Network error: {}", err);
+                        let _ = messaging
+                            .service
+                            .mark_send_failed(&item.client_id, &reason)
+                            .await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(delivered)
 }
 
 #[tauri::command]
