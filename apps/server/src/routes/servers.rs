@@ -4,6 +4,7 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use axum::extract::ws::Message as WsMessage;
@@ -19,6 +20,9 @@ pub fn router() -> Router<AppState> {
         .route("/:id/members", get(get_members))
         .route("/:id/channels", post(create_channel))
         .route("/:id/channels/:channel_id/typing", post(send_channel_typing))
+        .route("/:id/channels/:channel_id/voice", get(get_voice_channel_presence))
+        .route("/:id/channels/:channel_id/voice/join", post(join_voice_channel))
+        .route("/:id/channels/:channel_id/voice/leave", post(leave_voice_channel))
         .route("/:id/channels/:channel_id/messages", get(get_channel_messages).post(send_channel_message))
         .route("/:id/channels/:channel_id/messages/:message_id", put(edit_channel_message))
         .route("/join/:code", post(join_server))
@@ -73,6 +77,46 @@ pub struct ServerWithChannels {
     #[serde(flatten)]
     pub server: Server,
     pub channels: Vec<Channel>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct VoiceChannelParticipant {
+    pub user_id: Uuid,
+    pub username: String,
+    pub joined_at: DateTime<Utc>,
+}
+
+async fn broadcast_voice_presence(
+    state: &AppState,
+    server_id: Uuid,
+    channel_id: Uuid,
+    user_id: Uuid,
+    joined: bool,
+) -> Result<(), StatusCode> {
+    let members = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM server_members WHERE server_id = $1"
+    )
+    .bind(server_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let ws_payload = serde_json::json!({
+        "type": "VOICE_PRESENCE",
+        "server_id": server_id,
+        "channel_id": channel_id,
+        "user_id": user_id,
+        "joined": joined,
+    });
+    let ws_text = serde_json::to_string(&ws_payload).unwrap();
+
+    for member_id in members {
+        if let Some(peer_tx) = state.peers.get(&member_id.to_string()) {
+            let _ = peer_tx.send(WsMessage::Text(ws_text.clone()));
+        }
+    }
+
+    Ok(())
 }
 
 // === Handlers ===
@@ -306,6 +350,29 @@ async fn leave_server(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    // If user is currently in a voice channel for this server, remove and broadcast leave.
+    let active_voice_channels = sqlx::query_scalar::<_, Uuid>(
+        "SELECT channel_id FROM voice_channel_sessions WHERE server_id = $1 AND user_id = $2"
+    )
+    .bind(id)
+    .bind(user.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !active_voice_channels.is_empty() {
+        sqlx::query("DELETE FROM voice_channel_sessions WHERE server_id = $1 AND user_id = $2")
+            .bind(id)
+            .bind(user.id)
+            .execute(&state.db)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        for channel_id in active_voice_channels {
+            let _ = broadcast_voice_presence(&state, id, channel_id, user.id, false).await;
+        }
+    }
+
     sqlx::query("DELETE FROM server_members WHERE server_id = $1 AND user_id = $2")
         .bind(id)
         .bind(user.id)
@@ -369,6 +436,147 @@ async fn create_channel(
     })?;
 
     Ok(Json(channel))
+}
+
+/// List users currently connected to a voice channel.
+async fn get_voice_channel_presence(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((server_id, channel_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Vec<VoiceChannelParticipant>>, StatusCode> {
+    let is_member = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM server_members WHERE server_id = $1 AND user_id = $2"
+    )
+    .bind(server_id)
+    .bind(user.id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0) > 0;
+
+    if !is_member {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let is_voice = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM channels WHERE id = $1 AND server_id = $2 AND channel_type = 'voice'"
+    )
+    .bind(channel_id)
+    .bind(server_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0) > 0;
+
+    if !is_voice {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let participants = sqlx::query_as::<_, VoiceChannelParticipant>(
+        r#"
+        SELECT vcs.user_id, u.username, vcs.joined_at
+        FROM voice_channel_sessions vcs
+        INNER JOIN users u ON u.id = vcs.user_id
+        WHERE vcs.server_id = $1 AND vcs.channel_id = $2
+        ORDER BY vcs.joined_at ASC
+        "#,
+    )
+    .bind(server_id)
+    .bind(channel_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(participants))
+}
+
+/// Join (or move to) a voice channel.
+async fn join_voice_channel(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((server_id, channel_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, StatusCode> {
+    let is_member = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM server_members WHERE server_id = $1 AND user_id = $2"
+    )
+    .bind(server_id)
+    .bind(user.id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0) > 0;
+
+    if !is_member {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let is_voice = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM channels WHERE id = $1 AND server_id = $2 AND channel_type = 'voice'"
+    )
+    .bind(channel_id)
+    .bind(server_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0) > 0;
+
+    if !is_voice {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let previous = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT server_id, channel_id FROM voice_channel_sessions WHERE user_id = $1"
+    )
+    .bind(user.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO voice_channel_sessions (channel_id, server_id, user_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (user_id)
+        DO UPDATE SET
+            channel_id = EXCLUDED.channel_id,
+            server_id = EXCLUDED.server_id,
+            joined_at = NOW()
+        "#,
+    )
+    .bind(channel_id)
+    .bind(server_id)
+    .bind(user.id)
+    .execute(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if let Some((prev_server_id, prev_channel_id)) = previous {
+        if prev_server_id != server_id || prev_channel_id != channel_id {
+            let _ = broadcast_voice_presence(&state, prev_server_id, prev_channel_id, user.id, false).await;
+        }
+    }
+
+    let _ = broadcast_voice_presence(&state, server_id, channel_id, user.id, true).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Leave a voice channel.
+async fn leave_voice_channel(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((server_id, channel_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, StatusCode> {
+    let result = sqlx::query(
+        "DELETE FROM voice_channel_sessions WHERE server_id = $1 AND channel_id = $2 AND user_id = $3"
+    )
+    .bind(server_id)
+    .bind(channel_id)
+    .bind(user.id)
+    .execute(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if result.rows_affected() > 0 {
+        let _ = broadcast_voice_presence(&state, server_id, channel_id, user.id, false).await;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Get channel messages

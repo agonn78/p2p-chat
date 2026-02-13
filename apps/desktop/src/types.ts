@@ -98,6 +98,12 @@ export interface ServerMember {
     last_seen: string | null;
 }
 
+export interface VoiceChannelParticipant {
+    user_id: string;
+    username: string;
+    joined_at?: string | null;
+}
+
 export interface ChannelMessage {
     id: string;
     client_id?: string | null;

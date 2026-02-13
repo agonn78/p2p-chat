@@ -7,7 +7,7 @@ mod messaging;
 mod signaling;
 
 use tauri::{State, Manager, Emitter};
-use media::{MediaEngine, AudioSettings};
+use media::{AudioSettings, IceServerConfig, MediaEngine};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use signaling::WsSender;
@@ -25,10 +25,70 @@ pub struct MessagingState {
     pub service: MessagingService,
 }
 
+fn parse_csv_env(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn load_ice_servers_from_env() -> Vec<IceServerConfig> {
+    if let Ok(raw_json) = std::env::var("ICE_SERVERS_JSON") {
+        if let Ok(parsed) = serde_json::from_str::<Vec<IceServerConfig>>(&raw_json) {
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+        eprintln!("[ICE] Failed to parse ICE_SERVERS_JSON, falling back to STUN/TURN vars");
+    }
+
+    let mut servers: Vec<IceServerConfig> = Vec::new();
+
+    let mut stun_urls = parse_csv_env("STUN_URLS");
+    if stun_urls.is_empty() {
+        stun_urls.push("stun:stun.l.google.com:19302".to_string());
+    }
+    servers.push(IceServerConfig {
+        urls: stun_urls,
+        username: None,
+        credential: None,
+    });
+
+    let turn_urls = parse_csv_env("TURN_URLS");
+    if !turn_urls.is_empty() {
+        let username = std::env::var("TURN_USERNAME").ok().filter(|v| !v.trim().is_empty());
+        let credential = std::env::var("TURN_PASSWORD")
+            .or_else(|_| std::env::var("TURN_CREDENTIAL"))
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+
+        servers.push(IceServerConfig {
+            urls: turn_urls,
+            username,
+            credential,
+        });
+    }
+
+    servers
+}
+
 #[tauri::command]
-async fn identify_user(state: State<'_, AppState>, user_id: String) -> Result<(), String> {
+async fn identify_user(
+    state: State<'_, AppState>,
+    api_state: State<'_, ApiState>,
+    user_id: String,
+) -> Result<(), String> {
     println!("Identifying user: {}", user_id);
-    signaling::send_identify(&state.ws_sender, &user_id).await?;
+    let token = api_state
+        .get_token()
+        .await
+        .ok_or("Not authenticated")?;
+    signaling::send_identify(&state.ws_sender, &user_id, &token).await?;
     Ok(())
 }
 
@@ -179,6 +239,14 @@ async fn cancel_call(state: State<'_, AppState>, target_id: String) -> Result<()
     
     let msg = SignalingMessage::CallCancel { target_id };
     signaling::send_signal(&state.ws_sender, msg).await
+}
+
+/// Reset local call media state without sending signaling
+#[tauri::command]
+async fn reset_call_media(state: State<'_, AppState>) -> Result<(), String> {
+    let mut engine = state.media.lock().await;
+    engine.reset().await;
+    Ok(())
 }
 
 // === Audio Commands ===
@@ -523,11 +591,22 @@ fn main() {
             
             // Connect to signaling server (without identifying yet)
             tauri::async_runtime::spawn(async move {
+                let ice_servers = load_ice_servers_from_env();
+
+                let configured_urls = ice_servers
+                    .iter()
+                    .flat_map(|s| s.urls.iter().cloned())
+                    .collect::<Vec<_>>();
+                println!("[ICE] Configured ICE servers: {:?}", configured_urls);
+
                 match signaling::connect(config::SERVER_URL, app_handle.clone()).await {
                     Ok(sender) => {
+                        let mut media_engine = MediaEngine::new();
+                        media_engine.set_ice_servers(ice_servers.clone());
+
                         // Store the sender in app state
                         let state = AppState {
-                            media: Arc::new(Mutex::new(MediaEngine::new())),
+                            media: Arc::new(Mutex::new(media_engine)),
                             ws_sender: sender,
                         };
                         app_handle.manage(state);
@@ -536,9 +615,13 @@ fn main() {
                     Err(e) => {
                         eprintln!("Warning: Could not connect to signaling server: {}", e);
                         eprintln!("Server URL: {}", config::SERVER_URL);
+
+                        let mut media_engine = MediaEngine::new();
+                        media_engine.set_ice_servers(ice_servers.clone());
+
                         // Manage with empty sender
                         let state = AppState {
-                            media: Arc::new(Mutex::new(MediaEngine::new())),
+                            media: Arc::new(Mutex::new(media_engine)),
                             ws_sender: Arc::new(Mutex::new(None)),
                         };
                         app_handle.manage(state);
@@ -559,6 +642,7 @@ fn main() {
             decline_call,
             end_call,
             cancel_call,
+            reset_call_media,
             // Audio commands
             list_audio_devices,
             get_default_audio_device,
@@ -612,6 +696,9 @@ fn main() {
             api::servers::api_fetch_channel_messages,
             api::servers::api_send_channel_message,
             api::servers::api_send_channel_typing,
+            api::servers::api_fetch_voice_channel_presence,
+            api::servers::api_join_voice_channel,
+            api::servers::api_leave_voice_channel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,7 +1,20 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { invoke } from '@tauri-apps/api/core';
-import type { User, Friend, Room, CallState, Message, Server, Channel, ServerMember, ChannelMessage, IncomingCallPayload, CallAcceptedPayload } from './types';
+import type {
+    User,
+    Friend,
+    Room,
+    CallState,
+    Message,
+    Server,
+    Channel,
+    ServerMember,
+    ChannelMessage,
+    IncomingCallPayload,
+    CallAcceptedPayload,
+    VoiceChannelParticipant,
+} from './types';
 import * as crypto from './crypto';
 
 // Note: All HTTP API calls now go through Rust Tauri commands (no CORS issues)
@@ -73,6 +86,8 @@ interface AppState {
     channelMessages: ChannelMessage[];
     hasMoreChannelMessages: boolean;
     isLoadingMoreChannelMessages: boolean;
+    voicePresenceByChannel: Record<string, string[]>;
+    activeVoiceChannel: string | null;
 
     // Actions
     login: (email: string, password: string) => Promise<void>;
@@ -129,6 +144,10 @@ interface AppState {
     fetchChannelMessages: (serverId: string, channelId: string, options?: { before?: string; append?: boolean; limit?: number }) => Promise<void>;
     loadOlderChannelMessages: () => Promise<void>;
     sendChannelMessage: (serverId: string, channelId: string, content: string) => Promise<void>;
+    setVoicePresence: (channelId: string, userId: string, joined: boolean) => void;
+    fetchVoiceChannelPresence: (serverId: string, channelId: string) => Promise<void>;
+    joinVoiceChannel: (serverId: string, channelId: string) => Promise<void>;
+    leaveVoiceChannel: (serverId: string, channelId?: string) => Promise<void>;
 }
 
 export const useAppStore = create<AppState>()(
@@ -165,6 +184,8 @@ export const useAppStore = create<AppState>()(
             channelMessages: [],
             hasMoreChannelMessages: true,
             isLoadingMoreChannelMessages: false,
+            voicePresenceByChannel: {},
+            activeVoiceChannel: null,
 
             // Connection Actions
             setWsConnected: (connected) => {
@@ -220,6 +241,14 @@ export const useAppStore = create<AppState>()(
             },
 
             logout: () => {
+                const { activeServer, activeVoiceChannel } = get();
+                if (activeServer && activeVoiceChannel) {
+                    invoke('api_leave_voice_channel', {
+                        serverId: activeServer,
+                        channelId: activeVoiceChannel,
+                    }).catch(() => undefined);
+                }
+
                 crypto.clearSecretCache();
                 // Also logout from Rust API state
                 invoke('api_logout').catch(console.error);
@@ -239,6 +268,8 @@ export const useAppStore = create<AppState>()(
                     channelMessages: [],
                     hasMoreChannelMessages: true,
                     isLoadingMoreChannelMessages: false,
+                    voicePresenceByChannel: {},
+                    activeVoiceChannel: null,
                     typingByRoom: {},
                     typingByChannel: {},
                     wsConnected: false,
@@ -817,6 +848,7 @@ export const useAppStore = create<AppState>()(
                     console.log('[CALL-DEBUG] Call initiated, waiting for acceptance...');
                 } catch (e) {
                     console.error('[CALL-DEBUG] ❌ Failed to start call:', e);
+                    invoke('reset_call_media').catch(() => undefined);
                     set({ activeCall: null });
                 }
             },
@@ -868,6 +900,7 @@ export const useAppStore = create<AppState>()(
                     // Audio setup and connected state are completed when WebRTC offer is handled.
                 } catch (e) {
                     console.error('[CALL-DEBUG] Callee: ❌ Failed to accept call:', e);
+                    invoke('reset_call_media').catch(() => undefined);
                     set({ activeCall: null });
                 }
             },
@@ -881,6 +914,7 @@ export const useAppStore = create<AppState>()(
                 } catch (e) {
                     console.error('[Call] Failed to decline call:', e);
                 }
+                invoke('reset_call_media').catch(() => undefined);
                 set({ activeCall: null });
             },
 
@@ -893,6 +927,7 @@ export const useAppStore = create<AppState>()(
                 } catch (e) {
                     console.error('[Call] Failed to cancel call:', e);
                 }
+                invoke('reset_call_media').catch(() => undefined);
                 set({ activeCall: null });
             },
 
@@ -930,8 +965,15 @@ export const useAppStore = create<AppState>()(
             },
 
             leaveServer: async (serverId) => {
-                const { fetchServers, activeServer } = get();
+                const { fetchServers, activeServer, activeVoiceChannel } = get();
                 try {
+                    if (activeServer === serverId && activeVoiceChannel) {
+                        await invoke('api_leave_voice_channel', {
+                            serverId,
+                            channelId: activeVoiceChannel,
+                        }).catch(() => undefined);
+                    }
+
                     await invoke('api_leave_server', { serverId });
                     console.log('[Store] Left server');
                     if (activeServer === serverId) {
@@ -943,6 +985,8 @@ export const useAppStore = create<AppState>()(
                             channelMessages: [],
                             hasMoreChannelMessages: true,
                             isLoadingMoreChannelMessages: false,
+                            voicePresenceByChannel: {},
+                            activeVoiceChannel: null,
                         });
                     }
                     await fetchServers();
@@ -952,6 +996,14 @@ export const useAppStore = create<AppState>()(
             },
 
             setActiveServer: (serverId) => {
+                const { activeServer, activeVoiceChannel } = get();
+                if (activeServer && activeVoiceChannel && activeServer !== serverId) {
+                    invoke('api_leave_voice_channel', {
+                        serverId: activeServer,
+                        channelId: activeVoiceChannel,
+                    }).catch(() => undefined);
+                }
+
                 set({
                     activeServer: serverId,
                     activeChannel: null,
@@ -960,6 +1012,8 @@ export const useAppStore = create<AppState>()(
                     channelMessages: [],
                     hasMoreChannelMessages: true,
                     isLoadingMoreChannelMessages: false,
+                    voicePresenceByChannel: {},
+                    activeVoiceChannel: null,
                 });
                 if (serverId) {
                     get().fetchChannels(serverId);
@@ -978,6 +1032,12 @@ export const useAppStore = create<AppState>()(
                     if (firstTextChannel) {
                         get().setActiveChannel(firstTextChannel.id);
                     }
+
+                    data.channels
+                        .filter((c: Channel) => c.channel_type === 'voice')
+                        .forEach((channel: Channel) => {
+                            void get().fetchVoiceChannelPresence(serverId, channel.id);
+                        });
                 } catch (e) {
                     console.error('[Store] fetchChannels error:', e);
                 }
@@ -1117,6 +1177,77 @@ export const useAppStore = create<AppState>()(
                                 : m
                         )
                     });
+                }
+            },
+
+            setVoicePresence: (channelId, userId, joined) => {
+                const current = get().voicePresenceByChannel;
+                const existing = current[channelId] || [];
+                const next = joined
+                    ? Array.from(new Set([...existing, userId]))
+                    : existing.filter((id) => id !== userId);
+
+                set({
+                    voicePresenceByChannel: {
+                        ...current,
+                        [channelId]: next,
+                    },
+                });
+            },
+
+            fetchVoiceChannelPresence: async (serverId, channelId) => {
+                try {
+                    const participants = await invoke<VoiceChannelParticipant[]>('api_fetch_voice_channel_presence', {
+                        serverId,
+                        channelId,
+                    });
+                    set({
+                        voicePresenceByChannel: {
+                            ...get().voicePresenceByChannel,
+                            [channelId]: participants.map((p) => p.user_id),
+                        },
+                    });
+                } catch (e) {
+                    console.error('[Store] fetchVoiceChannelPresence error:', e);
+                }
+            },
+
+            joinVoiceChannel: async (serverId, channelId) => {
+                const { activeVoiceChannel, leaveVoiceChannel, setVoicePresence, user } = get();
+                try {
+                    if (activeVoiceChannel && activeVoiceChannel !== channelId) {
+                        await leaveVoiceChannel(serverId, activeVoiceChannel);
+                    }
+
+                    await invoke('api_join_voice_channel', { serverId, channelId });
+                    set({ activeVoiceChannel: channelId });
+                    if (user?.id) {
+                        setVoicePresence(channelId, user.id, true);
+                    }
+                    await get().fetchVoiceChannelPresence(serverId, channelId);
+                } catch (e) {
+                    console.error('[Store] joinVoiceChannel error:', e);
+                }
+            },
+
+            leaveVoiceChannel: async (serverId, channelId) => {
+                const { activeVoiceChannel, setVoicePresence, user } = get();
+                const effectiveChannel = channelId || activeVoiceChannel;
+                if (!effectiveChannel) return;
+
+                try {
+                    await invoke('api_leave_voice_channel', {
+                        serverId,
+                        channelId: effectiveChannel,
+                    });
+                    if (user?.id) {
+                        setVoicePresence(effectiveChannel, user.id, false);
+                    }
+                    if (activeVoiceChannel === effectiveChannel) {
+                        set({ activeVoiceChannel: null });
+                    }
+                } catch (e) {
+                    console.error('[Store] leaveVoiceChannel error:', e);
                 }
             },
         }),

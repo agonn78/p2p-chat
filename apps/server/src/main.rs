@@ -14,8 +14,10 @@ use std::env;
 use tokio::sync::mpsc;
 use shared_proto::signaling::SignalingMessage;
 use crate::state::AppState;
+use crate::auth::validate_token;
 use sqlx::postgres::PgPoolOptions;
 use axum::http::HeaderValue;
+use uuid::Uuid;
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
@@ -216,22 +218,30 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             // Attempt to parse as SignalingMessage
             if let Ok(signal) = serde_json::from_str::<SignalingMessage>(&text) {
                 match signal {
-                    SignalingMessage::Identify { user_id } => {
+                    SignalingMessage::Identify { user_id, token } => {
+                        let claims = match validate_token(&token) {
+                            Ok(claims) => claims,
+                            Err(_) => {
+                                tracing::warn!("Rejected WS identify for {}: invalid token", user_id);
+                                continue;
+                            }
+                        };
+
+                        if claims.sub != user_id {
+                            tracing::warn!(
+                                "Rejected WS identify: token subject {} does not match payload {}",
+                                claims.sub,
+                                user_id
+                            );
+                            continue;
+                        }
+
                         println!("🆔 User {} identified on WebSocket", user_id);
                         state.peers.insert(user_id.clone(), tx.clone());
                         let peer_count = state.peers.len();
                         println!("📊 Current connected peers: {} total", peer_count);
-                        
-                        // Fetch username from DB for call notifications
-                        if let Ok(row) = sqlx::query_scalar::<_, String>(
-                            "SELECT username FROM users WHERE id = $1::uuid"
-                        )
-                        .bind(&user_id)
-                        .fetch_optional(&state.db)
-                        .await {
-                            my_username = row;
-                        }
-                        
+
+                        my_username = Some(claims.username);
                         my_id = Some(user_id);
                     }
                     
@@ -518,6 +528,46 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 };
                 let msg = serde_json::to_string(&unavailable).unwrap();
                 let _ = peer_tx.send(Message::Text(msg));
+            }
+        }
+
+        // Remove user from any joined voice channels and broadcast leave presence.
+        if let Ok(user_uuid) = Uuid::parse_str(&id) {
+            if let Ok(joined_rows) = sqlx::query_as::<_, (Uuid, Uuid)>(
+                "SELECT server_id, channel_id FROM voice_channel_sessions WHERE user_id = $1"
+            )
+            .bind(user_uuid)
+            .fetch_all(&state.db)
+            .await
+            {
+                let _ = sqlx::query("DELETE FROM voice_channel_sessions WHERE user_id = $1")
+                    .bind(user_uuid)
+                    .execute(&state.db)
+                    .await;
+
+                for (server_id, channel_id) in joined_rows {
+                    if let Ok(member_ids) = sqlx::query_scalar::<_, Uuid>(
+                        "SELECT user_id FROM server_members WHERE server_id = $1"
+                    )
+                    .bind(server_id)
+                    .fetch_all(&state.db)
+                    .await
+                    {
+                        let ws_payload = serde_json::json!({
+                            "type": "VOICE_PRESENCE",
+                            "server_id": server_id,
+                            "channel_id": channel_id,
+                            "user_id": user_uuid,
+                            "joined": false,
+                        });
+                        let ws_text = serde_json::to_string(&ws_payload).unwrap();
+                        for member_id in member_ids {
+                            if let Some(peer_tx) = state.peers.get(&member_id.to_string()) {
+                                let _ = peer_tx.send(Message::Text(ws_text.clone()));
+                            }
+                        }
+                    }
+                }
             }
         }
         

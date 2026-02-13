@@ -36,6 +36,13 @@ pub struct ServerMember {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceChannelParticipant {
+    pub user_id: String,
+    pub username: String,
+    pub joined_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelMessage {
     pub id: String,
     pub client_id: Option<String>,
@@ -544,6 +551,98 @@ pub async fn api_send_channel_typing(
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
         return Err(format!("Failed to send channel typing: {}", text));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn api_fetch_voice_channel_presence(
+    state: State<'_, ApiState>,
+    server_id: String,
+    channel_id: String,
+) -> Result<Vec<VoiceChannelParticipant>, String> {
+    let token = state.get_token().await
+        .ok_or("Not authenticated")?;
+
+    let url = format!(
+        "{}/servers/{}/channels/{}/voice",
+        state.base_url, server_id, channel_id
+    );
+
+    let res = state.client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Failed to fetch voice presence: {}", text));
+    }
+
+    let participants: Vec<VoiceChannelParticipant> = res
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    Ok(participants)
+}
+
+#[tauri::command]
+pub async fn api_join_voice_channel(
+    state: State<'_, ApiState>,
+    server_id: String,
+    channel_id: String,
+) -> Result<(), String> {
+    let token = state.get_token().await
+        .ok_or("Not authenticated")?;
+
+    let url = format!(
+        "{}/servers/{}/channels/{}/voice/join",
+        state.base_url, server_id, channel_id
+    );
+
+    let res = state.client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Failed to join voice channel: {}", text));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn api_leave_voice_channel(
+    state: State<'_, ApiState>,
+    server_id: String,
+    channel_id: String,
+) -> Result<(), String> {
+    let token = state.get_token().await
+        .ok_or("Not authenticated")?;
+
+    let url = format!(
+        "{}/servers/{}/channels/{}/voice/leave",
+        state.base_url, server_id, channel_id
+    );
+
+    let res = state.client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Failed to leave voice channel: {}", text));
     }
 
     Ok(())

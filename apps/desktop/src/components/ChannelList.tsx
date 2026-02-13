@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Hash, Volume2, Plus, Settings, ChevronDown, Mic, MicOff, LogOut } from 'lucide-react';
+import { Hash, Volume2, Plus, Settings, ChevronDown, Mic, MicOff, LogOut, PhoneCall, PhoneOff } from 'lucide-react';
 import { useAppStore } from '../store';
 import type { Channel } from '../types';
 
@@ -97,6 +97,10 @@ export function ChannelList() {
     const channels = useAppStore((s) => s.channels);
     const activeChannel = useAppStore((s) => s.activeChannel);
     const setActiveChannel = useAppStore((s) => s.setActiveChannel);
+    const voicePresenceByChannel = useAppStore((s) => s.voicePresenceByChannel);
+    const activeVoiceChannel = useAppStore((s) => s.activeVoiceChannel);
+    const joinVoiceChannel = useAppStore((s) => s.joinVoiceChannel);
+    const leaveVoiceChannel = useAppStore((s) => s.leaveVoiceChannel);
     const user = useAppStore((s) => s.user);
 
     const currentServer = servers.find((s) => s.id === activeServer);
@@ -165,11 +169,13 @@ export function ChannelList() {
                                 <span>Voice Channels</span>
                             </div>
                             {voiceChannels.map((channel) => (
-                                <ChannelButton
+                                <VoiceChannelButton
                                     key={channel.id}
                                     channel={channel}
-                                    isActive={activeChannel === channel.id}
-                                    onClick={() => setActiveChannel(channel.id)}
+                                    participantCount={(voicePresenceByChannel[channel.id] || []).length}
+                                    joined={activeVoiceChannel === channel.id}
+                                    onJoin={() => joinVoiceChannel(activeServer, channel.id)}
+                                    onLeave={() => leaveVoiceChannel(activeServer, channel.id)}
                                 />
                             ))}
                         </div>
@@ -211,6 +217,40 @@ export function ChannelList() {
                 serverId={activeServer}
             />
         </>
+    );
+}
+
+function VoiceChannelButton({
+    channel,
+    participantCount,
+    joined,
+    onJoin,
+    onLeave,
+}: {
+    channel: Channel;
+    participantCount: number;
+    joined: boolean;
+    onJoin: () => void;
+    onLeave: () => void;
+}) {
+    return (
+        <div
+            className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-sm transition ${joined
+                ? 'bg-green-500/15 text-green-300 border border-green-500/20'
+                : 'text-gray-400 hover:text-white hover:bg-white/5'
+                }`}
+        >
+            <Volume2 className="w-4 h-4 flex-shrink-0" />
+            <span className="truncate flex-1">{channel.name}</span>
+            <span className="text-xs text-gray-400">{participantCount}</span>
+            <button
+                onClick={joined ? onLeave : onJoin}
+                className={`p-1 rounded transition ${joined ? 'hover:bg-red-500/20 text-red-300' : 'hover:bg-green-500/20 text-green-300'}`}
+                title={joined ? 'Leave voice channel' : 'Join voice channel'}
+            >
+                {joined ? <PhoneOff className="w-4 h-4" /> : <PhoneCall className="w-4 h-4" />}
+            </button>
+        </div>
     );
 }
 

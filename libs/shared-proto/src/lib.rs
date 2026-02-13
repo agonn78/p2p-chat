@@ -33,7 +33,7 @@ pub mod signaling {
             sdp_m_line_index: Option<u16>,
         },
         #[serde(rename = "identify")]
-        Identify { user_id: String },
+        Identify { user_id: String, token: String },
 
         // === Call Signaling ===
         /// Initiate a call to a target user

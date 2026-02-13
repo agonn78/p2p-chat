@@ -36,6 +36,23 @@ pub enum AudioMode {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IceServerConfig {
+    pub urls: Vec<String>,
+    pub username: Option<String>,
+    pub credential: Option<String>,
+}
+
+impl Default for IceServerConfig {
+    fn default() -> Self {
+        Self {
+            urls: vec!["stun:stun.l.google.com:19302".to_string()],
+            username: None,
+            credential: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AudioSettings {
     pub mic_gain: f32,
     pub output_volume: f32,
@@ -93,6 +110,8 @@ pub struct MediaEngine {
     selected_output_device: Option<String>,
     // Runtime audio settings
     audio_settings: AudioSettings,
+    // Runtime ICE server configuration
+    ice_servers: Vec<IceServerConfig>,
     /// Track whether playback stream has been started
     playback_started: Arc<AtomicBool>,
 }
@@ -114,8 +133,21 @@ impl MediaEngine {
             selected_input_device: None,
             selected_output_device: None,
             audio_settings: AudioSettings::default(),
+            ice_servers: vec![IceServerConfig::default()],
             playback_started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn set_ice_servers(&mut self, ice_servers: Vec<IceServerConfig>) {
+        self.ice_servers = if ice_servers.is_empty() {
+            vec![IceServerConfig::default()]
+        } else {
+            ice_servers
+        };
+    }
+
+    pub fn get_ice_servers(&self) -> Vec<IceServerConfig> {
+        self.ice_servers.clone()
     }
 
     /// Reset the media engine for a new call
@@ -367,11 +399,26 @@ impl MediaEngine {
             .with_media_engine(media_engine)
             .build();
 
+        let ice_servers = self
+            .ice_servers
+            .iter()
+            .map(|cfg| {
+                let mut server = RTCIceServer {
+                    urls: cfg.urls.clone(),
+                    ..Default::default()
+                };
+                if let Some(username) = &cfg.username {
+                    server.username = username.clone();
+                }
+                if let Some(credential) = &cfg.credential {
+                    server.credential = credential.clone();
+                }
+                server
+            })
+            .collect::<Vec<_>>();
+
         let config = RTCConfiguration {
-            ice_servers: vec![RTCIceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_owned()],
-                ..Default::default()
-            }],
+            ice_servers,
             ice_transport_policy: RTCIceTransportPolicy::All, // Allow both UDP and TCP
             ..Default::default()
         };

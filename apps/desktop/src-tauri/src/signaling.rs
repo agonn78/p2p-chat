@@ -217,7 +217,10 @@ pub async fn send_signal(sender: &WsSender, message: SignalingMessage) -> Result
 }
 
 /// Send identification message to server
-pub async fn send_identify(sender: &WsSender, user_id: &str) -> Result<(), String> {
-    let identify = SignalingMessage::Identify { user_id: user_id.to_string() };
+pub async fn send_identify(sender: &WsSender, user_id: &str, token: &str) -> Result<(), String> {
+    let identify = SignalingMessage::Identify {
+        user_id: user_id.to_string(),
+        token: token.to_string(),
+    };
     send_signal(sender, identify).await
 }

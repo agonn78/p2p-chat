@@ -62,6 +62,7 @@ function App() {
     const serverMembers = useAppStore((s) => s.serverMembers);
     const typingByChannel = useAppStore((s) => s.typingByChannel);
     const setChannelTyping = useAppStore((s) => s.setChannelTyping);
+    const setVoicePresence = useAppStore((s) => s.setVoicePresence);
     const sendChannelMessage = useAppStore((s) => s.sendChannelMessage);
 
     // Chat Store
@@ -205,6 +206,13 @@ function App() {
                             if (payload.channel_id && payload.user_id) {
                                 setChannelTyping(payload.channel_id, payload.user_id, !!payload.is_typing);
                             }
+                        } else if (payload.type === 'VOICE_PRESENCE') {
+                            if (payload.channel_id && payload.user_id) {
+                                setVoicePresence(payload.channel_id, payload.user_id, !!payload.joined);
+                                if (payload.user_id === user?.id && !payload.joined) {
+                                    useAppStore.setState({ activeVoiceChannel: null });
+                                }
+                            }
                         } else if (payload.type === 'CHANNEL_MESSAGE_EDITED') {
                             useAppStore.setState((state) => ({
                                 channelMessages: state.channelMessages.map((m) =>
@@ -268,7 +276,7 @@ function App() {
             console.log('[App] 🔌 Cleaning up WebSocket listener');
             if (cleanup) cleanup();
         };
-    }, [isAuthenticated, activeRoom, activeChannel, user?.id, setTyping, setChannelTyping]);
+    }, [isAuthenticated, activeRoom, activeChannel, user?.id, setTyping, setChannelTyping, setVoicePresence]);
 
     // Call event listeners
     useEffect(() => {
@@ -349,26 +357,31 @@ function App() {
             const unlistenDeclined = await listen<string>('call-declined', (event) => {
                 console.log('[CALL-DEBUG] ===== CALL DECLINED EVENT =====');
                 useAppStore.setState({ activeCall: null });
+                invoke('reset_call_media').catch(() => undefined);
             });
 
             const unlistenEnded = await listen<string>('call-ended', (event) => {
                 console.log('[CALL-DEBUG] ===== CALL ENDED EVENT =====');
                 useAppStore.setState({ activeCall: null });
+                invoke('reset_call_media').catch(() => undefined);
             });
 
             const unlistenBusy = await listen<string>('call-busy', () => {
                 console.log('[App] 📳 Target is busy');
                 useAppStore.setState({ activeCall: null });
+                invoke('reset_call_media').catch(() => undefined);
             });
 
             const unlistenCancelled = await listen<string>('call-cancelled', () => {
                 console.log('[App] 🚫 Call cancelled by caller');
                 useAppStore.setState({ activeCall: null });
+                invoke('reset_call_media').catch(() => undefined);
             });
 
             const unlistenUnavailable = await listen<CallUnavailablePayload>('call-unavailable', (event) => {
                 console.warn(`[App] 🚫 Call unavailable (${event.payload.reason}) for ${event.payload.targetId}`);
                 useAppStore.setState({ activeCall: null });
+                invoke('reset_call_media').catch(() => undefined);
             });
 
             return () => {
