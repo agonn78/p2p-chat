@@ -13,10 +13,16 @@ use tokio::sync::Mutex;
 use signaling::WsSender;
 use shared_proto::signaling::SignalingMessage;
 use api::ApiState;
+use messaging::service::MessagingService;
 
 struct AppState {
     media: Arc<Mutex<MediaEngine>>,
     ws_sender: WsSender,
+}
+
+#[derive(Clone)]
+pub struct MessagingState {
+    pub service: MessagingService,
 }
 
 #[tauri::command]
@@ -498,7 +504,27 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let app_handle = app.handle().clone();
-            
+
+            // Initialize local messaging storage (SQLite in app data dir)
+            let app_data_dir = app.path().app_data_dir().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to resolve app data directory: {e}"),
+                )
+            })?;
+            std::fs::create_dir_all(&app_data_dir)?;
+            let messaging_db_path = app_data_dir.join("messaging.sqlite");
+            let messaging_service = tauri::async_runtime::block_on(MessagingService::new(messaging_db_path))
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to initialize messaging storage: {e}"),
+                    )
+                })?;
+            app.manage(MessagingState {
+                service: messaging_service,
+            });
+             
             // Initialize API state for HTTP requests
             let api_state = ApiState::new(config::API_URL.to_string());
             app.manage(api_state);
