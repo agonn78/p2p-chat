@@ -1,4 +1,3 @@
-
 pub mod signaling {
     use serde::{Deserialize, Serialize};
 
@@ -23,15 +22,9 @@ pub mod signaling {
     #[serde(tag = "type", content = "payload")]
     pub enum SignalingMessage {
         #[serde(rename = "offer")]
-        Offer {
-            target_id: String,
-            sdp: String,
-        },
+        Offer { target_id: String, sdp: String },
         #[serde(rename = "answer")]
-        Answer {
-            target_id: String,
-            sdp: String,
-        },
+        Answer { target_id: String, sdp: String },
         #[serde(rename = "candidate")]
         Candidate {
             target_id: String,
@@ -40,12 +33,9 @@ pub mod signaling {
             sdp_m_line_index: Option<u16>,
         },
         #[serde(rename = "identify")]
-        Identify {
-            user_id: String,
-        },
-        
+        Identify { user_id: String },
+
         // === Call Signaling ===
-        
         /// Initiate a call to a target user
         #[serde(rename = "call_initiate")]
         CallInitiate {
@@ -73,39 +63,28 @@ pub mod signaling {
         },
         /// Decline an incoming call
         #[serde(rename = "call_decline")]
-        CallDecline {
-            caller_id: String,
-        },
+        CallDecline { caller_id: String },
         /// Call was declined (server -> caller)
         #[serde(rename = "call_declined")]
-        CallDeclined {
-            target_id: String,
-        },
+        CallDeclined { target_id: String },
         /// End an active call
         #[serde(rename = "call_end")]
-        CallEnd {
-            peer_id: String,
-        },
+        CallEnd { peer_id: String },
         /// Call ended notification
         #[serde(rename = "call_ended")]
-        CallEnded {
-            peer_id: String,
-        },
+        CallEnded { peer_id: String },
         /// Target user is busy (in another call)
         #[serde(rename = "call_busy")]
-        CallBusy {
-            caller_id: String,
-        },
+        CallBusy { caller_id: String },
         /// Cancel outgoing call before answer
         #[serde(rename = "call_cancel")]
-        CallCancel {
-            target_id: String,
-        },
+        CallCancel { target_id: String },
         /// Call was cancelled (server -> callee)
         #[serde(rename = "call_cancelled")]
-        CallCancelled {
-            caller_id: String,
-        },
+        CallCancelled { caller_id: String },
+        /// Call cannot proceed (offline peer, expired ringing state, etc.)
+        #[serde(rename = "call_unavailable")]
+        CallUnavailable { target_id: String, reason: String },
     }
 }
 

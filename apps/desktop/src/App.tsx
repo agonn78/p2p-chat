@@ -11,7 +11,7 @@ import { ChannelList } from './components/ChannelList';
 import { MemberList } from './components/MemberList';
 import { IncomingCallModal } from './components/IncomingCallModal';
 import { SafeCallOverlay } from './components/SafeCallOverlay';
-import type { IncomingCallPayload, CallAcceptedPayload } from './types';
+import type { IncomingCallPayload, CallAcceptedPayload, CallUnavailablePayload } from './types';
 
 // Slash commands
 const SLASH_COMMANDS: Record<string, { description: string; replacement?: string }> = {
@@ -45,6 +45,7 @@ function App() {
     const logout = useAppStore((s) => s.logout);
     const activeCall = useAppStore((s) => s.activeCall);
     const endCall = useAppStore((s) => s.endCall);
+    const cancelOutgoingCall = useAppStore((s) => s.cancelOutgoingCall);
     const friends = useAppStore((s) => s.friends);
     const startCall = useAppStore((s) => s.startCall);
     const fetchFriends = useAppStore((s) => s.fetchFriends);
@@ -290,12 +291,8 @@ function App() {
 
                     // Start WebRTC Audio Handshake
                     console.log('[CALL-DEBUG] Initializing WebRTC audio call...');
-                    try {
-                        await invoke('init_audio_call', { targetId: event.payload.peerId });
-                        console.log('[CALL-DEBUG] ✅ WebRTC audio call initialized');
-                    } catch (audioErr) {
-                        console.warn('[CALL-DEBUG] ⚠️ Audio start failed:', audioErr);
-                    }
+                    await invoke('init_audio_call', { targetId: event.payload.peerId });
+                    console.log('[CALL-DEBUG] ✅ WebRTC audio call initialized');
 
                     useAppStore.setState((state) => ({
                         activeCall: state.activeCall ? {
@@ -306,7 +303,7 @@ function App() {
                     }));
                 } catch (e) {
                     console.error('[CALL-DEBUG] ❌ E2EE handshake failed:', e);
-                    endCall();
+                    await endCall();
                 }
             });
 
@@ -318,9 +315,16 @@ function App() {
                         targetId: event.payload.peerId,
                         sdp: event.payload.sdp
                     });
-                    // Note: Callee starts sending media after handling offer (creating answer)
+                    useAppStore.setState((state) => ({
+                        activeCall: state.activeCall ? {
+                            ...state.activeCall,
+                            status: 'connected',
+                            startTime: state.activeCall.startTime ?? Date.now(),
+                        } : null,
+                    }));
                 } catch (e) {
                     console.error('[WEBRTC] Failed to handle offer:', e);
+                    await endCall();
                 }
             });
 
@@ -362,6 +366,11 @@ function App() {
                 useAppStore.setState({ activeCall: null });
             });
 
+            const unlistenUnavailable = await listen<CallUnavailablePayload>('call-unavailable', (event) => {
+                console.warn(`[App] 🚫 Call unavailable (${event.payload.reason}) for ${event.payload.targetId}`);
+                useAppStore.setState({ activeCall: null });
+            });
+
             return () => {
                 unlistenIncoming();
                 unlistenAccepted();
@@ -372,6 +381,7 @@ function App() {
                 unlistenEnded();
                 unlistenBusy();
                 unlistenCancelled();
+                unlistenUnavailable();
             };
         };
 
@@ -382,6 +392,22 @@ function App() {
             if (cleanup) cleanup();
         };
     }, [isAuthenticated, handleIncomingCall, endCall]);
+
+    // Auto-timeout outgoing calls that are never accepted
+    useEffect(() => {
+        if (activeCall?.status !== 'calling') {
+            return;
+        }
+
+        const timeout = window.setTimeout(() => {
+            console.warn('[Call] Outgoing call timed out, cancelling...');
+            void cancelOutgoingCall();
+        }, 30_000);
+
+        return () => {
+            window.clearTimeout(timeout);
+        };
+    }, [activeCall?.status, cancelOutgoingCall]);
 
     // Polling fallback
     useEffect(() => {
@@ -474,13 +500,7 @@ function App() {
     }, [msgInput, activeRoom, isAuthenticated]);
 
     const handleJoinCall = async (friendId: string) => {
-        startCall(friendId);
-        try {
-            const result = await invoke('join_call', { channel: friendId });
-            console.log('Call started:', result);
-        } catch (e) {
-            console.error('Failed to start call:', e);
-        }
+        await startCall(friendId);
     };
 
     const handleFriendClick = async (friendId: string) => {

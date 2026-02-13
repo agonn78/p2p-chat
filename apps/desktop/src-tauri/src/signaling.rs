@@ -174,7 +174,15 @@ async fn handle_ws_messages(
                             println!("🚫 Call cancelled by {}", caller_id);
                             let _ = app_handle.emit("call-cancelled", caller_id);
                         }
-                        
+                        SignalingMessage::CallUnavailable { target_id, reason } => {
+                            println!("⚠️ Call unavailable for {} ({})", target_id, reason);
+                            let payload = serde_json::json!({
+                                "targetId": target_id,
+                                "reason": reason,
+                            });
+                            let _ = app_handle.emit("call-unavailable", payload);
+                        }
+                         
                         _ => {}
                     }
                 }

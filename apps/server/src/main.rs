@@ -305,13 +305,33 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     // === Call Signaling ===
                     
                     SignalingMessage::CallInitiate { target_id, public_key } => {
-                        let caller_id = my_id.clone().unwrap_or_default();
+                        let caller_id = match &my_id {
+                            Some(id) => id.clone(),
+                            None => {
+                                tracing::warn!("Received call initiate before identify");
+                                continue;
+                            }
+                        };
                         let caller_name = my_username.clone().unwrap_or_else(|| "Unknown".to_string());
+
+                        if caller_id == target_id {
+                            continue;
+                        }
+
+                        // Caller already busy (in-call or already ringing)
+                        if state.is_busy(&caller_id) {
+                            if let Some(caller_tx) = state.peers.get(&caller_id) {
+                                let busy = SignalingMessage::CallBusy { caller_id };
+                                let msg = serde_json::to_string(&busy).unwrap();
+                                let _ = caller_tx.send(Message::Text(msg));
+                            }
+                            continue;
+                        }
                         
                         // Check if target is online
                         if let Some(peer_tx) = state.peers.get(&target_id) {
                             // Check if target is busy
-                            if state.is_in_call(&target_id) {
+                            if state.is_busy(&target_id) {
                                 // Send busy signal back to caller
                                 if let Some(caller_tx) = state.peers.get(&caller_id) {
                                     let busy = SignalingMessage::CallBusy { caller_id: target_id.clone() };
@@ -319,27 +339,77 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     let _ = caller_tx.send(Message::Text(msg));
                                 }
                             } else {
+                                // Track ringing state before the call is accepted
+                                state.start_pending_call(&caller_id, &target_id);
+
                                 // Forward as IncomingCall to target
                                 let incoming = SignalingMessage::IncomingCall {
-                                    caller_id,
+                                    caller_id: caller_id.clone(),
                                     caller_name,
                                     public_key,
                                 };
                                 let msg = serde_json::to_string(&incoming).unwrap();
                                 let _ = peer_tx.send(Message::Text(msg));
                                 tracing::info!("📞 Call initiated to {}", target_id);
+
+                                // Ring timeout: if still pending after 30s, clear it and notify caller.
+                                let timeout_state = state.clone();
+                                let timeout_caller = caller_id.clone();
+                                let timeout_target = target_id.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                                    if timeout_state.cancel_pending_pair(&timeout_caller, &timeout_target) {
+                                        if let Some(caller_tx) = timeout_state.peers.get(&timeout_caller) {
+                                            let unavailable = SignalingMessage::CallUnavailable {
+                                                target_id: timeout_target,
+                                                reason: "timeout".to_string(),
+                                            };
+                                            let msg = serde_json::to_string(&unavailable).unwrap();
+                                            let _ = caller_tx.send(Message::Text(msg));
+                                        }
+                                    }
+                                });
                             }
                         } else {
                             tracing::warn!("Target {} not online for call", target_id);
-                            // Could send a "user offline" response here
+
+                            if let Some(caller_tx) = state.peers.get(&caller_id) {
+                                let unavailable = SignalingMessage::CallUnavailable {
+                                    target_id,
+                                    reason: "offline".to_string(),
+                                };
+                                let msg = serde_json::to_string(&unavailable).unwrap();
+                                let _ = caller_tx.send(Message::Text(msg));
+                            }
                         }
                     }
                     
                     SignalingMessage::CallAccept { caller_id, public_key } => {
-                        let callee_id = my_id.clone().unwrap_or_default();
-                        
-                        // Start tracking the call
-                        state.start_call(&caller_id, &callee_id);
+                        let callee_id = match &my_id {
+                            Some(id) => id.clone(),
+                            None => {
+                                tracing::warn!("Received call accept before identify");
+                                continue;
+                            }
+                        };
+
+                        // Promote pending ringing state to active call.
+                        if !state.accept_pending_call(&caller_id, &callee_id) {
+                            tracing::warn!(
+                                "Ignoring call accept: no pending call between caller={} and callee={}",
+                                caller_id,
+                                callee_id
+                            );
+                            if let Some(callee_tx) = state.peers.get(&callee_id) {
+                                let unavailable = SignalingMessage::CallUnavailable {
+                                    target_id: caller_id,
+                                    reason: "expired".to_string(),
+                                };
+                                let msg = serde_json::to_string(&unavailable).unwrap();
+                                let _ = callee_tx.send(Message::Text(msg));
+                            }
+                            continue;
+                        }
                         
                         // Forward CallAccepted to caller
                         if let Some(caller_tx) = state.peers.get(&caller_id) {
@@ -354,6 +424,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                     
                     SignalingMessage::CallDecline { caller_id } => {
+                        let callee_id = match &my_id {
+                            Some(id) => id.clone(),
+                            None => {
+                                tracing::warn!("Received call decline before identify");
+                                continue;
+                            }
+                        };
+                        let _ = state.cancel_pending_pair(&caller_id, &callee_id);
+
                         // Forward CallDeclined to caller
                         if let Some(caller_tx) = state.peers.get(&caller_id) {
                             let declined = SignalingMessage::CallDeclined {
@@ -383,10 +462,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                     
                     SignalingMessage::CallCancel { target_id } => {
+                        let caller_id = match &my_id {
+                            Some(id) => id.clone(),
+                            None => {
+                                tracing::warn!("Received call cancel before identify");
+                                continue;
+                            }
+                        };
+                        let _ = state.cancel_pending_pair(&caller_id, &target_id);
+
                         // Forward CallCancelled to target (callee)
                         if let Some(peer_tx) = state.peers.get(&target_id) {
                             let cancelled = SignalingMessage::CallCancelled {
-                                caller_id: my_id.clone().unwrap_or_default(),
+                                caller_id,
                             };
                             let msg = serde_json::to_string(&cancelled).unwrap();
                             let _ = peer_tx.send(Message::Text(msg));
@@ -400,7 +488,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     SignalingMessage::CallDeclined { .. } |
                     SignalingMessage::CallEnded { .. } |
                     SignalingMessage::CallBusy { .. } |
-                    SignalingMessage::CallCancelled { .. } => {}
+                    SignalingMessage::CallCancelled { .. } |
+                    SignalingMessage::CallUnavailable { .. } => {}
                 }
             }
         }
@@ -408,7 +497,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // Cleanup on disconnect
     if let Some(id) = my_id {
-        // If user was in a call, notify peer
+        // If user was in an active call, notify peer
         if let Some(peer_id) = state.end_call(&id) {
             if let Some(peer_tx) = state.peers.get(&peer_id) {
                 let ended = SignalingMessage::CallEnded { peer_id: id.clone() };
@@ -419,6 +508,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
             } else {
                 tracing::warn!("📴 User {} disconnected, peer {} already gone", id, peer_id);
+            }
+        } else if let Some(peer_id) = state.cancel_pending_call(&id) {
+            // If user disconnects while ringing, notify peer call is unavailable.
+            if let Some(peer_tx) = state.peers.get(&peer_id) {
+                let unavailable = SignalingMessage::CallUnavailable {
+                    target_id: id.clone(),
+                    reason: "peer_disconnected".to_string(),
+                };
+                let msg = serde_json::to_string(&unavailable).unwrap();
+                let _ = peer_tx.send(Message::Text(msg));
             }
         }
         

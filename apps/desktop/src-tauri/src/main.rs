@@ -26,14 +26,6 @@ pub struct MessagingState {
 }
 
 #[tauri::command]
-async fn join_call(_state: State<'_, AppState>, channel: String) -> Result<String, String> {
-    println!("🔊 [CALL-DEBUG] Joining call in channel: {}", channel);
-    // Note: Media engine will be started after E2EE handshake completes
-    // Don't start it here to avoid holding the lock during async operations
-    Ok(format!("Joined channel {}", channel))
-}
-
-#[tauri::command]
 async fn identify_user(state: State<'_, AppState>, user_id: String) -> Result<(), String> {
     println!("Identifying user: {}", user_id);
     signaling::send_identify(&state.ws_sender, &user_id).await?;
@@ -558,7 +550,6 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             // WebRTC/Call commands
-            join_call, 
             send_offer, 
             send_answer, 
             identify_user,

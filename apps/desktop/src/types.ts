@@ -66,6 +66,11 @@ export interface CallAcceptedPayload {
     publicKey: string;
 }
 
+export interface CallUnavailablePayload {
+    targetId: string;
+    reason: string;
+}
+
 // Server types
 export interface Server {
     id: string;
