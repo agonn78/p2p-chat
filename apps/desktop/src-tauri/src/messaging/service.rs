@@ -254,4 +254,41 @@ mod tests {
 
         let _ = std::fs::remove_file(db_path);
     }
+
+    #[tokio::test]
+    async fn set_status_updates_cached_message_by_server_id() {
+        let db_path = temp_db_path("messaging-service-status");
+        let service = MessagingService::new(db_path.clone()).await.expect("service init");
+
+        service
+            .mark_send_success(
+                ConversationKind::Dm,
+                "room-1",
+                "srv-msg-2".to_string(),
+                Some("c5".to_string()),
+                Some("u1".to_string()),
+                Some("alice".to_string()),
+                "hello".to_string(),
+                None,
+                "2026-02-12T00:20:00Z".to_string(),
+                None,
+                MessageStatus::Sent,
+            )
+            .await
+            .expect("insert sent message");
+
+        service
+            .set_status_by_server_id("srv-msg-2", MessageStatus::Read)
+            .await
+            .expect("set read status");
+
+        let loaded = service
+            .load_messages(ConversationKind::Dm, "room-1", None, 50)
+            .await
+            .expect("load messages");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].status, MessageStatus::Read);
+
+        let _ = std::fs::remove_file(db_path);
+    }
 }

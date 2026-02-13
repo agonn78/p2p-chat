@@ -516,4 +516,76 @@ mod tests {
 
         let _ = std::fs::remove_file(db_path);
     }
+
+    #[tokio::test]
+    async fn load_messages_honors_before_cursor() {
+        let db_path = temp_db_path("messaging-storage-before-cursor");
+        let storage = MessagingStorage::new(db_path.clone()).await.expect("storage init");
+
+        let m1 = PersistedMessage {
+            local_id: "m1".to_string(),
+            server_id: Some("m1".to_string()),
+            client_id: None,
+            sender_id: Some("u1".to_string()),
+            sender_username: Some("alice".to_string()),
+            target_kind: ConversationKind::Dm,
+            target_id: "room-1".to_string(),
+            content: "first".to_string(),
+            nonce: None,
+            created_at: "2026-02-12T00:00:00Z".to_string(),
+            edited_at: None,
+            status: MessageStatus::Sent,
+        };
+
+        let m2 = PersistedMessage {
+            local_id: "m2".to_string(),
+            server_id: Some("m2".to_string()),
+            client_id: None,
+            sender_id: Some("u1".to_string()),
+            sender_username: Some("alice".to_string()),
+            target_kind: ConversationKind::Dm,
+            target_id: "room-1".to_string(),
+            content: "second".to_string(),
+            nonce: None,
+            created_at: "2026-02-12T00:00:01Z".to_string(),
+            edited_at: None,
+            status: MessageStatus::Sent,
+        };
+
+        let m3 = PersistedMessage {
+            local_id: "m3".to_string(),
+            server_id: Some("m3".to_string()),
+            client_id: None,
+            sender_id: Some("u1".to_string()),
+            sender_username: Some("alice".to_string()),
+            target_kind: ConversationKind::Dm,
+            target_id: "room-1".to_string(),
+            content: "third".to_string(),
+            nonce: None,
+            created_at: "2026-02-12T00:00:02Z".to_string(),
+            edited_at: None,
+            status: MessageStatus::Sent,
+        };
+
+        storage.upsert_message(&m1).await.expect("insert m1");
+        storage.upsert_message(&m2).await.expect("insert m2");
+        storage.upsert_message(&m3).await.expect("insert m3");
+
+        let page = storage
+            .load_messages(ConversationKind::Dm, "room-1", None, 2)
+            .await
+            .expect("load page");
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].local_id, "m2");
+        assert_eq!(page[1].local_id, "m3");
+
+        let older = storage
+            .load_messages(ConversationKind::Dm, "room-1", Some("m2"), 2)
+            .await
+            .expect("load older page");
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].local_id, "m1");
+
+        let _ = std::fs::remove_file(db_path);
+    }
 }
