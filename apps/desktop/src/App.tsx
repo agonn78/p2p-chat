@@ -91,6 +91,7 @@ function App() {
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     const typingTimeoutRef = useRef<number | null>(null);
+    const dmLoadOlderInFlightRef = useRef(false);
 
     useEffect(() => {
         if (isAuthenticated) {
@@ -397,7 +398,7 @@ function App() {
         setShowCommandHint(msgInput.startsWith('/') && msgInput.length > 1);
     }, [msgInput]);
 
-    // Typing indicator emitter (DM + channel)
+    // Typing indicator emitter (DM only)
     useEffect(() => {
         if (!isAuthenticated) return;
 
@@ -415,21 +416,13 @@ function App() {
             }
         }
 
-        if (activeServer && activeChannel) {
-            invoke('api_send_channel_typing', {
-                serverId: activeServer,
-                channelId: activeChannel,
-                isTyping,
-            }).catch(() => undefined);
-        }
-
         return () => {
             if (typingTimeoutRef.current) {
                 window.clearTimeout(typingTimeoutRef.current);
                 typingTimeoutRef.current = null;
             }
         };
-    }, [msgInput, activeRoom, activeServer, activeChannel, isAuthenticated]);
+    }, [msgInput, activeRoom, isAuthenticated]);
 
     const handleJoinCall = async (friendId: string) => {
         startCall(friendId);
@@ -685,15 +678,58 @@ function App() {
                                     className="flex-1 overflow-y-auto p-4 space-y-2"
                                     onScroll={(e) => {
                                         const el = e.currentTarget;
-                                        if (el.scrollTop < 80) {
-                                            loadOlderMessages();
+                                        if (
+                                            el.scrollTop < 80
+                                            && hasMoreMessages
+                                            && !isLoadingMoreMessages
+                                            && !dmLoadOlderInFlightRef.current
+                                        ) {
+                                            const previousHeight = el.scrollHeight;
+                                            const previousTop = el.scrollTop;
+                                            dmLoadOlderInFlightRef.current = true;
+
+                                            void loadOlderMessages().finally(() => {
+                                                window.requestAnimationFrame(() => {
+                                                    const updated = dmMessagesContainerRef.current;
+                                                    if (updated) {
+                                                        const delta = updated.scrollHeight - previousHeight;
+                                                        updated.scrollTop = previousTop + Math.max(0, delta);
+                                                    }
+                                                    dmLoadOlderInFlightRef.current = false;
+                                                });
+                                            });
                                         }
                                     }}
                                 >
                                     {(hasMoreMessages || isLoadingMoreMessages) && (
                                         <div className="flex justify-center mb-3">
                                             <button
-                                                onClick={loadOlderMessages}
+                                                onClick={() => {
+                                                    const container = dmMessagesContainerRef.current;
+                                                    if (
+                                                        !container
+                                                        || isLoadingMoreMessages
+                                                        || !hasMoreMessages
+                                                        || dmLoadOlderInFlightRef.current
+                                                    ) {
+                                                        return;
+                                                    }
+
+                                                    const previousHeight = container.scrollHeight;
+                                                    const previousTop = container.scrollTop;
+                                                    dmLoadOlderInFlightRef.current = true;
+
+                                                    void loadOlderMessages().finally(() => {
+                                                        window.requestAnimationFrame(() => {
+                                                            const updated = dmMessagesContainerRef.current;
+                                                            if (updated) {
+                                                                const delta = updated.scrollHeight - previousHeight;
+                                                                updated.scrollTop = previousTop + Math.max(0, delta);
+                                                            }
+                                                            dmLoadOlderInFlightRef.current = false;
+                                                        });
+                                                    });
+                                                }}
                                                 disabled={isLoadingMoreMessages}
                                                 className="text-xs px-3 py-1 rounded-full bg-white/5 hover:bg-white/10 disabled:opacity-60"
                                             >
@@ -1008,6 +1044,7 @@ function ServerChatView({
     const messagesContainerRef = useRef<HTMLDivElement>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const typingTimeoutRef = useRef<number | null>(null);
+    const channelLoadOlderInFlightRef = useRef(false);
     const channel = channels.find((c: any) => c.id === activeChannel);
     const typingMemberName = typingUserIds
         .filter((id) => id !== user?.id)
@@ -1075,15 +1112,58 @@ function ServerChatView({
                 className="flex-1 overflow-y-auto p-4 space-y-4"
                 onScroll={(e) => {
                     const el = e.currentTarget;
-                    if (el.scrollTop < 80) {
-                        loadOlderChannelMessages();
+                    if (
+                        el.scrollTop < 80
+                        && hasMoreChannelMessages
+                        && !isLoadingMoreChannelMessages
+                        && !channelLoadOlderInFlightRef.current
+                    ) {
+                        const previousHeight = el.scrollHeight;
+                        const previousTop = el.scrollTop;
+                        channelLoadOlderInFlightRef.current = true;
+
+                        void loadOlderChannelMessages().finally(() => {
+                            window.requestAnimationFrame(() => {
+                                const updated = messagesContainerRef.current;
+                                if (updated) {
+                                    const delta = updated.scrollHeight - previousHeight;
+                                    updated.scrollTop = previousTop + Math.max(0, delta);
+                                }
+                                channelLoadOlderInFlightRef.current = false;
+                            });
+                        });
                     }
                 }}
             >
                 {(hasMoreChannelMessages || isLoadingMoreChannelMessages) && (
                     <div className="flex justify-center mb-2">
                         <button
-                            onClick={() => void loadOlderChannelMessages()}
+                            onClick={() => {
+                                const container = messagesContainerRef.current;
+                                if (
+                                    !container
+                                    || isLoadingMoreChannelMessages
+                                    || !hasMoreChannelMessages
+                                    || channelLoadOlderInFlightRef.current
+                                ) {
+                                    return;
+                                }
+
+                                const previousHeight = container.scrollHeight;
+                                const previousTop = container.scrollTop;
+                                channelLoadOlderInFlightRef.current = true;
+
+                                void loadOlderChannelMessages().finally(() => {
+                                    window.requestAnimationFrame(() => {
+                                        const updated = messagesContainerRef.current;
+                                        if (updated) {
+                                            const delta = updated.scrollHeight - previousHeight;
+                                            updated.scrollTop = previousTop + Math.max(0, delta);
+                                        }
+                                        channelLoadOlderInFlightRef.current = false;
+                                    });
+                                });
+                            }}
                             disabled={isLoadingMoreChannelMessages}
                             className="text-xs px-3 py-1 rounded-full bg-white/5 hover:bg-white/10 disabled:opacity-60"
                         >
