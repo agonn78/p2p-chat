@@ -1,15 +1,15 @@
 //! End-to-End Encryption module using X25519 key exchange and AES-256-GCM
-//! 
+//!
 //! Flow:
 //! 1. Generate ephemeral X25519 keypair
 //! 2. Exchange public keys via signaling server
 //! 3. Derive shared secret using Diffie-Hellman
 //! 4. Use shared secret as AES-256-GCM key for encrypting audio packets
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey, NONCE_LEN};
 use ring::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey, X25519};
 use ring::rand::SystemRandom;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -38,7 +38,7 @@ impl KeyPair {
         let rng = SystemRandom::new();
         let private_key = EphemeralPrivateKey::generate(&X25519, &rng)?;
         let public_key = private_key.compute_public_key()?;
-        
+
         Ok(Self {
             private_key,
             public_key_bytes: public_key.as_ref().to_vec(),
@@ -51,19 +51,20 @@ impl KeyPair {
     }
 
     /// Perform key exchange with peer's public key and derive encryption context
-    pub fn derive_shared_secret(self, peer_public_key_bytes: &[u8]) -> Result<CryptoContext, String> {
+    pub fn derive_shared_secret(
+        self,
+        peer_public_key_bytes: &[u8],
+    ) -> Result<CryptoContext, String> {
         let peer_public_key = UnparsedPublicKey::new(&X25519, peer_public_key_bytes);
-        
-        let shared_secret = agreement::agree_ephemeral(
-            self.private_key,
-            &peer_public_key,
-            |key_material| {
+
+        let shared_secret =
+            agreement::agree_ephemeral(self.private_key, &peer_public_key, |key_material| {
                 // Use first 32 bytes as AES-256 key
                 let mut key_bytes = [0u8; 32];
                 key_bytes.copy_from_slice(&key_material[..32]);
                 key_bytes
-            },
-        ).map_err(|_| "Key exchange failed".to_string())?;
+            })
+            .map_err(|_| "Key exchange failed".to_string())?;
 
         CryptoContext::new(&shared_secret)
     }
@@ -74,7 +75,7 @@ impl CryptoContext {
     fn new(key_bytes: &[u8; 32]) -> Result<Self, String> {
         let unbound_key = UnboundKey::new(&aead::AES_256_GCM, key_bytes)
             .map_err(|_| "Failed to create AES key".to_string())?;
-        
+
         Ok(Self {
             key: Mutex::new(LessSafeKey::new(unbound_key)),
             nonce_counter: AtomicU64::new(0),
@@ -95,11 +96,11 @@ impl CryptoContext {
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
         let nonce_bytes = self.next_nonce();
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
-        
+
         let mut buffer = plaintext.to_vec();
         // Reserve space for the authentication tag
         buffer.extend_from_slice(&[0u8; 16]);
-        
+
         let key = self.key.lock().map_err(|_| "Lock poisoned")?;
         key.seal_in_place_separate_tag(nonce, Aad::empty(), &mut buffer[..plaintext.len()])
             .map(|tag| {
@@ -121,9 +122,9 @@ impl CryptoContext {
         let (nonce_bytes, encrypted) = ciphertext.split_at(NONCE_LEN);
         let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)
             .map_err(|_| "Invalid nonce".to_string())?;
-        
+
         let mut buffer = encrypted.to_vec();
-        
+
         let key = self.key.lock().map_err(|_| "Lock poisoned")?;
         key.open_in_place(nonce, Aad::empty(), &mut buffer)
             .map(|plaintext| plaintext.to_vec())
@@ -133,7 +134,9 @@ impl CryptoContext {
 
 /// Parse a base64 encoded public key
 pub fn parse_public_key(base64_key: &str) -> Result<Vec<u8>, String> {
-    BASE64.decode(base64_key).map_err(|e| format!("Invalid base64: {}", e))
+    BASE64
+        .decode(base64_key)
+        .map_err(|e| format!("Invalid base64: {}", e))
 }
 
 #[cfg(test)]

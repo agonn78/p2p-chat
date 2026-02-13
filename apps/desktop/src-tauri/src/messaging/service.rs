@@ -153,7 +153,9 @@ impl MessagingService {
         message_id: &str,
         status: MessageStatus,
     ) -> Result<(), MessagingError> {
-        self.storage.update_status_by_server_id(message_id, status).await
+        self.storage
+            .update_status_by_server_id(message_id, status)
+            .await
     }
 }
 
@@ -169,7 +171,9 @@ mod tests {
     #[tokio::test]
     async fn pending_then_success_replaces_local_and_clears_outbox() {
         let db_path = temp_db_path("messaging-service-success");
-        let service = MessagingService::new(db_path.clone()).await.expect("service init");
+        let service = MessagingService::new(db_path.clone())
+            .await
+            .expect("service init");
 
         let pending = service
             .create_pending_message(
@@ -220,7 +224,9 @@ mod tests {
     #[tokio::test]
     async fn failed_send_marks_message_failed_and_tracks_attempts() {
         let db_path = temp_db_path("messaging-service-failed");
-        let service = MessagingService::new(db_path.clone()).await.expect("service init");
+        let service = MessagingService::new(db_path.clone())
+            .await
+            .expect("service init");
 
         service
             .create_pending_message(
@@ -258,7 +264,9 @@ mod tests {
     #[tokio::test]
     async fn set_status_updates_cached_message_by_server_id() {
         let db_path = temp_db_path("messaging-service-status");
-        let service = MessagingService::new(db_path.clone()).await.expect("service init");
+        let service = MessagingService::new(db_path.clone())
+            .await
+            .expect("service init");
 
         service
             .mark_send_success(

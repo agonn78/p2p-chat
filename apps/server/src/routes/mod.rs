@@ -1,5 +1,5 @@
 pub mod auth;
-pub mod friends;
-pub mod users;
 pub mod chat;
+pub mod friends;
 pub mod servers;
+pub mod users;

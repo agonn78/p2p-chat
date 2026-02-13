@@ -6,14 +6,14 @@ mod config;
 mod messaging;
 mod signaling;
 
-use tauri::{State, Manager, Emitter};
-use media::{AudioSettings, IceServerConfig, MediaEngine};
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use signaling::WsSender;
-use shared_proto::signaling::SignalingMessage;
 use api::ApiState;
+use media::{AudioSettings, IceServerConfig, MediaEngine};
 use messaging::service::MessagingService;
+use shared_proto::signaling::SignalingMessage;
+use signaling::WsSender;
+use std::sync::Arc;
+use tauri::{Emitter, Manager, State};
+use tokio::sync::Mutex;
 
 struct AppState {
     media: Arc<Mutex<MediaEngine>>,
@@ -61,7 +61,9 @@ fn load_ice_servers_from_env() -> Vec<IceServerConfig> {
 
     let turn_urls = parse_csv_env("TURN_URLS");
     if !turn_urls.is_empty() {
-        let username = std::env::var("TURN_USERNAME").ok().filter(|v| !v.trim().is_empty());
+        let username = std::env::var("TURN_USERNAME")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
         let credential = std::env::var("TURN_PASSWORD")
             .or_else(|_| std::env::var("TURN_CREDENTIAL"))
             .ok()
@@ -84,22 +86,27 @@ async fn identify_user(
     user_id: String,
 ) -> Result<(), String> {
     println!("Identifying user: {}", user_id);
-    let token = api_state
-        .get_token()
-        .await
-        .ok_or("Not authenticated")?;
+    let token = api_state.get_token().await.ok_or("Not authenticated")?;
     signaling::send_identify(&state.ws_sender, &user_id, &token).await?;
     Ok(())
 }
 
 #[tauri::command]
-async fn send_offer(state: State<'_, AppState>, target_id: String, sdp: String) -> Result<(), String> {
+async fn send_offer(
+    state: State<'_, AppState>,
+    target_id: String,
+    sdp: String,
+) -> Result<(), String> {
     let msg = SignalingMessage::Offer { target_id, sdp };
     signaling::send_signal(&state.ws_sender, msg).await
 }
 
 #[tauri::command]
-async fn send_answer(state: State<'_, AppState>, target_id: String, sdp: String) -> Result<(), String> {
+async fn send_answer(
+    state: State<'_, AppState>,
+    target_id: String,
+    sdp: String,
+) -> Result<(), String> {
     let msg = SignalingMessage::Answer { target_id, sdp };
     signaling::send_signal(&state.ws_sender, msg).await
 }
@@ -111,7 +118,7 @@ async fn send_answer(state: State<'_, AppState>, target_id: String, sdp: String)
 async fn start_call(state: State<'_, AppState>, target_id: String) -> Result<String, String> {
     println!("📞 [CALL-DEBUG] ===== STARTING CALL =====");
     println!("📞 [CALL-DEBUG] Target ID: {}", target_id);
-    
+
     // Generate keypair for E2EE
     println!("📞 [CALL-DEBUG] Generating keypair...");
     let public_key = {
@@ -121,31 +128,37 @@ async fn start_call(state: State<'_, AppState>, target_id: String) -> Result<Str
             e.to_string()
         })?
     };
-    println!("📞 [CALL-DEBUG] Generated public key: {}...", &public_key[..30.min(public_key.len())]);
-    
+    println!(
+        "📞 [CALL-DEBUG] Generated public key: {}...",
+        &public_key[..30.min(public_key.len())]
+    );
+
     // Send call initiate signal
     println!("📞 [CALL-DEBUG] Sending CallInitiate signal...");
-    let msg = SignalingMessage::CallInitiate { 
-        target_id: target_id.clone(), 
+    let msg = SignalingMessage::CallInitiate {
+        target_id: target_id.clone(),
         public_key: public_key.clone(),
     };
     signaling::send_signal(&state.ws_sender, msg).await?;
     println!("📞 [CALL-DEBUG] ✅ CallInitiate sent successfully");
-    
+
     Ok(public_key)
 }
 
 /// Accept incoming call - generates keypair, completes key exchange
 #[tauri::command]
 async fn accept_call(
-    state: State<'_, AppState>, 
+    state: State<'_, AppState>,
     caller_id: String,
     caller_public_key: String,
 ) -> Result<String, String> {
     println!("✅ [CALL-DEBUG] ===== ACCEPTING CALL =====");
     println!("✅ [CALL-DEBUG] Caller ID: {}", caller_id);
-    println!("✅ [CALL-DEBUG] Caller public key: {}...", &caller_public_key[..30.min(caller_public_key.len())]);
-    
+    println!(
+        "✅ [CALL-DEBUG] Caller public key: {}...",
+        &caller_public_key[..30.min(caller_public_key.len())]
+    );
+
     // Generate our keypair and complete key exchange
     println!("✅ [CALL-DEBUG] Generating keypair and completing key exchange...");
     let public_key = {
@@ -154,23 +167,28 @@ async fn accept_call(
             println!("✅ [CALL-DEBUG] ❌ Failed to generate keypair: {}", e);
             e.to_string()
         })?;
-        engine.complete_key_exchange(&caller_public_key).map_err(|e| {
-            println!("✅ [CALL-DEBUG] ❌ Key exchange failed: {}", e);
-            e.to_string()
-        })?;
+        engine
+            .complete_key_exchange(&caller_public_key)
+            .map_err(|e| {
+                println!("✅ [CALL-DEBUG] ❌ Key exchange failed: {}", e);
+                e.to_string()
+            })?;
         pk
     };
-    println!("✅ [CALL-DEBUG] Generated our public key: {}...", &public_key[..30.min(public_key.len())]);
-    
+    println!(
+        "✅ [CALL-DEBUG] Generated our public key: {}...",
+        &public_key[..30.min(public_key.len())]
+    );
+
     // Send accept signal with our public key
     println!("✅ [CALL-DEBUG] Sending CallAccept signal...");
-    let msg = SignalingMessage::CallAccept { 
-        caller_id, 
+    let msg = SignalingMessage::CallAccept {
+        caller_id,
         public_key: public_key.clone(),
     };
     signaling::send_signal(&state.ws_sender, msg).await?;
     println!("✅ [CALL-DEBUG] ✅ CallAccept sent successfully");
-    
+
     Ok(public_key)
 }
 
@@ -181,17 +199,22 @@ async fn complete_call_handshake(
     peer_public_key: String,
 ) -> Result<(), String> {
     println!("🔐 [CALL-DEBUG] ===== COMPLETING E2EE HANDSHAKE =====");
-    println!("🔐 [CALL-DEBUG] Peer public key (first 30 chars): {}...", &peer_public_key[..30.min(peer_public_key.len())]);
-    
+    println!(
+        "🔐 [CALL-DEBUG] Peer public key (first 30 chars): {}...",
+        &peer_public_key[..30.min(peer_public_key.len())]
+    );
+
     {
         let mut engine = state.media.lock().await;
         println!("🔐 [CALL-DEBUG] Got media engine lock");
-        engine.complete_key_exchange(&peer_public_key).map_err(|e| {
-            println!("🔐 [CALL-DEBUG] ❌ Key exchange failed: {}", e);
-            e.to_string()
-        })?;
+        engine
+            .complete_key_exchange(&peer_public_key)
+            .map_err(|e| {
+                println!("🔐 [CALL-DEBUG] ❌ Key exchange failed: {}", e);
+                e.to_string()
+            })?;
     }
-    
+
     println!("🔐 [CALL-DEBUG] ✅ Key exchange completed successfully");
     Ok(())
 }
@@ -200,13 +223,13 @@ async fn complete_call_handshake(
 #[tauri::command]
 async fn decline_call(state: State<'_, AppState>, caller_id: String) -> Result<(), String> {
     println!("❌ Declining call from {}", caller_id);
-    
+
     // Reset media engine (may have generated keypair)
     {
         let mut engine = state.media.lock().await;
         engine.reset().await;
     }
-    
+
     let msg = SignalingMessage::CallDecline { caller_id };
     signaling::send_signal(&state.ws_sender, msg).await
 }
@@ -215,13 +238,13 @@ async fn decline_call(state: State<'_, AppState>, caller_id: String) -> Result<(
 #[tauri::command]
 async fn end_call(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
     println!("📴 Ending call with {}", peer_id);
-    
+
     // Reset media engine for next call
     {
         let mut engine = state.media.lock().await;
         engine.reset().await;
     }
-    
+
     let msg = SignalingMessage::CallEnd { peer_id };
     signaling::send_signal(&state.ws_sender, msg).await
 }
@@ -230,13 +253,13 @@ async fn end_call(state: State<'_, AppState>, peer_id: String) -> Result<(), Str
 #[tauri::command]
 async fn cancel_call(state: State<'_, AppState>, target_id: String) -> Result<(), String> {
     println!("🚫 Cancelling call to {}", target_id);
-    
+
     // Reset media engine
     {
         let mut engine = state.media.lock().await;
         engine.reset().await;
     }
-    
+
     let msg = SignalingMessage::CallCancel { target_id };
     signaling::send_signal(&state.ws_sender, msg).await
 }
@@ -263,7 +286,8 @@ struct AudioDevice {
 async fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
     MediaEngine::list_input_devices()
         .map(|devices| {
-            devices.into_iter()
+            devices
+                .into_iter()
                 .map(|(id, name)| AudioDevice { id, name })
                 .collect()
         })
@@ -273,16 +297,22 @@ async fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
 #[tauri::command]
 async fn get_default_audio_device() -> Result<AudioDevice, String> {
     MediaEngine::default_input_device_name()
-        .map(|name| AudioDevice { id: name.clone(), name })
+        .map(|name| AudioDevice {
+            id: name.clone(),
+            name,
+        })
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn get_selected_audio_device(state: State<'_, AppState>) -> Result<Option<AudioDevice>, String> {
+async fn get_selected_audio_device(
+    state: State<'_, AppState>,
+) -> Result<Option<AudioDevice>, String> {
     let engine = state.media.lock().await;
-    Ok(engine
-        .selected_input_device()
-        .map(|name| AudioDevice { id: name.clone(), name }))
+    Ok(engine.selected_input_device().map(|name| AudioDevice {
+        id: name.clone(),
+        name,
+    }))
 }
 
 #[tauri::command]
@@ -310,16 +340,22 @@ async fn list_output_devices() -> Result<Vec<AudioDevice>, String> {
 #[tauri::command]
 async fn get_default_output_device() -> Result<AudioDevice, String> {
     MediaEngine::default_output_device_name()
-        .map(|name| AudioDevice { id: name.clone(), name })
+        .map(|name| AudioDevice {
+            id: name.clone(),
+            name,
+        })
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn get_selected_output_device(state: State<'_, AppState>) -> Result<Option<AudioDevice>, String> {
+async fn get_selected_output_device(
+    state: State<'_, AppState>,
+) -> Result<Option<AudioDevice>, String> {
     let engine = state.media.lock().await;
-    Ok(engine
-        .selected_output_device()
-        .map(|name| AudioDevice { id: name.clone(), name }))
+    Ok(engine.selected_output_device().map(|name| AudioDevice {
+        id: name.clone(),
+        name,
+    }))
 }
 
 #[tauri::command]
@@ -339,7 +375,10 @@ async fn get_audio_settings(state: State<'_, AppState>) -> Result<AudioSettings,
 }
 
 #[tauri::command]
-async fn update_audio_settings(state: State<'_, AppState>, settings: AudioSettings) -> Result<(), String> {
+async fn update_audio_settings(
+    state: State<'_, AppState>,
+    settings: AudioSettings,
+) -> Result<(), String> {
     let mut engine = state.media.lock().await;
     engine.update_audio_settings(settings);
     Ok(())
@@ -371,7 +410,7 @@ struct IceCandidatePayload {
 #[tauri::command]
 async fn init_audio_call(state: State<'_, AppState>, target_id: String) -> Result<(), String> {
     println!("📞 [WEBRTC] Initializing audio call to {}", target_id);
-    
+
     // 1. Initialize WebRTC
     let mut ice_rx = {
         let mut engine = state.media.lock().await;
@@ -406,7 +445,10 @@ async fn init_audio_call(state: State<'_, AppState>, target_id: String) -> Resul
     // 3. Create Audio DataChannel
     {
         let engine = state.media.lock().await;
-        engine.create_audio_channel().await.map_err(|e| e.to_string())?;
+        engine
+            .create_audio_channel()
+            .await
+            .map_err(|e| e.to_string())?;
     }
 
     // 4. Create Offer
@@ -424,7 +466,11 @@ async fn init_audio_call(state: State<'_, AppState>, target_id: String) -> Resul
 /// Handle received Offer (Callee side)
 /// Initializes PC, accepts offer, creates Answer, and sends it via WS.
 #[tauri::command]
-async fn handle_audio_offer(state: State<'_, AppState>, target_id: String, sdp: String) -> Result<(), String> {
+async fn handle_audio_offer(
+    state: State<'_, AppState>,
+    target_id: String,
+    sdp: String,
+) -> Result<(), String> {
     println!("📞 [WEBRTC] Handling Offer from {}", target_id);
 
     // 1. Initialize WebRTC (Answerer)
@@ -463,7 +509,10 @@ async fn handle_audio_offer(state: State<'_, AppState>, target_id: String, sdp: 
     println!("📞 [WEBRTC] Answer created, sending...");
 
     // 4. Send Answer
-    let msg = SignalingMessage::Answer { target_id, sdp: answer_sdp };
+    let msg = SignalingMessage::Answer {
+        target_id,
+        sdp: answer_sdp,
+    };
     signaling::send_signal(&state.ws_sender, msg).await
 }
 
@@ -472,13 +521,19 @@ async fn handle_audio_offer(state: State<'_, AppState>, target_id: String, sdp: 
 async fn handle_audio_answer(state: State<'_, AppState>, sdp: String) -> Result<(), String> {
     println!("📞 [WEBRTC] Handling Answer");
     let engine = state.media.lock().await;
-    engine.set_remote_description(&sdp).await.map_err(|e| e.to_string())?;
+    engine
+        .set_remote_description(&sdp)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 /// Handle received ICE candidate
 #[tauri::command]
-async fn handle_ice_candidate(state: State<'_, AppState>, payload: IceCandidatePayload) -> Result<(), String> {
+async fn handle_ice_candidate(
+    state: State<'_, AppState>,
+    payload: IceCandidatePayload,
+) -> Result<(), String> {
     // Reconstruct valid JSON for RTCIceCandidateInit
     let json = serde_json::json!({
         "candidate": payload.candidate,
@@ -488,7 +543,10 @@ async fn handle_ice_candidate(state: State<'_, AppState>, payload: IceCandidateP
     let candidate_str = json.to_string();
 
     let engine = state.media.lock().await;
-    engine.add_ice_candidate(&candidate_str).await.map_err(|e| e.to_string())?;
+    engine
+        .add_ice_candidate(&candidate_str)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -496,19 +554,22 @@ async fn handle_ice_candidate(state: State<'_, AppState>, payload: IceCandidateP
 #[tauri::command]
 async fn start_call_audio(state: State<'_, AppState>) -> Result<(), String> {
     println!("🔊 [AUDIO] Starting call audio...");
-    
+
     let engine = state.media.lock().await;
-    
+
     if !engine.is_ready_for_audio() {
         return Err("E2EE key exchange not completed".to_string());
     }
-    
+
     // Create the audio DataChannel (Offerer side)
     // This sets up capture → encode → encrypt → send pipeline
-    engine.create_audio_channel().await.map_err(|e| format!("Failed to create audio channel: {}", e))?;
-    
+    engine
+        .create_audio_channel()
+        .await
+        .map_err(|e| format!("Failed to create audio channel: {}", e))?;
+
     println!("🔊 [AUDIO] ✅ Audio DataChannel created, capture will start when channel opens");
-    
+
     Ok(())
 }
 
@@ -538,8 +599,8 @@ async fn start_vu_meter(app: tauri::AppHandle, state: State<'_, AppState>) -> Re
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
-    let mut rms_rx = rms_rx
-        .ok_or_else(|| "RMS receiver not available (capture not started)".to_string())?;
+    let mut rms_rx =
+        rms_rx.ok_or_else(|| "RMS receiver not available (capture not started)".to_string())?;
 
     // Spawn a background task to forward RMS levels to the frontend
     tauri::async_runtime::spawn(async move {
@@ -554,7 +615,7 @@ async fn start_vu_meter(app: tauri::AppHandle, state: State<'_, AppState>) -> Re
             }
         }
     });
-    
+
     Ok(())
 }
 
@@ -574,21 +635,23 @@ fn main() {
             })?;
             std::fs::create_dir_all(&app_data_dir)?;
             let messaging_db_path = app_data_dir.join("messaging.sqlite");
-            let messaging_service = tauri::async_runtime::block_on(MessagingService::new(messaging_db_path))
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to initialize messaging storage: {e}"),
-                    )
-                })?;
+            let messaging_service = tauri::async_runtime::block_on(MessagingService::new(
+                messaging_db_path,
+            ))
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to initialize messaging storage: {e}"),
+                )
+            })?;
             app.manage(MessagingState {
                 service: messaging_service,
             });
-             
+
             // Initialize API state for HTTP requests
             let api_state = ApiState::new(config::API_URL.to_string());
             app.manage(api_state);
-            
+
             // Connect to signaling server (without identifying yet)
             tauri::async_runtime::spawn(async move {
                 let ice_servers = load_ice_servers_from_env();
@@ -628,13 +691,13 @@ fn main() {
                     }
                 }
             });
-            
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             // WebRTC/Call commands
-            send_offer, 
-            send_answer, 
+            send_offer,
+            send_answer,
             identify_user,
             start_call,
             accept_call,
@@ -670,6 +733,10 @@ fn main() {
             api::auth::api_health_check,
             api::users::api_upload_public_key,
             api::users::api_fetch_user_public_key,
+            api::users::api_fetch_my_profile,
+            api::users::api_update_my_profile,
+            api::users::api_fetch_my_settings,
+            api::users::api_update_my_settings,
             api::friends::api_fetch_friends,
             api::friends::api_fetch_pending_requests,
             api::friends::api_fetch_online_friends,
@@ -686,15 +753,34 @@ fn main() {
             api::chat::api_delete_message,
             api::chat::api_delete_all_messages,
             api::chat::api_edit_message,
+            api::chat::api_search_messages,
+            api::chat::api_fetch_message_reactions,
+            api::chat::api_add_message_reaction,
+            api::chat::api_remove_message_reaction,
+            api::chat::api_fetch_thread_messages,
+            api::chat::api_send_thread_message,
             api::servers::api_fetch_servers,
             api::servers::api_create_server,
             api::servers::api_join_server,
             api::servers::api_leave_server,
+            api::servers::api_delete_server,
+            api::servers::api_regenerate_server_invite,
             api::servers::api_fetch_server_details,
             api::servers::api_create_channel,
+            api::servers::api_update_member_role,
+            api::servers::api_kick_member,
+            api::servers::api_ban_member,
+            api::servers::api_list_server_bans,
+            api::servers::api_unban_member,
             api::servers::api_fetch_server_members,
             api::servers::api_fetch_channel_messages,
+            api::servers::api_search_channel_messages,
             api::servers::api_send_channel_message,
+            api::servers::api_fetch_channel_message_reactions,
+            api::servers::api_add_channel_message_reaction,
+            api::servers::api_remove_channel_message_reaction,
+            api::servers::api_fetch_channel_thread_messages,
+            api::servers::api_send_channel_thread_message,
             api::servers::api_send_channel_typing,
             api::servers::api_fetch_voice_channel_presence,
             api::servers::api_join_voice_channel,
@@ -703,5 +789,3 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
-

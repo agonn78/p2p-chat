@@ -2,26 +2,38 @@ mod auth;
 mod models;
 mod routes;
 mod state;
+mod validation;
 
+use crate::auth::validate_token;
+use crate::state::AppState;
 use axum::{
-    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State},
-    response::IntoResponse,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Request, State,
+    },
+    http::{header, HeaderValue, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
+use dashmap::DashMap;
 use futures::{sink::SinkExt, stream::StreamExt};
-use std::env;
-use tokio::sync::mpsc;
 use shared_proto::signaling::SignalingMessage;
-use crate::state::AppState;
-use crate::auth::validate_token;
 use sqlx::postgres::PgPoolOptions;
-use axum::http::HeaderValue;
-use uuid::Uuid;
+use std::{
+    env,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
+use tokio::sync::mpsc;
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
+use uuid::Uuid;
+
+static RATE_LIMIT_BUCKETS: LazyLock<DashMap<String, (u32, Instant)>> = LazyLock::new(DashMap::new);
 
 #[tokio::main]
 async fn main() {
@@ -30,9 +42,9 @@ async fn main() {
 
     let database_url = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://user:password@p2p-chat-db:5432/p2p_chat".to_string());
-    
+
     tracing::info!("Connecting to database...");
-    
+
     // Connect to DB with retry
     let pool = loop {
         match PgPoolOptions::new()
@@ -59,7 +71,10 @@ async fn main() {
     tracing::info!("Migrations complete!");
 
     // Seed test users only if SEED_TEST_USERS=true (dev/testing only)
-    if std::env::var("SEED_TEST_USERS").map(|v| v == "true").unwrap_or(false) {
+    if std::env::var("SEED_TEST_USERS")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
         tracing::info!("SEED_TEST_USERS=true, seeding test users...");
         seed_test_users(&pool).await;
     }
@@ -102,6 +117,7 @@ async fn main() {
         .nest("/users", routes::users::router())
         .nest("/chat", routes::chat::router())
         .nest("/servers", routes::servers::router())
+        .layer(axum::middleware::from_fn(rate_limit_middleware))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(app_state);
@@ -112,6 +128,89 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+fn rate_limit_budget(path: &str) -> (u32, Duration, &'static str) {
+    if path.starts_with("/auth/login") || path.starts_with("/auth/register") {
+        (20, Duration::from_secs(60), "auth")
+    } else if path.starts_with("/ws") {
+        (120, Duration::from_secs(60), "ws")
+    } else if path.contains("/typing") {
+        (600, Duration::from_secs(60), "typing")
+    } else {
+        (300, Duration::from_secs(60), "api")
+    }
+}
+
+fn request_fingerprint(req: &Request) -> String {
+    let forwarded = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("unknown");
+
+    let user_agent = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.chars().take(24).collect::<String>())
+        .unwrap_or_else(|| "ua-none".to_string());
+
+    let auth_hint = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            let mut chars = v.chars();
+            chars.by_ref().take(18).collect::<String>()
+        })
+        .unwrap_or_else(|| "anon".to_string());
+
+    format!("{}:{}:{}", forwarded, user_agent, auth_hint)
+}
+
+async fn rate_limit_middleware(req: Request, next: Next) -> Result<Response, StatusCode> {
+    let path = req.uri().path().to_string();
+    if path == "/health" {
+        return Ok(next.run(req).await);
+    }
+
+    let now = Instant::now();
+    let (max_requests, window, bucket) = rate_limit_budget(&path);
+    let identity = request_fingerprint(&req);
+    let key = format!("{}:{}", bucket, identity);
+
+    let mut allowed = true;
+    {
+        let mut entry = RATE_LIMIT_BUCKETS.entry(key).or_insert((0, now));
+        let (count, window_start) = entry.value_mut();
+
+        if now.duration_since(*window_start) >= window {
+            *count = 0;
+            *window_start = now;
+        }
+
+        if *count >= max_requests {
+            allowed = false;
+        } else {
+            *count += 1;
+        }
+    }
+
+    if RATE_LIMIT_BUCKETS.len() > 50_000 {
+        let stale_after = window + window;
+        RATE_LIMIT_BUCKETS
+            .retain(|_, (_, started_at)| now.duration_since(*started_at) < stale_after);
+    }
+
+    if !allowed {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    Ok(next.run(req).await)
+}
+
 /// Seed test users for Mac and Windows clients
 async fn seed_test_users(pool: &sqlx::PgPool) {
     let users = [
@@ -120,16 +219,17 @@ async fn seed_test_users(pool: &sqlx::PgPool) {
     ];
 
     for (username, email, password) in users {
-        let existing = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE username = $1")
-            .bind(username)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
+        let existing =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE username = $1")
+                .bind(username)
+                .fetch_one(pool)
+                .await
+                .unwrap_or(0);
 
         if existing == 0 {
             let password_hash = auth::hash_password(password).expect("Failed to hash password");
             let result = sqlx::query(
-                "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3)"
+                "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3)",
             )
             .bind(username)
             .bind(email)
@@ -151,14 +251,15 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
-fn rewrite_offer_for_peer(target_id: String, sdp: String, from_id: &str) -> (String, SignalingMessage) {
+fn rewrite_offer_for_peer(
+    target_id: String,
+    sdp: String,
+    from_id: &str,
+) -> (String, SignalingMessage) {
     (
         target_id,
         SignalingMessage::Offer {
@@ -168,7 +269,11 @@ fn rewrite_offer_for_peer(target_id: String, sdp: String, from_id: &str) -> (Str
     )
 }
 
-fn rewrite_answer_for_peer(target_id: String, sdp: String, from_id: &str) -> (String, SignalingMessage) {
+fn rewrite_answer_for_peer(
+    target_id: String,
+    sdp: String,
+    from_id: &str,
+) -> (String, SignalingMessage) {
     (
         target_id,
         SignalingMessage::Answer {
@@ -222,7 +327,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let claims = match validate_token(&token) {
                             Ok(claims) => claims,
                             Err(_) => {
-                                tracing::warn!("Rejected WS identify for {}: invalid token", user_id);
+                                tracing::warn!(
+                                    "Rejected WS identify for {}: invalid token",
+                                    user_id
+                                );
                                 continue;
                             }
                         };
@@ -244,7 +352,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         my_username = Some(claims.username);
                         my_id = Some(user_id);
                     }
-                    
+
                     // === WebRTC Signaling (forward to target) ===
                     // Important: when forwarding, rewrite `target_id` to the sender id
                     // so the receiver knows who to reply to.
@@ -257,7 +365,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             }
                         };
 
-                        let (target_id, forwarded) = rewrite_offer_for_peer(target_id, sdp, &from_id);
+                        let (target_id, forwarded) =
+                            rewrite_offer_for_peer(target_id, sdp, &from_id);
 
                         if let Some(peer_tx) = state.peers.get(&target_id) {
                             if let Ok(msg) = serde_json::to_string(&forwarded) {
@@ -276,7 +385,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             }
                         };
 
-                        let (target_id, forwarded) = rewrite_answer_for_peer(target_id, sdp, &from_id);
+                        let (target_id, forwarded) =
+                            rewrite_answer_for_peer(target_id, sdp, &from_id);
 
                         if let Some(peer_tx) = state.peers.get(&target_id) {
                             if let Ok(msg) = serde_json::to_string(&forwarded) {
@@ -286,7 +396,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             tracing::warn!("Target peer {} not found", target_id);
                         }
                     }
-                    SignalingMessage::Candidate { target_id, candidate, sdp_mid, sdp_m_line_index } => {
+                    SignalingMessage::Candidate {
+                        target_id,
+                        candidate,
+                        sdp_mid,
+                        sdp_m_line_index,
+                    } => {
                         let from_id = match &my_id {
                             Some(id) => id.clone(),
                             None => {
@@ -311,10 +426,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             tracing::warn!("Target peer {} not found", target_id);
                         }
                     }
-                    
+
                     // === Call Signaling ===
-                    
-                    SignalingMessage::CallInitiate { target_id, public_key } => {
+                    SignalingMessage::CallInitiate {
+                        target_id,
+                        public_key,
+                    } => {
                         let caller_id = match &my_id {
                             Some(id) => id.clone(),
                             None => {
@@ -322,7 +439,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 continue;
                             }
                         };
-                        let caller_name = my_username.clone().unwrap_or_else(|| "Unknown".to_string());
+                        let caller_name =
+                            my_username.clone().unwrap_or_else(|| "Unknown".to_string());
 
                         if caller_id == target_id {
                             continue;
@@ -337,14 +455,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             }
                             continue;
                         }
-                        
+
                         // Check if target is online
                         if let Some(peer_tx) = state.peers.get(&target_id) {
                             // Check if target is busy
                             if state.is_busy(&target_id) {
                                 // Send busy signal back to caller
                                 if let Some(caller_tx) = state.peers.get(&caller_id) {
-                                    let busy = SignalingMessage::CallBusy { caller_id: target_id.clone() };
+                                    let busy = SignalingMessage::CallBusy {
+                                        caller_id: target_id.clone(),
+                                    };
                                     let msg = serde_json::to_string(&busy).unwrap();
                                     let _ = caller_tx.send(Message::Text(msg));
                                 }
@@ -368,8 +488,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 let timeout_target = target_id.clone();
                                 tokio::spawn(async move {
                                     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-                                    if timeout_state.cancel_pending_pair(&timeout_caller, &timeout_target) {
-                                        if let Some(caller_tx) = timeout_state.peers.get(&timeout_caller) {
+                                    if timeout_state
+                                        .cancel_pending_pair(&timeout_caller, &timeout_target)
+                                    {
+                                        if let Some(caller_tx) =
+                                            timeout_state.peers.get(&timeout_caller)
+                                        {
                                             let unavailable = SignalingMessage::CallUnavailable {
                                                 target_id: timeout_target,
                                                 reason: "timeout".to_string(),
@@ -393,8 +517,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             }
                         }
                     }
-                    
-                    SignalingMessage::CallAccept { caller_id, public_key } => {
+
+                    SignalingMessage::CallAccept {
+                        caller_id,
+                        public_key,
+                    } => {
                         let callee_id = match &my_id {
                             Some(id) => id.clone(),
                             None => {
@@ -420,7 +547,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             }
                             continue;
                         }
-                        
+
                         // Forward CallAccepted to caller
                         if let Some(caller_tx) = state.peers.get(&caller_id) {
                             let accepted = SignalingMessage::CallAccepted {
@@ -432,7 +559,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             tracing::info!("✅ Call accepted, notifying caller {}", caller_id);
                         }
                     }
-                    
+
                     SignalingMessage::CallDecline { caller_id } => {
                         let callee_id = match &my_id {
                             Some(id) => id.clone(),
@@ -453,24 +580,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             tracing::info!("❌ Call declined to {}", caller_id);
                         }
                     }
-                    
+
                     SignalingMessage::CallEnd { peer_id } => {
                         let user_id = my_id.clone().unwrap_or_default();
-                        
+
                         // End the call tracking
                         state.end_call(&user_id);
-                        
+
                         // Notify peer
                         if let Some(peer_tx) = state.peers.get(&peer_id) {
-                            let ended = SignalingMessage::CallEnded {
-                                peer_id: user_id,
-                            };
+                            let ended = SignalingMessage::CallEnded { peer_id: user_id };
                             let msg = serde_json::to_string(&ended).unwrap();
                             let _ = peer_tx.send(Message::Text(msg));
                             tracing::info!("📴 Call ended with {}", peer_id);
                         }
                     }
-                    
+
                     SignalingMessage::CallCancel { target_id } => {
                         let caller_id = match &my_id {
                             Some(id) => id.clone(),
@@ -483,23 +608,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         // Forward CallCancelled to target (callee)
                         if let Some(peer_tx) = state.peers.get(&target_id) {
-                            let cancelled = SignalingMessage::CallCancelled {
-                                caller_id,
-                            };
+                            let cancelled = SignalingMessage::CallCancelled { caller_id };
                             let msg = serde_json::to_string(&cancelled).unwrap();
                             let _ = peer_tx.send(Message::Text(msg));
                             tracing::info!("🚫 Call cancelled to {}", target_id);
                         }
                     }
-                    
+
                     // These are server->client only, ignore if received
-                    SignalingMessage::IncomingCall { .. } |
-                    SignalingMessage::CallAccepted { .. } |
-                    SignalingMessage::CallDeclined { .. } |
-                    SignalingMessage::CallEnded { .. } |
-                    SignalingMessage::CallBusy { .. } |
-                    SignalingMessage::CallCancelled { .. } |
-                    SignalingMessage::CallUnavailable { .. } => {}
+                    SignalingMessage::IncomingCall { .. }
+                    | SignalingMessage::CallAccepted { .. }
+                    | SignalingMessage::CallDeclined { .. }
+                    | SignalingMessage::CallEnded { .. }
+                    | SignalingMessage::CallBusy { .. }
+                    | SignalingMessage::CallCancelled { .. }
+                    | SignalingMessage::CallUnavailable { .. } => {}
                 }
             }
         }
@@ -510,11 +633,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         // If user was in an active call, notify peer
         if let Some(peer_id) = state.end_call(&id) {
             if let Some(peer_tx) = state.peers.get(&peer_id) {
-                let ended = SignalingMessage::CallEnded { peer_id: id.clone() };
+                let ended = SignalingMessage::CallEnded {
+                    peer_id: id.clone(),
+                };
                 let msg = serde_json::to_string(&ended).unwrap();
                 match peer_tx.send(Message::Text(msg)) {
-                    Ok(_) => tracing::info!("📴 User {} disconnected, notified peer {}", id, peer_id),
-                    Err(e) => tracing::warn!("📴 User {} disconnected, failed to notify peer {}: {}", id, peer_id, e),
+                    Ok(_) => {
+                        tracing::info!("📴 User {} disconnected, notified peer {}", id, peer_id)
+                    }
+                    Err(e) => tracing::warn!(
+                        "📴 User {} disconnected, failed to notify peer {}: {}",
+                        id,
+                        peer_id,
+                        e
+                    ),
                 }
             } else {
                 tracing::warn!("📴 User {} disconnected, peer {} already gone", id, peer_id);
@@ -534,7 +666,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         // Remove user from any joined voice channels and broadcast leave presence.
         if let Ok(user_uuid) = Uuid::parse_str(&id) {
             if let Ok(joined_rows) = sqlx::query_as::<_, (Uuid, Uuid)>(
-                "SELECT server_id, channel_id FROM voice_channel_sessions WHERE user_id = $1"
+                "SELECT server_id, channel_id FROM voice_channel_sessions WHERE user_id = $1",
             )
             .bind(user_uuid)
             .fetch_all(&state.db)
@@ -547,7 +679,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                 for (server_id, channel_id) in joined_rows {
                     if let Ok(member_ids) = sqlx::query_scalar::<_, Uuid>(
-                        "SELECT user_id FROM server_members WHERE server_id = $1"
+                        "SELECT user_id FROM server_members WHERE server_id = $1",
                     )
                     .bind(server_id)
                     .fetch_all(&state.db)
@@ -570,7 +702,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
             }
         }
-        
+
         state.peers.remove(&id);
         tracing::info!("User disconnected: {}", id);
     }
@@ -643,4 +775,3 @@ mod tests {
         }
     }
 }
-

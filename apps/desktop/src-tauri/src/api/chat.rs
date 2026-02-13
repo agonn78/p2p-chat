@@ -1,10 +1,13 @@
-use serde::{Deserialize, Serialize};
-use tauri::State;
-use crate::api::ApiState;
 use crate::api::servers::ChannelMessage;
-use crate::messaging::domain::{ConversationKind, MessageStatus as LocalMessageStatus, PersistedMessage};
+use crate::api::ApiState;
+use crate::messaging::domain::{
+    ConversationKind, MessageStatus as LocalMessageStatus, PersistedMessage,
+};
 use crate::MessagingState;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use tauri::State;
+use url::form_urlencoded::byte_serialize;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,7 +89,10 @@ fn api_to_persisted_message(room_id: &str, message: &Message) -> PersistedMessag
         target_id: room_id.to_string(),
         content: message.content.clone(),
         nonce: message.nonce.clone(),
-        created_at: message.created_at.clone().unwrap_or_else(|| Utc::now().to_rfc3339()),
+        created_at: message
+            .created_at
+            .clone()
+            .unwrap_or_else(|| Utc::now().to_rfc3339()),
         edited_at: message.edited_at.clone(),
         status: parse_local_status(message.status.as_deref()),
     }
@@ -97,12 +103,12 @@ pub async fn api_create_or_get_dm(
     state: State<'_, ApiState>,
     friend_id: String,
 ) -> Result<Room, String> {
-    let token = state.get_token().await
-        .ok_or("Not authenticated")?;
-    
+    let token = state.get_token().await.ok_or("Not authenticated")?;
+
     let url = format!("{}/chat/dm", state.base_url);
-    
-    let res = state.client
+
+    let res = state
+        .client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&CreateDmRequest { friend_id })
@@ -115,7 +121,9 @@ pub async fn api_create_or_get_dm(
         return Err(format!("Failed to create DM: {}", text));
     }
 
-    let room: Room = res.json().await
+    let room: Room = res
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
     Ok(room)
@@ -129,11 +137,10 @@ pub async fn api_fetch_messages(
     before: Option<String>,
     limit: Option<i64>,
 ) -> Result<Vec<Message>, String> {
-    let token = state.get_token().await
-        .ok_or("Not authenticated")?;
+    let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let limit = limit.unwrap_or(100).clamp(1, 200);
-    
+
     let url = format!("{}/chat/{}/messages", state.base_url, room_id);
 
     let before_cursor = before.clone();
@@ -142,8 +149,9 @@ pub async fn api_fetch_messages(
         query_params.push(("before".to_string(), before_id));
     }
     query_params.push(("limit".to_string(), limit.to_string()));
-    
-    let remote_res = state.client
+
+    let remote_res = state
+        .client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
         .query(&query_params)
@@ -169,12 +177,18 @@ pub async fn api_fetch_messages(
 
             match messaging
                 .service
-                .load_messages(ConversationKind::Dm, &room_id, before_cursor.as_deref(), limit)
+                .load_messages(
+                    ConversationKind::Dm,
+                    &room_id,
+                    before_cursor.as_deref(),
+                    limit,
+                )
                 .await
             {
-                Ok(local_messages) if !local_messages.is_empty() => {
-                    Ok(local_messages.into_iter().map(persisted_to_api_message).collect())
-                }
+                Ok(local_messages) if !local_messages.is_empty() => Ok(local_messages
+                    .into_iter()
+                    .map(persisted_to_api_message)
+                    .collect()),
                 Ok(_) => Ok(remote_messages),
                 Err(err) => {
                     eprintln!("[Messaging] Failed to load cached DM messages: {}", err);
@@ -188,7 +202,12 @@ pub async fn api_fetch_messages(
 
             let cached = messaging
                 .service
-                .load_messages(ConversationKind::Dm, &room_id, before_cursor.as_deref(), limit)
+                .load_messages(
+                    ConversationKind::Dm,
+                    &room_id,
+                    before_cursor.as_deref(),
+                    limit,
+                )
                 .await
                 .map_err(|e| format!("{} (cache unavailable: {})", remote_error, e))?;
 
@@ -201,7 +220,12 @@ pub async fn api_fetch_messages(
         Err(remote_error) => {
             let cached = messaging
                 .service
-                .load_messages(ConversationKind::Dm, &room_id, before_cursor.as_deref(), limit)
+                .load_messages(
+                    ConversationKind::Dm,
+                    &room_id,
+                    before_cursor.as_deref(),
+                    limit,
+                )
                 .await
                 .map_err(|e| format!("{} (cache unavailable: {})", remote_error, e))?;
 
@@ -223,9 +247,8 @@ pub async fn api_send_message(
     nonce: Option<String>,
     client_id: Option<String>,
 ) -> Result<Message, String> {
-    let token = state.get_token().await
-        .ok_or("Not authenticated")?;
-    
+    let token = state.get_token().await.ok_or("Not authenticated")?;
+
     let url = format!("{}/chat/{}/messages", state.base_url, room_id);
     let resolved_client_id = client_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
@@ -244,8 +267,9 @@ pub async fn api_send_message(
     {
         eprintln!("[Messaging] Failed to persist pending DM message: {}", err);
     }
-    
-    let res = state.client
+
+    let res = state
+        .client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&SendMessageRequest {
@@ -269,7 +293,9 @@ pub async fn api_send_message(
         return Err(format!("Failed to send message: {}", text));
     }
 
-    let mut message: Message = res.json().await
+    let mut message: Message = res
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
     if message.client_id.is_none() {
@@ -311,10 +337,7 @@ pub async fn api_drain_outbox(
     messaging: State<'_, MessagingState>,
     limit: Option<i64>,
 ) -> Result<u32, String> {
-    let token = state
-        .get_token()
-        .await
-        .ok_or("Not authenticated")?;
+    let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let limit = limit.unwrap_or(200).clamp(1, 1000);
     let outbox_items = messaging
@@ -409,7 +432,10 @@ pub async fn api_drain_outbox(
                 let Some(server_id) = item.server_scope_id.clone() else {
                     let _ = messaging
                         .service
-                        .mark_send_failed(&item.client_id, "Missing server_scope_id for channel outbox message")
+                        .mark_send_failed(
+                            &item.client_id,
+                            "Missing server_scope_id for channel outbox message",
+                        )
                         .await;
                     continue;
                 };
@@ -436,7 +462,8 @@ pub async fn api_drain_outbox(
                         let mut message: ChannelMessage = match res.json().await {
                             Ok(message) => message,
                             Err(err) => {
-                                let reason = format!("Failed to parse channel retry response: {}", err);
+                                let reason =
+                                    format!("Failed to parse channel retry response: {}", err);
                                 let _ = messaging
                                     .service
                                     .mark_send_failed(&item.client_id, &reason)
@@ -472,7 +499,10 @@ pub async fn api_drain_outbox(
                             )
                             .await
                         {
-                            eprintln!("[Messaging] Failed to persist retried channel message: {}", err);
+                            eprintln!(
+                                "[Messaging] Failed to persist retried channel message: {}",
+                                err
+                            );
                         } else {
                             delivered += 1;
                         }
@@ -528,12 +558,12 @@ pub async fn api_send_typing(
     room_id: String,
     is_typing: bool,
 ) -> Result<(), String> {
-    let token = state.get_token().await
-        .ok_or("Not authenticated")?;
+    let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/chat/{}/typing", state.base_url, room_id);
 
-    let res = state.client
+    let res = state
+        .client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&TypingRequest { is_typing })
@@ -555,12 +585,15 @@ pub async fn api_mark_message_delivered(
     room_id: String,
     message_id: String,
 ) -> Result<(), String> {
-    let token = state.get_token().await
-        .ok_or("Not authenticated")?;
+    let token = state.get_token().await.ok_or("Not authenticated")?;
 
-    let url = format!("{}/chat/{}/messages/{}/delivered", state.base_url, room_id, message_id);
+    let url = format!(
+        "{}/chat/{}/messages/{}/delivered",
+        state.base_url, room_id, message_id
+    );
 
-    let res = state.client
+    let res = state
+        .client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .send()
@@ -581,12 +614,12 @@ pub async fn api_mark_room_read(
     room_id: String,
     upto_message_id: Option<String>,
 ) -> Result<(), String> {
-    let token = state.get_token().await
-        .ok_or("Not authenticated")?;
+    let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/chat/{}/read", state.base_url, room_id);
 
-    let res = state.client
+    let res = state
+        .client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&ReadRequest { upto_message_id })
@@ -608,12 +641,15 @@ pub async fn api_delete_message(
     room_id: String,
     message_id: String,
 ) -> Result<(), String> {
-    let token = state.get_token().await
-        .ok_or("Not authenticated")?;
-    
-    let url = format!("{}/chat/{}/messages/{}", state.base_url, room_id, message_id);
-    
-    let res = state.client
+    let token = state.get_token().await.ok_or("Not authenticated")?;
+
+    let url = format!(
+        "{}/chat/{}/messages/{}",
+        state.base_url, room_id, message_id
+    );
+
+    let res = state
+        .client
         .delete(&url)
         .header("Authorization", format!("Bearer {}", token))
         .send()
@@ -633,12 +669,12 @@ pub async fn api_delete_all_messages(
     state: State<'_, ApiState>,
     room_id: String,
 ) -> Result<(), String> {
-    let token = state.get_token().await
-        .ok_or("Not authenticated")?;
-    
+    let token = state.get_token().await.ok_or("Not authenticated")?;
+
     let url = format!("{}/chat/{}/messages", state.base_url, room_id);
-    
-    let res = state.client
+
+    let res = state
+        .client
         .delete(&url)
         .header("Authorization", format!("Bearer {}", token))
         .send()
@@ -667,12 +703,15 @@ pub async fn api_edit_message(
     content: String,
     nonce: Option<String>,
 ) -> Result<Message, String> {
-    let token = state.get_token().await
-        .ok_or("Not authenticated")?;
-    
-    let url = format!("{}/chat/{}/messages/{}", state.base_url, room_id, message_id);
-    
-    let res = state.client
+    let token = state.get_token().await.ok_or("Not authenticated")?;
+
+    let url = format!(
+        "{}/chat/{}/messages/{}",
+        state.base_url, room_id, message_id
+    );
+
+    let res = state
+        .client
         .put(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&EditMessageRequest { content, nonce })
@@ -685,8 +724,218 @@ pub async fn api_edit_message(
         return Err(format!("Failed to edit message: {}", text));
     }
 
-    let message: Message = res.json().await
+    let message: Message = res
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
     Ok(message)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageReactionSummary {
+    pub emoji: String,
+    pub user_ids: Vec<String>,
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ReactionRequest {
+    emoji: String,
+}
+
+#[tauri::command]
+pub async fn api_search_messages(
+    state: State<'_, ApiState>,
+    room_id: String,
+    query: String,
+    limit: Option<i64>,
+) -> Result<Vec<Message>, String> {
+    let token = state.get_token().await.ok_or("Not authenticated")?;
+    let url = format!("{}/chat/{}/messages/search", state.base_url, room_id);
+
+    let mut params = vec![("q".to_string(), query)];
+    if let Some(limit) = limit {
+        params.push(("limit".to_string(), limit.to_string()));
+    }
+
+    let res = state
+        .client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&params)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Failed to search messages: {}", text));
+    }
+
+    res.json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))
+}
+
+#[tauri::command]
+pub async fn api_fetch_message_reactions(
+    state: State<'_, ApiState>,
+    room_id: String,
+    message_id: String,
+) -> Result<Vec<MessageReactionSummary>, String> {
+    let token = state.get_token().await.ok_or("Not authenticated")?;
+    let url = format!(
+        "{}/chat/{}/messages/{}/reactions",
+        state.base_url, room_id, message_id
+    );
+
+    let res = state
+        .client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Failed to fetch message reactions: {}", text));
+    }
+
+    res.json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))
+}
+
+#[tauri::command]
+pub async fn api_add_message_reaction(
+    state: State<'_, ApiState>,
+    room_id: String,
+    message_id: String,
+    emoji: String,
+) -> Result<Vec<MessageReactionSummary>, String> {
+    let token = state.get_token().await.ok_or("Not authenticated")?;
+    let url = format!(
+        "{}/chat/{}/messages/{}/reactions",
+        state.base_url, room_id, message_id
+    );
+
+    let res = state
+        .client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&ReactionRequest { emoji })
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Failed to add message reaction: {}", text));
+    }
+
+    res.json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))
+}
+
+#[tauri::command]
+pub async fn api_remove_message_reaction(
+    state: State<'_, ApiState>,
+    room_id: String,
+    message_id: String,
+    emoji: String,
+) -> Result<Vec<MessageReactionSummary>, String> {
+    let token = state.get_token().await.ok_or("Not authenticated")?;
+    let encoded_emoji: String = byte_serialize(emoji.as_bytes()).collect();
+    let url = format!(
+        "{}/chat/{}/messages/{}/reactions/{}",
+        state.base_url, room_id, message_id, encoded_emoji
+    );
+
+    let res = state
+        .client
+        .delete(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Failed to remove message reaction: {}", text));
+    }
+
+    res.json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))
+}
+
+#[tauri::command]
+pub async fn api_fetch_thread_messages(
+    state: State<'_, ApiState>,
+    room_id: String,
+    message_id: String,
+) -> Result<Vec<Message>, String> {
+    let token = state.get_token().await.ok_or("Not authenticated")?;
+    let url = format!(
+        "{}/chat/{}/messages/{}/thread",
+        state.base_url, room_id, message_id
+    );
+
+    let res = state
+        .client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Failed to fetch thread messages: {}", text));
+    }
+
+    res.json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))
+}
+
+#[tauri::command]
+pub async fn api_send_thread_message(
+    state: State<'_, ApiState>,
+    room_id: String,
+    message_id: String,
+    content: String,
+    nonce: Option<String>,
+    client_id: Option<String>,
+) -> Result<Message, String> {
+    let token = state.get_token().await.ok_or("Not authenticated")?;
+    let url = format!(
+        "{}/chat/{}/messages/{}/thread",
+        state.base_url, room_id, message_id
+    );
+
+    let res = state
+        .client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&SendMessageRequest {
+            content,
+            nonce,
+            client_id,
+        })
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Failed to send thread message: {}", text));
+    }
+
+    res.json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))
 }

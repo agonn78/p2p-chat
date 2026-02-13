@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use sqlx::{sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions}, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    SqlitePool,
+};
 
 use super::domain::{ConversationKind, MessageStatus, OutboxMessage, PersistedMessage};
 use super::error::MessagingError;
@@ -110,11 +113,9 @@ impl MessagingStorage {
         .execute(&self.pool)
         .await?;
 
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_outbox_created_at ON outbox(created_at ASC)",
-        )
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_outbox_created_at ON outbox(created_at ASC)")
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
@@ -282,7 +283,10 @@ impl MessagingStorage {
             .await?
         };
 
-        let mut messages = rows.into_iter().map(Self::row_to_message).collect::<Vec<_>>();
+        let mut messages = rows
+            .into_iter()
+            .map(Self::row_to_message)
+            .collect::<Vec<_>>();
         messages.reverse();
         Ok(messages)
     }
@@ -331,9 +335,13 @@ impl MessagingStorage {
         Ok(())
     }
 
-    pub async fn update_outbox_error(&self, client_id: &str, err: &str) -> Result<(), MessagingError> {
+    pub async fn update_outbox_error(
+        &self,
+        client_id: &str,
+        err: &str,
+    ) -> Result<(), MessagingError> {
         sqlx::query(
-            "UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE client_id = ?"
+            "UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE client_id = ?",
         )
         .bind(err)
         .bind(client_id)
@@ -432,7 +440,9 @@ mod tests {
     #[tokio::test]
     async fn upsert_message_deduplicates_on_client_id() {
         let db_path = temp_db_path("messaging-storage-upsert-client");
-        let storage = MessagingStorage::new(db_path.clone()).await.expect("storage init");
+        let storage = MessagingStorage::new(db_path.clone())
+            .await
+            .expect("storage init");
 
         let first = PersistedMessage {
             local_id: "local-c1".to_string(),
@@ -464,7 +474,10 @@ mod tests {
             status: MessageStatus::Sent,
         };
 
-        storage.upsert_message(&first).await.expect("insert pending");
+        storage
+            .upsert_message(&first)
+            .await
+            .expect("insert pending");
         storage.upsert_message(&second).await.expect("upsert ack");
 
         let loaded = storage
@@ -484,7 +497,9 @@ mod tests {
     #[tokio::test]
     async fn outbox_error_and_remove_work() {
         let db_path = temp_db_path("messaging-storage-outbox");
-        let storage = MessagingStorage::new(db_path.clone()).await.expect("storage init");
+        let storage = MessagingStorage::new(db_path.clone())
+            .await
+            .expect("storage init");
 
         let outbox = OutboxMessage {
             client_id: "c2".to_string(),
@@ -499,7 +514,10 @@ mod tests {
             last_error: None,
         };
 
-        storage.enqueue_outbox(&outbox).await.expect("enqueue outbox");
+        storage
+            .enqueue_outbox(&outbox)
+            .await
+            .expect("enqueue outbox");
         storage
             .update_outbox_error("c2", "timeout")
             .await
@@ -511,7 +529,10 @@ mod tests {
         assert_eq!(listed[0].last_error.as_deref(), Some("timeout"));
 
         storage.remove_outbox("c2").await.expect("remove outbox");
-        let listed = storage.list_outbox(10).await.expect("list outbox after remove");
+        let listed = storage
+            .list_outbox(10)
+            .await
+            .expect("list outbox after remove");
         assert!(listed.is_empty());
 
         let _ = std::fs::remove_file(db_path);
@@ -520,7 +541,9 @@ mod tests {
     #[tokio::test]
     async fn load_messages_honors_before_cursor() {
         let db_path = temp_db_path("messaging-storage-before-cursor");
-        let storage = MessagingStorage::new(db_path.clone()).await.expect("storage init");
+        let storage = MessagingStorage::new(db_path.clone())
+            .await
+            .expect("storage init");
 
         let m1 = PersistedMessage {
             local_id: "m1".to_string(),

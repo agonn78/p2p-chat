@@ -7,14 +7,20 @@ services:
       dockerfile: apps/server/Dockerfile
     ports:
       - "3000:3000"
+    restart: unless-stopped
     environment:
+      - DATABASE_URL=postgres://user:password@db:5432/p2p_chat
+      - JWT_SECRET=change-me-in-production
+      - ALLOWED_ORIGINS=http://localhost:1420
       - RUST_LOG=info
+      - SEED_TEST_USERS=false
     depends_on:
-      - db
+      db:
+        condition: service_healthy
 
   db:
-    container_name: p2p-chat-db
     image: postgres:15-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: password
@@ -23,6 +29,11 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d p2p_chat"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
 
 volumes:
   postgres_data:

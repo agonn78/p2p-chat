@@ -3,13 +3,15 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
+use validator::Validate;
 
 use crate::auth::{AuthError, AuthUser};
 use crate::state::AppState;
+use crate::validation::validate_username;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -33,8 +35,9 @@ pub struct FriendInfo {
     pub last_seen: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Validate)]
 pub struct FriendRequest {
+    #[validate(length(min = 3, max = 32), custom(function = "validate_username"))]
     pub username: String,
 }
 
@@ -68,9 +71,12 @@ async fn send_request(
     user: AuthUser,
     Json(req): Json<FriendRequest>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
+    req.validate()
+        .map_err(|e| AuthError::Validation(e.to_string()))?;
+
     // Find target user
     let target = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE username = $1")
-        .bind(&req.username)
+        .bind(req.username.trim())
         .fetch_optional(&state.db)
         .await?
         .ok_or(AuthError::InvalidCredentials)?;
@@ -92,19 +98,21 @@ async fn send_request(
     .await?;
 
     if existing > 0 {
-        return Ok(Json(serde_json::json!({ "error": "Friend request already exists" })));
+        return Ok(Json(
+            serde_json::json!({ "error": "Friend request already exists" }),
+        ));
     }
 
     // Create friendship request
-    sqlx::query(
-        "INSERT INTO friendships (user_id, friend_id, status) VALUES ($1, $2, 'pending')"
-    )
-    .bind(user.id)
-    .bind(target)
-    .execute(&state.db)
-    .await?;
+    sqlx::query("INSERT INTO friendships (user_id, friend_id, status) VALUES ($1, $2, 'pending')")
+        .bind(user.id)
+        .bind(target)
+        .execute(&state.db)
+        .await?;
 
-    Ok(Json(serde_json::json!({ "success": true, "message": "Friend request sent" })))
+    Ok(Json(
+        serde_json::json!({ "success": true, "message": "Friend request sent" }),
+    ))
 }
 
 /// Accept a friend request
@@ -113,8 +121,12 @@ async fn accept_request(
     user: AuthUser,
     Path(sender_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
-    tracing::info!("Received accept request for sender_id: {} from user: {}", sender_id, user.id);
-    
+    tracing::info!(
+        "Received accept request for sender_id: {} from user: {}",
+        sender_id,
+        user.id
+    );
+
     let result = sqlx::query(
         r#"
         UPDATE friendships 
@@ -131,7 +143,9 @@ async fn accept_request(
         return Ok(Json(serde_json::json!({ "error": "Request not found" })));
     }
 
-    Ok(Json(serde_json::json!({ "success": true, "message": "Friend request accepted" })))
+    Ok(Json(
+        serde_json::json!({ "success": true, "message": "Friend request accepted" }),
+    ))
 }
 
 /// Reject a friend request
@@ -141,7 +155,7 @@ async fn reject_request(
     Path(sender_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
     sqlx::query(
-        "DELETE FROM friendships WHERE user_id = $1 AND friend_id = $2 AND status = 'pending'"
+        "DELETE FROM friendships WHERE user_id = $1 AND friend_id = $2 AND status = 'pending'",
     )
     .bind(sender_id)
     .bind(user.id)

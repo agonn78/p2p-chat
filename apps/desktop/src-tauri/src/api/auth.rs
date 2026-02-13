@@ -1,6 +1,6 @@
+use crate::api::ApiState;
 use serde::{Deserialize, Serialize};
 use tauri::State;
-use crate::api::ApiState;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LoginRequest {
@@ -21,7 +21,7 @@ pub struct User {
     pub username: String,
     // Note: server's UserPublic doesn't include email in response
     pub avatar_url: Option<String>,
-    pub last_seen: Option<String>,  // DateTime comes as string
+    pub last_seen: Option<String>, // DateTime comes as string
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,8 +37,9 @@ pub async fn api_login(
     password: String,
 ) -> Result<AuthResponse, String> {
     let url = format!("{}/auth/login", state.base_url);
-    
-    let res = state.client
+
+    let res = state
+        .client
         .post(&url)
         .json(&LoginRequest { email, password })
         .send()
@@ -51,7 +52,9 @@ pub async fn api_login(
         return Err(format!("Login failed ({}): {}", status, text));
     }
 
-    let auth_response: AuthResponse = res.json().await
+    let auth_response: AuthResponse = res
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
     // Store token for subsequent requests
@@ -68,10 +71,15 @@ pub async fn api_register(
     password: String,
 ) -> Result<AuthResponse, String> {
     let url = format!("{}/auth/register", state.base_url);
-    
-    let res = state.client
+
+    let res = state
+        .client
         .post(&url)
-        .json(&RegisterRequest { username, email, password })
+        .json(&RegisterRequest {
+            username,
+            email,
+            password,
+        })
         .send()
         .await
         .map_err(|e| format!("Network error: {}", e))?;
@@ -82,7 +90,9 @@ pub async fn api_register(
         return Err(format!("Registration failed ({}): {}", status, text));
     }
 
-    let auth_response: AuthResponse = res.json().await
+    let auth_response: AuthResponse = res
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
     // Store token for subsequent requests
@@ -100,7 +110,7 @@ pub async fn api_logout(state: State<'_, ApiState>) -> Result<(), String> {
 #[tauri::command]
 pub async fn api_health_check(state: State<'_, ApiState>) -> Result<bool, String> {
     let url = format!("{}/health", state.base_url);
-    
+
     match state.client.get(&url).send().await {
         Ok(res) => Ok(res.status().is_success()),
         Err(_) => Ok(false),

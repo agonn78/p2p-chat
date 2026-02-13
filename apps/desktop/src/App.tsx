@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Mic, Video, Settings, Hash, Send, UserPlus, Phone, LogOut, MicOff, UserCircle, Calendar, Wifi, WifiOff, Trash2, Copy, Pencil, Check, X } from 'lucide-react';
+import { Mic, Video, Settings, Hash, Send, UserPlus, Phone, LogOut, MicOff, UserCircle, Calendar, Wifi, WifiOff, Trash2, Copy, Pencil, Check, X, SmilePlus } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore, POLL_INTERVAL_MS } from './store';
@@ -56,6 +56,7 @@ function App() {
     const channels = useAppStore((s) => s.channels);
     const activeChannel = useAppStore((s) => s.activeChannel);
     const channelMessages = useAppStore((s) => s.channelMessages);
+    const channelReactions = useAppStore((s) => s.channelReactions);
     const hasMoreChannelMessages = useAppStore((s) => s.hasMoreChannelMessages);
     const isLoadingMoreChannelMessages = useAppStore((s) => s.isLoadingMoreChannelMessages);
     const loadOlderChannelMessages = useAppStore((s) => s.loadOlderChannelMessages);
@@ -64,6 +65,9 @@ function App() {
     const setChannelTyping = useAppStore((s) => s.setChannelTyping);
     const setVoicePresence = useAppStore((s) => s.setVoicePresence);
     const sendChannelMessage = useAppStore((s) => s.sendChannelMessage);
+    const setChannelMessageReactions = useAppStore((s) => s.setChannelMessageReactions);
+    const fetchChannelMessageReactions = useAppStore((s) => s.fetchChannelMessageReactions);
+    const toggleChannelReaction = useAppStore((s) => s.toggleChannelReaction);
 
     // Chat Store
     const activeRoom = useAppStore((s) => s.activeRoom);
@@ -219,6 +223,12 @@ function App() {
                                     m.id === payload.message.id ? { ...m, ...payload.message } : m
                                 ),
                             }));
+                        } else if (payload.type === 'CHANNEL_MESSAGE_REACTIONS') {
+                            if (payload.message_id) {
+                                setChannelMessageReactions(payload.message_id, payload.reactions || []);
+                            }
+                        } else if (payload.type === 'MENTION_ALERT') {
+                            console.log('[App] 🔔 Mention alert:', payload);
                         }
                     } catch (e) {
                         console.error('[App] ❌ Failed to parse WS message:', e);
@@ -276,7 +286,7 @@ function App() {
             console.log('[App] 🔌 Cleaning up WebSocket listener');
             if (cleanup) cleanup();
         };
-    }, [isAuthenticated, activeRoom, activeChannel, user?.id, setTyping, setChannelTyping, setVoicePresence]);
+    }, [isAuthenticated, activeRoom, activeChannel, user?.id, setTyping, setChannelTyping, setVoicePresence, setChannelMessageReactions]);
 
     // Call event listeners
     useEffect(() => {
@@ -641,6 +651,9 @@ function App() {
                                 channels={channels}
                                 user={user}
                                 serverMembers={serverMembers}
+                                channelReactions={channelReactions}
+                                fetchChannelMessageReactions={fetchChannelMessageReactions}
+                                toggleChannelReaction={toggleChannelReaction}
                                 typingUserIds={typingByChannel[activeChannel] || []}
                             />
                         ) : (
@@ -1021,9 +1034,13 @@ function App() {
                                     <Phone className="w-5 h-5" />
                                     Voice Call
                                 </button>
-                                <button className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition">
+                                <button
+                                    onClick={() => handleJoinCall(activeFriend.id)}
+                                    className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition"
+                                    title="Video call (beta fallback to secure voice)"
+                                >
                                     <Video className="w-5 h-5" />
-                                    Video Call
+                                    Video Call (Beta)
                                 </button>
                             </div>
 
@@ -1099,6 +1116,7 @@ function App() {
 // Server Chat View Component
 function ServerChatView({
     channelMessages,
+    channelReactions,
     sendChannelMessage,
     loadOlderChannelMessages,
     hasMoreChannelMessages,
@@ -1108,9 +1126,12 @@ function ServerChatView({
     channels,
     user,
     serverMembers,
+    fetchChannelMessageReactions,
+    toggleChannelReaction,
     typingUserIds,
 }: {
     channelMessages: any[];
+    channelReactions: Record<string, { emoji: string; user_ids: string[]; count: number }[]>;
     sendChannelMessage: (serverId: string, channelId: string, content: string) => Promise<void>;
     loadOlderChannelMessages: () => Promise<void>;
     hasMoreChannelMessages: boolean;
@@ -1120,6 +1141,8 @@ function ServerChatView({
     channels: any[];
     user: any;
     serverMembers: any[];
+    fetchChannelMessageReactions: (serverId: string, channelId: string, messageId: string) => Promise<void>;
+    toggleChannelReaction: (serverId: string, channelId: string, messageId: string, emoji: string) => Promise<void>;
     typingUserIds: string[];
 }) {
     const [input, setInput] = useState('');
@@ -1163,6 +1186,18 @@ function ServerChatView({
             }
         };
     }, [input, activeServer, activeChannel]);
+
+    useEffect(() => {
+        for (const msg of channelMessages) {
+            if (msg.id.startsWith('local-')) {
+                continue;
+            }
+            const hasCached = !!channelReactions[msg.id];
+            if (!hasCached) {
+                void fetchChannelMessageReactions(activeServer, activeChannel, msg.id);
+            }
+        }
+    }, [channelMessages, channelReactions, activeServer, activeChannel, fetchChannelMessageReactions]);
 
     useEffect(() => {
         const container = messagesContainerRef.current;
@@ -1280,6 +1315,34 @@ function ServerChatView({
                                 )}
                             </div>
                             <p className="text-gray-200">{msg.content}</p>
+                            <div className="mt-2 flex items-center flex-wrap gap-1.5">
+                                {(channelReactions[msg.id] || msg.reactions || []).map((reaction: any) => {
+                                    const mine = reaction.user_ids?.includes(user?.id);
+                                    return (
+                                        <button
+                                            key={`${msg.id}-${reaction.emoji}`}
+                                            onClick={() => toggleChannelReaction(activeServer, activeChannel, msg.id, reaction.emoji)}
+                                            className={`px-2 py-1 rounded-full text-xs border transition ${mine
+                                                ? 'bg-primary/30 border-primary/60 text-white'
+                                                : 'bg-white/5 border-white/10 text-gray-200 hover:bg-white/10'
+                                                }`}
+                                            title={mine ? 'Remove reaction' : 'Add reaction'}
+                                        >
+                                            <span className="mr-1">{reaction.emoji}</span>
+                                            <span>{reaction.count}</span>
+                                        </button>
+                                    );
+                                })}
+                                {!msg.id.startsWith('local-') && (
+                                    <button
+                                        onClick={() => toggleChannelReaction(activeServer, activeChannel, msg.id, '👍')}
+                                        className="p-1 rounded-full text-gray-400 hover:text-white hover:bg-white/10 transition"
+                                        title="React with thumbs up"
+                                    >
+                                        <SmilePlus className="w-4 h-4" />
+                                    </button>
+                                )}
+                            </div>
                         </div>
                     </div>
                 ))}

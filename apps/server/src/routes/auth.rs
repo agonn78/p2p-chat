@@ -31,10 +31,7 @@ async fn login(
     Ok(Json(response))
 }
 
-async fn me(
-    State(state): State<AppState>,
-    user: AuthUser,
-) -> Result<Json<UserPublic>, AuthError> {
+async fn me(State(state): State<AppState>, user: AuthUser) -> Result<Json<UserPublic>, AuthError> {
     let user = auth::get_me(&state.db, user.id).await?;
     Ok(Json(user.into()))
 }

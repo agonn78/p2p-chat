@@ -1,6 +1,6 @@
 pub mod auth;
-pub mod friends;
 pub mod chat;
+pub mod friends;
 pub mod servers;
 pub mod users;
 
@@ -21,7 +21,7 @@ impl ApiState {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client");
-        
+
         Self {
             client,
             base_url,

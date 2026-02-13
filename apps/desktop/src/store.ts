@@ -14,6 +14,7 @@ import type {
     IncomingCallPayload,
     CallAcceptedPayload,
     VoiceChannelParticipant,
+    MessageReaction,
 } from './types';
 import * as crypto from './crypto';
 
@@ -88,6 +89,7 @@ interface AppState {
     isLoadingMoreChannelMessages: boolean;
     voicePresenceByChannel: Record<string, string[]>;
     activeVoiceChannel: string | null;
+    channelReactions: Record<string, MessageReaction[]>;
 
     // Actions
     login: (email: string, password: string) => Promise<void>;
@@ -144,6 +146,9 @@ interface AppState {
     fetchChannelMessages: (serverId: string, channelId: string, options?: { before?: string; append?: boolean; limit?: number }) => Promise<void>;
     loadOlderChannelMessages: () => Promise<void>;
     sendChannelMessage: (serverId: string, channelId: string, content: string) => Promise<void>;
+    fetchChannelMessageReactions: (serverId: string, channelId: string, messageId: string) => Promise<void>;
+    toggleChannelReaction: (serverId: string, channelId: string, messageId: string, emoji: string) => Promise<void>;
+    setChannelMessageReactions: (messageId: string, reactions: MessageReaction[]) => void;
     setVoicePresence: (channelId: string, userId: string, joined: boolean) => void;
     fetchVoiceChannelPresence: (serverId: string, channelId: string) => Promise<void>;
     joinVoiceChannel: (serverId: string, channelId: string) => Promise<void>;
@@ -186,6 +191,7 @@ export const useAppStore = create<AppState>()(
             isLoadingMoreChannelMessages: false,
             voicePresenceByChannel: {},
             activeVoiceChannel: null,
+            channelReactions: {},
 
             // Connection Actions
             setWsConnected: (connected) => {
@@ -270,6 +276,7 @@ export const useAppStore = create<AppState>()(
                     isLoadingMoreChannelMessages: false,
                     voicePresenceByChannel: {},
                     activeVoiceChannel: null,
+                    channelReactions: {},
                     typingByRoom: {},
                     typingByChannel: {},
                     wsConnected: false,
@@ -987,6 +994,7 @@ export const useAppStore = create<AppState>()(
                             isLoadingMoreChannelMessages: false,
                             voicePresenceByChannel: {},
                             activeVoiceChannel: null,
+                            channelReactions: {},
                         });
                     }
                     await fetchServers();
@@ -1014,6 +1022,7 @@ export const useAppStore = create<AppState>()(
                     isLoadingMoreChannelMessages: false,
                     voicePresenceByChannel: {},
                     activeVoiceChannel: null,
+                    channelReactions: {},
                 });
                 if (serverId) {
                     get().fetchChannels(serverId);
@@ -1061,6 +1070,7 @@ export const useAppStore = create<AppState>()(
                     channelMessages: [],
                     hasMoreChannelMessages: true,
                     isLoadingMoreChannelMessages: false,
+                    channelReactions: {},
                 });
                 if (channelId && activeServer) {
                     get().fetchChannelMessages(activeServer, channelId, { limit: 100 });
@@ -1089,6 +1099,12 @@ export const useAppStore = create<AppState>()(
                 try {
                     const fetched = await invoke<ChannelMessage[]>('api_fetch_channel_messages', { serverId, channelId, before, limit });
                     const normalized = fetched.map((m) => ({ ...m, status: m.status ?? 'sent' as const }));
+                    const reactionPatch: Record<string, MessageReaction[]> = {};
+                    for (const msg of normalized) {
+                        if (msg.reactions) {
+                            reactionPatch[msg.id] = msg.reactions;
+                        }
+                    }
 
                     if (append) {
                         const merged = [...normalized, ...get().channelMessages].filter((msg, idx, arr) => {
@@ -1100,12 +1116,17 @@ export const useAppStore = create<AppState>()(
                             channelMessages: merged,
                             hasMoreChannelMessages: normalized.length >= limit,
                             isLoadingMoreChannelMessages: false,
+                            channelReactions: {
+                                ...get().channelReactions,
+                                ...reactionPatch,
+                            },
                         });
                     } else {
                         set({
                             channelMessages: normalized,
                             hasMoreChannelMessages: normalized.length >= limit,
                             isLoadingMoreChannelMessages: false,
+                            channelReactions: reactionPatch,
                         });
                     }
 
@@ -1177,6 +1198,62 @@ export const useAppStore = create<AppState>()(
                                 : m
                         )
                     });
+                }
+            },
+
+            setChannelMessageReactions: (messageId, reactions) => {
+                set((state) => ({
+                    channelReactions: {
+                        ...state.channelReactions,
+                        [messageId]: reactions,
+                    },
+                    channelMessages: state.channelMessages.map((msg) =>
+                        msg.id === messageId ? { ...msg, reactions } : msg
+                    ),
+                }));
+            },
+
+            fetchChannelMessageReactions: async (serverId, channelId, messageId) => {
+                try {
+                    const reactions = await invoke<MessageReaction[]>('api_fetch_channel_message_reactions', {
+                        serverId,
+                        channelId,
+                        messageId,
+                    });
+                    get().setChannelMessageReactions(messageId, reactions);
+                } catch (e) {
+                    console.error('[Store] fetchChannelMessageReactions error:', e);
+                }
+            },
+
+            toggleChannelReaction: async (serverId, channelId, messageId, emoji) => {
+                const { user, channelReactions } = get();
+                const myId = user?.id;
+                if (!myId) return;
+
+                const current = channelReactions[messageId] || [];
+                const hasMine = current.some((reaction) =>
+                    reaction.emoji === emoji && reaction.user_ids.includes(myId)
+                );
+
+                try {
+                    const reactions = hasMine
+                        ? await invoke<MessageReaction[]>('api_remove_channel_message_reaction', {
+                            serverId,
+                            channelId,
+                            messageId,
+                            emoji,
+                        })
+                        : await invoke<MessageReaction[]>('api_add_channel_message_reaction', {
+                            serverId,
+                            channelId,
+                            messageId,
+                            emoji,
+                        });
+
+                    get().setChannelMessageReactions(messageId, reactions);
+                } catch (e) {
+                    console.error('[Store] toggleChannelReaction error:', e);
                 }
             },
 

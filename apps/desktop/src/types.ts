@@ -31,6 +31,7 @@ export interface Message {
     edited_at?: string | null;
     status?: MessageStatus;
     _decryptedContent?: string;  // Client-side only - cached decrypted content
+    reactions?: MessageReaction[];
 }
 
 export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
@@ -116,5 +117,12 @@ export interface ChannelMessage {
     edited_at?: string | null;
     status?: MessageStatus;
     _decryptedContent?: string;
+    reactions?: MessageReaction[];
+}
+
+export interface MessageReaction {
+    emoji: string;
+    user_ids: string[];
+    count: number;
 }
 

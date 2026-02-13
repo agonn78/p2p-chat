@@ -1,7 +1,7 @@
 //! P2P Nitro Media Engine
-//! 
+//!
 //! Provides E2EE audio/video communication over WebRTC.
-//! 
+//!
 //! Pipeline: cpal (capture) → audiopus (encode) → ring (encrypt) → webrtc-rs (send)
 
 mod audio;
@@ -9,7 +9,10 @@ mod crypto;
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::mpsc;
 use webrtc::api::media_engine::MediaEngine as WebRtcMediaEngine;
 use webrtc::api::APIBuilder;
@@ -97,10 +100,10 @@ pub struct MediaEngine {
     keypair: Option<crypto::KeyPair>,
     /// Derived crypto context after key exchange
     crypto_ctx: Option<Arc<CryptoContext>>,
-    
+
     // WebRTC components
     rtc_connection: Option<Arc<RTCPeerConnection>>,
-    
+
     // Audio components
     audio_capture: Option<Arc<AudioCapture>>,
     audio_playback: Option<Arc<AudioPlayback>>,
@@ -162,13 +165,13 @@ impl MediaEngine {
         if let Some(playback) = &self.audio_playback {
             playback.stop();
         }
-        
+
         // Close WebRTC connection
         if let Some(pc) = self.rtc_connection.take() {
             let _ = pc.close().await;
             tracing::info!("WebRTC connection closed");
         }
-        
+
         self.keypair = None;
         self.crypto_ctx = None;
         self.audio_capture = None;
@@ -189,14 +192,17 @@ impl MediaEngine {
 
     /// Complete key exchange with peer's public key
     pub fn complete_key_exchange(&mut self, peer_public_key_base64: &str) -> Result<()> {
-        let keypair = self.keypair.take()
+        let keypair = self
+            .keypair
+            .take()
             .ok_or_else(|| anyhow::anyhow!("No keypair generated"))?;
-        
-        let peer_key_bytes = crypto::parse_public_key(peer_public_key_base64)
+
+        let peer_key_bytes =
+            crypto::parse_public_key(peer_public_key_base64).map_err(|e| anyhow::anyhow!(e))?;
+        let ctx = keypair
+            .derive_shared_secret(&peer_key_bytes)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let ctx = keypair.derive_shared_secret(&peer_key_bytes)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        
+
         self.crypto_ctx = Some(Arc::new(ctx));
         tracing::info!("E2EE key exchange completed successfully");
         Ok(())
@@ -220,33 +226,39 @@ impl MediaEngine {
 
     /// Get current mute state
     pub fn is_muted(&self) -> bool {
-        self.audio_capture.as_ref().map(|c| c.is_muted()).unwrap_or(false)
+        self.audio_capture
+            .as_ref()
+            .map(|c| c.is_muted())
+            .unwrap_or(false)
     }
 
     /// Take the RMS receiver for VU meter updates
     pub fn take_rms_receiver(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<f32>> {
-        self.audio_capture.as_ref().and_then(|c| c.take_rms_receiver())
+        self.audio_capture
+            .as_ref()
+            .and_then(|c| c.take_rms_receiver())
     }
 
     /// List available input (microphone) devices
     pub fn list_input_devices() -> Result<Vec<(String, String)>> {
         let host = cpal::default_host();
         let mut devices = Vec::new();
-        
+
         for device in host.input_devices()? {
             if let Ok(name) = device.name() {
                 // Use name as both ID and display name for now
                 devices.push((name.clone(), name));
             }
         }
-        
+
         Ok(devices)
     }
 
     /// Get the default input device name
     pub fn default_input_device_name() -> Result<String> {
         let host = cpal::default_host();
-        let device = host.default_input_device()
+        let device = host
+            .default_input_device()
             .ok_or_else(|| anyhow::anyhow!("No default input device"))?;
         device.name().map_err(|e| anyhow::anyhow!(e))
     }
@@ -297,7 +309,8 @@ impl MediaEngine {
     /// Get the default output device name
     pub fn default_output_device_name() -> Result<String> {
         let host = cpal::default_host();
-        let device = host.default_output_device()
+        let device = host
+            .default_output_device()
             .ok_or_else(|| anyhow::anyhow!("No default output device"))?;
         device.name().map_err(|e| anyhow::anyhow!(e))
     }
@@ -354,7 +367,8 @@ impl MediaEngine {
             capture.set_agc_enabled(self.audio_settings.agc);
             capture.set_noise_gate_enabled(self.audio_settings.noise_gate);
             capture.set_noise_gate_threshold(self.audio_settings.noise_gate_threshold);
-            capture.set_muted(self.audio_settings.deafen || self.audio_settings.voice_mode == "mute");
+            capture
+                .set_muted(self.audio_settings.deafen || self.audio_settings.voice_mode == "mute");
         }
 
         if let Some(playback) = &self.audio_playback {
@@ -395,9 +409,7 @@ impl MediaEngine {
         let mut media_engine = WebRtcMediaEngine::default();
         media_engine.register_default_codecs()?;
 
-        let api = APIBuilder::new()
-            .with_media_engine(media_engine)
-            .build();
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
 
         let ice_servers = self
             .ice_servers
@@ -453,7 +465,7 @@ impl MediaEngine {
             let playback = Arc::new(AudioPlayback::new(ctx.clone())?);
             self.audio_playback = Some(playback.clone());
             let shared_playback_rms = playback.output_rms_shared();
-             
+
             // Setup Capture
             let capture = Arc::new(AudioCapture::new(ctx.clone(), shared_playback_rms)?);
             self.audio_capture = Some(capture.clone());
@@ -470,17 +482,17 @@ impl MediaEngine {
             let capture_clone = capture.clone();
             let preferred_input_device_clone = preferred_input_device.clone();
             let preferred_output_device_clone = preferred_output_device.clone();
-            
+
             pc.on_data_channel(Box::new(move |d_channel: Arc<RTCDataChannel>| {
                 let playback = playback_clone.clone();
                 let capture = capture_clone.clone();
                 let playback_started = playback_started_clone.clone();
                 let preferred_input_device = preferred_input_device_clone.clone();
                 let preferred_output_device = preferred_output_device_clone.clone();
-                
+
                 Box::pin(async move {
                     tracing::info!("New DataChannel {} {}", d_channel.label(), d_channel.id());
-                    
+
                     let d_channel_clone = d_channel.clone();
                     let playback_for_open = playback.clone();
                     let ps_for_open = playback_started.clone();
@@ -502,19 +514,22 @@ impl MediaEngine {
                                     Err(e) => tracing::error!("Failed to start playback: {}", e),
                                 }
                             }
-                            
+
                             // Start capture
                             if let Err(e) = capture.start_with_device(preferred_input.as_deref()) {
                                 tracing::error!("Failed to start capture: {}", e);
                             }
-                            
+
                             // Pipe capture -> DC
                             if let Some(mut rx) = capture.take_packet_receiver() {
                                 tokio::spawn(async move {
                                     while let Some(packet) = rx.recv().await {
                                         if let Ok(bytes) = bincode::serialize(&packet) {
                                             if let Err(e) = dc.send(&bytes.into()).await {
-                                                tracing::warn!("Failed to send audio packet (Answerer): {}", e);
+                                                tracing::warn!(
+                                                    "Failed to send audio packet (Answerer): {}",
+                                                    e
+                                                );
                                             }
                                         }
                                     }
@@ -526,11 +541,14 @@ impl MediaEngine {
                     d_channel.on_message(Box::new(move |msg: DataChannelMessage| {
                         let playback = playback.clone();
                         Box::pin(async move {
-                           if let Ok(packet) = bincode::deserialize::<AudioPacket>(&msg.data) {
-                               if let Err(e) = playback.process_packet(packet) {
-                                   tracing::warn!("Failed to process incoming audio packet (Answerer): {}", e);
-                               }
-                           }
+                            if let Ok(packet) = bincode::deserialize::<AudioPacket>(&msg.data) {
+                                if let Err(e) = playback.process_packet(packet) {
+                                    tracing::warn!(
+                                        "Failed to process incoming audio packet (Answerer): {}",
+                                        e
+                                    );
+                                }
+                            }
                         })
                     }));
                 })
@@ -543,22 +561,28 @@ impl MediaEngine {
 
     /// Create an offer for a WebRTC connection
     pub async fn create_offer(&self) -> Result<String> {
-        let pc = self.rtc_connection.as_ref()
+        let pc = self
+            .rtc_connection
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WebRTC not initialized"))?;
 
         let offer = pc.create_offer(None).await?;
         pc.set_local_description(offer).await?;
 
         // Send the SDP immediately and rely on trickle ICE via on_ice_candidate.
-        let local_desc = pc.local_description().await
+        let local_desc = pc
+            .local_description()
+            .await
             .ok_or_else(|| anyhow::anyhow!("Failed to get local description"))?;
-        
+
         Ok(serde_json::to_string(&local_desc)?)
     }
 
     /// Accept an offer from a peer and create an answer
     pub async fn accept_offer(&self, offer_sdp: &str) -> Result<String> {
-        let pc = self.rtc_connection.as_ref()
+        let pc = self
+            .rtc_connection
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WebRTC not initialized"))?;
 
         let offer = serde_json::from_str::<RTCSessionDescription>(offer_sdp)?;
@@ -568,17 +592,21 @@ impl MediaEngine {
         pc.set_local_description(answer).await?;
 
         // Send the SDP immediately and rely on trickle ICE via on_ice_candidate.
-        let local_desc = pc.local_description().await
+        let local_desc = pc
+            .local_description()
+            .await
             .ok_or_else(|| anyhow::anyhow!("Failed to get local description"))?;
-        
+
         Ok(serde_json::to_string(&local_desc)?)
     }
 
     /// Set the remote description (answer or offer)
     pub async fn set_remote_description(&self, sdp: &str) -> Result<()> {
-        let pc = self.rtc_connection.as_ref()
+        let pc = self
+            .rtc_connection
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WebRTC not initialized"))?;
-        
+
         let remote_desc = serde_json::from_str::<RTCSessionDescription>(sdp)?;
         pc.set_remote_description(remote_desc).await?;
         Ok(())
@@ -586,9 +614,11 @@ impl MediaEngine {
 
     /// Add a remote ICE candidate
     pub async fn add_ice_candidate(&self, candidate_json: &str) -> Result<()> {
-        let pc = self.rtc_connection.as_ref()
+        let pc = self
+            .rtc_connection
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WebRTC not initialized"))?;
-        
+
         let ice_candidate_init: RTCIceCandidateInit = serde_json::from_str(candidate_json)?;
         pc.add_ice_candidate(ice_candidate_init).await?;
         Ok(())
@@ -596,18 +626,24 @@ impl MediaEngine {
 
     /// Create DataChannel for audio (Offerer side) and start capture
     pub async fn create_audio_channel(&self) -> Result<()> {
-        let pc = self.rtc_connection.as_ref()
-             .ok_or_else(|| anyhow::anyhow!("WebRTC not initialized"))?;
-             
+        let pc = self
+            .rtc_connection
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WebRTC not initialized"))?;
+
         let mut options = RTCDataChannelInit::default();
         options.ordered = Some(false);
         options.max_retransmits = Some(0); // Unreliable (UDP-like) for audio
 
         let dc = pc.create_data_channel("audio", Some(options)).await?;
-        
-        let audio_capture = self.audio_capture.clone()
+
+        let audio_capture = self
+            .audio_capture
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("Audio capture not initialized"))?;
-        let audio_playback = self.audio_playback.clone()
+        let audio_playback = self
+            .audio_playback
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("Audio playback not initialized"))?;
         let preferred_input_device = self.selected_input_device.clone();
         let preferred_output_device = self.selected_output_device.clone();
@@ -637,7 +673,7 @@ impl MediaEngine {
             let ps = playback_started.clone();
             let preferred_input = preferred_input_for_open.clone();
             let preferred_output = preferred_output_for_open.clone();
-            
+
             Box::pin(async move {
                 // Start playback stream once (Offerer side)
                 if !ps.swap(true, Ordering::SeqCst) {
@@ -652,7 +688,7 @@ impl MediaEngine {
                     tracing::error!("Failed to start capture: {}", e);
                     return;
                 }
-                
+
                 // Pipe captured audio packets to the DataChannel
                 if let Some(mut rx) = capture.take_packet_receiver() {
                     tokio::spawn(async move {
@@ -669,7 +705,7 @@ impl MediaEngine {
                 }
             })
         }));
-        
+
         Ok(())
     }
 }
