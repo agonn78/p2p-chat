@@ -107,6 +107,7 @@ function App() {
 
     const typingTimeoutRef = useRef<number | null>(null);
     const dmLoadOlderInFlightRef = useRef(false);
+    const lastScrolledRoomRef = useRef<string | null>(null);
 
     useEffect(() => {
         if (isAuthenticated) {
@@ -421,6 +422,19 @@ function App() {
     useEffect(() => {
         const container = dmMessagesContainerRef.current;
         if (!container) return;
+
+        if (!activeRoom) {
+            lastScrolledRoomRef.current = null;
+            return;
+        }
+
+        if (lastScrolledRoomRef.current !== activeRoom) {
+            if (messages.length > 0) {
+                messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
+                lastScrolledRoomRef.current = activeRoom;
+            }
+            return;
+        }
 
         const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
         if (distanceToBottom < 120) {
@@ -1080,6 +1094,7 @@ function ServerChatView({
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const typingTimeoutRef = useRef<number | null>(null);
     const channelLoadOlderInFlightRef = useRef(false);
+    const lastScrolledChannelRef = useRef<string | null>(null);
     const channel = channels.find((c: any) => c.id === activeChannel);
     const typingMemberName = typingUserIds
         .filter((id) => id !== user?.id)
@@ -1120,11 +1135,19 @@ function ServerChatView({
         const container = messagesContainerRef.current;
         if (!container) return;
 
+        if (lastScrolledChannelRef.current !== activeChannel) {
+            if (channelMessages.length > 0) {
+                messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
+                lastScrolledChannelRef.current = activeChannel;
+            }
+            return;
+        }
+
         const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
         if (distanceToBottom < 120) {
             messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
         }
-    }, [channelMessages.length]);
+    }, [channelMessages.length, activeChannel]);
 
     const handleSend = async (e: React.FormEvent) => {
         e.preventDefault();
