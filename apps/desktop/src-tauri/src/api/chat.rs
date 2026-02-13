@@ -501,6 +501,28 @@ pub async fn api_drain_outbox(
 }
 
 #[tauri::command]
+pub async fn api_cache_message_status(
+    messaging: State<'_, MessagingState>,
+    message_id: String,
+    status: String,
+) -> Result<(), String> {
+    let next = match status.as_str() {
+        "sending" => LocalMessageStatus::Sending,
+        "sent" => LocalMessageStatus::Sent,
+        "delivered" => LocalMessageStatus::Delivered,
+        "read" => LocalMessageStatus::Read,
+        "failed" => LocalMessageStatus::Failed,
+        _ => return Err(format!("Unsupported status: {}", status)),
+    };
+
+    messaging
+        .service
+        .set_status_by_server_id(&message_id, next)
+        .await
+        .map_err(|e| format!("Failed to persist message status: {}", e))
+}
+
+#[tauri::command]
 pub async fn api_send_typing(
     state: State<'_, ApiState>,
     room_id: String,

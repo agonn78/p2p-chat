@@ -604,6 +604,7 @@ fn main() {
             api::chat::api_fetch_messages,
             api::chat::api_send_message,
             api::chat::api_drain_outbox,
+            api::chat::api_cache_message_status,
             api::chat::api_send_typing,
             api::chat::api_mark_message_delivered,
             api::chat::api_mark_room_read,

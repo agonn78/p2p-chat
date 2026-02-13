@@ -24,6 +24,21 @@ const SLASH_COMMANDS: Record<string, { description: string; replacement?: string
     '/deleteall': { description: 'Delete entire conversation (server)' },
 };
 
+const MESSAGE_STATUS_RANK: Record<string, number> = {
+    sending: 0,
+    failed: 0,
+    sent: 1,
+    delivered: 2,
+    read: 3,
+};
+
+const shouldPromoteStatus = (current?: string, next?: string) => {
+    if (!next) return false;
+    const currentRank = MESSAGE_STATUS_RANK[current || 'sending'] ?? 0;
+    const nextRank = MESSAGE_STATUS_RANK[next] ?? 0;
+    return nextRank >= currentRank;
+};
+
 function App() {
     const isAuthenticated = useAppStore((s) => s.isAuthenticated);
     const user = useAppStore((s) => s.user);
@@ -143,11 +158,21 @@ function App() {
                             console.log('[App] ✏️ MESSAGE_EDITED via WebSocket');
                             updateMessage(payload.message);
                         } else if (payload.type === 'MESSAGE_STATUS') {
+                            const nextStatus = typeof payload.status === 'string' ? payload.status : undefined;
                             useAppStore.setState((state) => ({
                                 messages: state.messages.map((m) =>
-                                    m.id === payload.message_id ? { ...m, status: payload.status } : m
+                                    m.id === payload.message_id && shouldPromoteStatus(m.status, nextStatus)
+                                        ? { ...m, status: nextStatus }
+                                        : m
                                 ),
                             }));
+
+                            if (payload.message_id && nextStatus) {
+                                invoke('api_cache_message_status', {
+                                    messageId: payload.message_id,
+                                    status: nextStatus,
+                                }).catch(() => undefined);
+                            }
                         } else if (payload.type === 'TYPING') {
                             if (payload.room_id && payload.user_id) {
                                 setTyping(payload.room_id, payload.user_id, !!payload.is_typing);
