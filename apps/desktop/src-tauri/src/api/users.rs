@@ -1,4 +1,5 @@
 use crate::api::ApiState;
+use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -49,7 +50,7 @@ struct UpdateSettingsRequest {
 pub async fn api_upload_public_key(
     state: State<'_, ApiState>,
     public_key: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/users/me/public-key", state.base_url);
@@ -65,7 +66,7 @@ pub async fn api_upload_public_key(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to upload public key: {}", text));
+        return Err(format!("Failed to upload public key: {}", text).into());
     }
 
     Ok(())
@@ -75,7 +76,7 @@ pub async fn api_upload_public_key(
 pub async fn api_fetch_user_public_key(
     state: State<'_, ApiState>,
     user_id: String,
-) -> Result<Option<String>, String> {
+) -> AppResult<Option<String>> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/users/{}/public-key", state.base_url, user_id);
@@ -101,7 +102,7 @@ pub async fn api_fetch_user_public_key(
 }
 
 #[tauri::command]
-pub async fn api_fetch_my_profile(state: State<'_, ApiState>) -> Result<UserProfile, String> {
+pub async fn api_fetch_my_profile(state: State<'_, ApiState>) -> AppResult<UserProfile> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/users/me", state.base_url);
@@ -116,12 +117,14 @@ pub async fn api_fetch_my_profile(state: State<'_, ApiState>) -> Result<UserProf
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to fetch profile: {}", text));
+        return Err(format!("Failed to fetch profile: {}", text).into());
     }
 
-    res.json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))
+    Ok(
+        res.json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?,
+    )
 }
 
 #[tauri::command]
@@ -129,7 +132,7 @@ pub async fn api_update_my_profile(
     state: State<'_, ApiState>,
     username: Option<String>,
     avatar_url: Option<String>,
-) -> Result<UserProfile, String> {
+) -> AppResult<UserProfile> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/users/me", state.base_url);
@@ -148,16 +151,18 @@ pub async fn api_update_my_profile(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to update profile: {}", text));
+        return Err(format!("Failed to update profile: {}", text).into());
     }
 
-    res.json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))
+    Ok(
+        res.json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?,
+    )
 }
 
 #[tauri::command]
-pub async fn api_fetch_my_settings(state: State<'_, ApiState>) -> Result<UserSettings, String> {
+pub async fn api_fetch_my_settings(state: State<'_, ApiState>) -> AppResult<UserSettings> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/users/me/settings", state.base_url);
@@ -172,12 +177,14 @@ pub async fn api_fetch_my_settings(state: State<'_, ApiState>) -> Result<UserSet
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to fetch settings: {}", text));
+        return Err(format!("Failed to fetch settings: {}", text).into());
     }
 
-    res.json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))
+    Ok(
+        res.json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?,
+    )
 }
 
 #[tauri::command]
@@ -186,7 +193,7 @@ pub async fn api_update_my_settings(
     allow_dm_from_strangers: Option<bool>,
     enable_mention_notifications: Option<bool>,
     enable_sound_notifications: Option<bool>,
-) -> Result<UserSettings, String> {
+) -> AppResult<UserSettings> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/users/me/settings", state.base_url);
@@ -206,10 +213,12 @@ pub async fn api_update_my_settings(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to update settings: {}", text));
+        return Err(format!("Failed to update settings: {}", text).into());
     }
 
-    res.json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))
+    Ok(
+        res.json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?,
+    )
 }

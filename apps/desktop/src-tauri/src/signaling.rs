@@ -1,9 +1,16 @@
+use std::sync::{Arc, OnceLock};
+
 use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
 use shared_proto::signaling::SignalingMessage;
-use std::sync::Arc;
 use tauri::Emitter;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+
+use crate::backoff::{compute_backoff_delay, BackoffConfig};
+use crate::error::{AppError, AppResult};
+use crate::observability;
+use crate::protocol;
 
 pub type WsSender = Arc<
     Mutex<
@@ -18,121 +25,311 @@ pub type WsSender = Arc<
     >,
 >;
 
-/// Connect to the signaling server with automatic reconnection
-pub async fn connect(server_url: &str, app_handle: tauri::AppHandle) -> Result<WsSender, String> {
-    let url = url::Url::parse(server_url).map_err(|e| e.to_string())?;
+type WsReadHalf = futures_util::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WsLifecycleState {
+    Disconnected,
+    Connecting,
+    Identifying,
+    Ready,
+    Reconnecting,
+}
+
+#[derive(Debug, Clone)]
+struct IdentifyContext {
+    user_id: String,
+    token: String,
+}
+
+type IdentifySlot = Arc<Mutex<Option<IdentifyContext>>>;
+
+static IDENTIFY_SLOT: OnceLock<IdentifySlot> = OnceLock::new();
+
+fn identify_slot() -> IdentifySlot {
+    IDENTIFY_SLOT
+        .get_or_init(|| Arc::new(Mutex::new(None)))
+        .clone()
+}
+
+/// Connect to the signaling server with automatic reconnection.
+pub async fn connect(server_url: &str, app_handle: tauri::AppHandle) -> AppResult<WsSender> {
+    let url = url::Url::parse(server_url)?;
+
+    let sender = Arc::new(Mutex::new(None));
+    let state = Arc::new(Mutex::new(WsLifecycleState::Disconnected));
+
+    transition_ws_state(&app_handle, &state, WsLifecycleState::Connecting, "initial connect").await;
 
     let (ws_stream, _) = connect_async(url.clone())
         .await
-        .map_err(|e| format!("Failed to connect: {}", e))?;
+        .map_err(|e| AppError::network("Failed to connect signaling websocket").with_details(e.to_string()))?;
 
-    println!("Connected to signaling server: {}", server_url);
+    let (write, read) = ws_stream.split();
+    {
+        let mut guard = sender.lock().await;
+        *guard = Some(write);
+    }
 
-    let (write, mut read) = ws_stream.split();
+    transition_ws_state(&app_handle, &state, WsLifecycleState::Ready, "connected").await;
 
-    let sender = Arc::new(Mutex::new(Some(write)));
     let sender_clone = sender.clone();
-
-    // Emit connected status
-    let _ = app_handle.emit("ws-status", true);
-
-    // Spawn task to handle incoming messages with reconnection
+    let state_clone = state.clone();
     let app_handle_clone = app_handle.clone();
-    let sender_for_reconnect = sender.clone();
-    let server_url_owned = server_url.to_string();
-    tokio::spawn(async move {
-        println!("📡 WebSocket message handler started");
+    let reconnect_url = server_url.to_string();
+    let identify = identify_slot();
 
-        // Process messages from current connection
-        handle_ws_messages(&mut read, &app_handle_clone).await;
+    tauri::async_runtime::spawn(async move {
+        run_ws_loop(
+            reconnect_url,
+            read,
+            sender_clone,
+            state_clone,
+            identify,
+            app_handle_clone,
+        )
+        .await;
+    });
 
-        // Connection dropped — start reconnection loop
-        println!("🔄 WebSocket disconnected, starting reconnection...");
-        let _ = app_handle_clone.emit("ws-status", false);
+    Ok(sender)
+}
 
-        let mut backoff_secs = 1u64;
-        let max_backoff = 30u64;
+async fn run_ws_loop(
+    server_url: String,
+    mut read: WsReadHalf,
+    sender: WsSender,
+    state: Arc<Mutex<WsLifecycleState>>,
+    identify: IdentifySlot,
+    app_handle: tauri::AppHandle,
+) {
+    let backoff = BackoffConfig::websocket_default();
+    let mut reconnect_attempt: u32 = 0;
+
+    loop {
+        handle_ws_messages(&mut read, &app_handle).await;
+
+        transition_ws_state(
+            &app_handle,
+            &state,
+            WsLifecycleState::Reconnecting,
+            "connection dropped",
+        )
+        .await;
 
         loop {
-            println!("🔄 Reconnecting in {}s...", backoff_secs);
-            tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+            let delay = compute_backoff_delay(backoff, reconnect_attempt);
+            reconnect_attempt = reconnect_attempt.saturating_add(1);
 
-            let reconnect_url = match url::Url::parse(&server_url_owned) {
+            tracing::warn!(
+                component = "ws",
+                ws_state = "reconnecting",
+                attempt = reconnect_attempt,
+                delay_ms = delay.as_millis() as u64,
+                trace_id = observability::trace_id(),
+                protocol_version = protocol::PROTOCOL_VERSION,
+                "websocket reconnect scheduled"
+            );
+
+            tokio::time::sleep(delay).await;
+
+            transition_ws_state(&app_handle, &state, WsLifecycleState::Connecting, "retry connect").await;
+
+            let reconnect_url = match url::Url::parse(&server_url) {
                 Ok(url) => url,
-                Err(e) => {
-                    eprintln!("❌ Invalid reconnect URL: {}", e);
-                    backoff_secs = (backoff_secs * 2).min(max_backoff);
+                Err(err) => {
+                    tracing::error!(
+                        component = "ws",
+                        ws_state = "connecting",
+                        trace_id = observability::trace_id(),
+                        protocol_version = protocol::PROTOCOL_VERSION,
+                        error = %err,
+                        "invalid signaling reconnect URL"
+                    );
+                    transition_ws_state(
+                        &app_handle,
+                        &state,
+                        WsLifecycleState::Reconnecting,
+                        "invalid reconnect url",
+                    )
+                    .await;
                     continue;
                 }
             };
 
             match connect_async(reconnect_url).await {
                 Ok((new_ws_stream, _)) => {
-                    println!("✅ WebSocket reconnected!");
-                    let (new_write, mut new_read) = new_ws_stream.split();
-
-                    // Update the sender with new write half
+                    reconnect_attempt = 0;
+                    let (new_write, new_read) = new_ws_stream.split();
                     {
-                        let mut guard = sender_for_reconnect.lock().await;
+                        let mut guard = sender.lock().await;
                         *guard = Some(new_write);
                     }
 
-                    let _ = app_handle_clone.emit("ws-status", true);
-                    // Signal frontend to re-identify
-                    let _ = app_handle_clone.emit("ws-reconnected", true);
-                    backoff_secs = 1; // Reset backoff
+                    let identify_result = maybe_identify_after_reconnect(
+                        &sender,
+                        identify.clone(),
+                        &state,
+                        &app_handle,
+                    )
+                    .await;
 
-                    // Handle messages from new connection
-                    handle_ws_messages(&mut new_read, &app_handle_clone).await;
+                    if let Err(err) = identify_result {
+                        tracing::warn!(
+                            component = "ws",
+                            ws_state = "identifying",
+                            trace_id = observability::trace_id(),
+                            protocol_version = protocol::PROTOCOL_VERSION,
+                            error = %err,
+                            "automatic identify after reconnect failed"
+                        );
+                        transition_ws_state(
+                            &app_handle,
+                            &state,
+                            WsLifecycleState::Reconnecting,
+                            "identify failed",
+                        )
+                        .await;
+                        continue;
+                    }
 
-                    // If we get here, connection dropped again
-                    println!("🔄 WebSocket disconnected again, reconnecting...");
-                    let _ = app_handle_clone.emit("ws-status", false);
+                    transition_ws_state(
+                        &app_handle,
+                        &state,
+                        WsLifecycleState::Ready,
+                        "reconnected",
+                    )
+                    .await;
+
+                    emit_resync(&app_handle);
+                    read = new_read;
+                    break;
                 }
-                Err(e) => {
-                    eprintln!("❌ Reconnection failed: {}", e);
-                    backoff_secs = (backoff_secs * 2).min(max_backoff);
+                Err(err) => {
+                    tracing::warn!(
+                        component = "ws",
+                        ws_state = "connecting",
+                        trace_id = observability::trace_id(),
+                        protocol_version = protocol::PROTOCOL_VERSION,
+                        error = %err,
+                        "websocket reconnect failed"
+                    );
+                    transition_ws_state(
+                        &app_handle,
+                        &state,
+                        WsLifecycleState::Reconnecting,
+                        "connect failed",
+                    )
+                    .await;
                 }
             }
         }
-    });
-
-    Ok(sender_clone)
+    }
 }
 
-/// Handle incoming WebSocket messages (extracted for reconnection reuse)
-async fn handle_ws_messages(
-    read: &mut futures_util::stream::SplitStream<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    >,
+async fn transition_ws_state(
     app_handle: &tauri::AppHandle,
+    state: &Arc<Mutex<WsLifecycleState>>,
+    next: WsLifecycleState,
+    reason: &str,
 ) {
+    {
+        let mut guard = state.lock().await;
+        *guard = next;
+    }
+
+    let ws_connected = matches!(next, WsLifecycleState::Identifying | WsLifecycleState::Ready);
+
+    let payload = serde_json::json!({
+        "state": next,
+        "reason": reason,
+        "traceId": observability::trace_id(),
+        "protocolVersion": protocol::PROTOCOL_VERSION,
+    });
+
+    let _ = app_handle.emit("ws-state", payload);
+    let _ = app_handle.emit("ws-status", ws_connected);
+
+    tracing::info!(
+        component = "ws",
+        ws_state = ?next,
+        trace_id = observability::trace_id(),
+        protocol_version = protocol::PROTOCOL_VERSION,
+        reason,
+        "websocket state transition"
+    );
+}
+
+async fn maybe_identify_after_reconnect(
+    sender: &WsSender,
+    identify: IdentifySlot,
+    state: &Arc<Mutex<WsLifecycleState>>,
+    app_handle: &tauri::AppHandle,
+) -> AppResult<()> {
+    let identify_ctx = identify.lock().await.clone();
+    if let Some(ctx) = identify_ctx {
+        transition_ws_state(
+            app_handle,
+            state,
+            WsLifecycleState::Identifying,
+            "auto identify",
+        )
+        .await;
+        send_identify(sender, &ctx.user_id, &ctx.token).await?;
+    }
+    Ok(())
+}
+
+fn emit_resync(app_handle: &tauri::AppHandle) {
+    let payload = serde_json::json!({
+        "traceId": observability::trace_id(),
+        "protocolVersion": protocol::PROTOCOL_VERSION,
+    });
+    let _ = app_handle.emit("ws-reconnected", true);
+    let _ = app_handle.emit("ws-resync", payload);
+}
+
+/// Handle incoming WebSocket messages.
+async fn handle_ws_messages(read: &mut WsReadHalf, app_handle: &tauri::AppHandle) {
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                println!("📨 [WS] Received from server: {}", text);
+                let _ = app_handle.emit("ws-message", text.clone());
 
-                // Emit to frontend for chat messages
-                match app_handle.emit("ws-message", text.clone()) {
-                    Ok(_) => println!("✅ [WS] Emitted 'ws-message' event to frontend"),
-                    Err(e) => eprintln!("❌ [WS] Failed to emit ws-message event: {}", e),
-                }
-
-                // Also handle WebRTC signaling
                 if let Ok(signal) = serde_json::from_str::<SignalingMessage>(&text) {
+                    if !protocol::is_supported_protocol_version(signal.version()) {
+                        tracing::warn!(
+                            component = "ws",
+                            ws_state = "ready",
+                            trace_id = signal.trace_id().unwrap_or(observability::trace_id()),
+                            protocol_version = signal.version(),
+                            "received unsupported protocol version"
+                        );
+                        let _ = app_handle.emit(
+                            "ws-protocol-error",
+                            serde_json::json!({
+                                "receivedVersion": signal.version(),
+                                "supported": [protocol::LEGACY_PROTOCOL_VERSION, protocol::PROTOCOL_VERSION],
+                            }),
+                        );
+                        continue;
+                    }
+
                     match signal {
-                        SignalingMessage::Offer { target_id, sdp } => {
-                            println!("🎯 Received Offer SDP from {}", target_id);
+                        SignalingMessage::Offer {
+                            target_id, sdp, ..
+                        } => {
                             let payload = serde_json::json!({
                                 "peerId": target_id,
                                 "sdp": sdp,
                             });
                             let _ = app_handle.emit("webrtc-offer", payload);
                         }
-                        SignalingMessage::Answer { target_id, sdp } => {
-                            println!("🎯 Received Answer SDP from {}", target_id);
+                        SignalingMessage::Answer {
+                            target_id, sdp, ..
+                        } => {
                             let payload = serde_json::json!({
                                 "peerId": target_id,
                                 "sdp": sdp,
@@ -144,8 +341,8 @@ async fn handle_ws_messages(
                             candidate,
                             sdp_mid,
                             sdp_m_line_index,
+                            ..
                         } => {
-                            println!("🎯 Received ICE Candidate from {}", target_id);
                             let payload = serde_json::json!({
                                 "peerId": target_id,
                                 "candidate": candidate,
@@ -154,14 +351,12 @@ async fn handle_ws_messages(
                             });
                             let _ = app_handle.emit("webrtc-candidate", payload);
                         }
-
-                        // === Call Events ===
                         SignalingMessage::IncomingCall {
                             caller_id,
                             caller_name,
                             public_key,
+                            ..
                         } => {
-                            println!("📞 Incoming call from {} ({})", caller_name, caller_id);
                             let payload = serde_json::json!({
                                 "callerId": caller_id,
                                 "callerName": caller_name,
@@ -172,54 +367,58 @@ async fn handle_ws_messages(
                         SignalingMessage::CallAccepted {
                             target_id,
                             public_key,
+                            ..
                         } => {
-                            println!("✅ Call accepted by {}", target_id);
                             let payload = serde_json::json!({
                                 "peerId": target_id,
                                 "publicKey": public_key,
                             });
                             let _ = app_handle.emit("call-accepted", payload);
                         }
-                        SignalingMessage::CallDeclined { target_id } => {
-                            println!("❌ Call declined by {}", target_id);
+                        SignalingMessage::CallDeclined { target_id, .. } => {
                             let _ = app_handle.emit("call-declined", target_id);
                         }
-                        SignalingMessage::CallEnded { peer_id } => {
-                            println!("📴 Call ended by {}", peer_id);
+                        SignalingMessage::CallEnded { peer_id, .. } => {
                             let _ = app_handle.emit("call-ended", peer_id);
                         }
                         SignalingMessage::CallBusy {
                             caller_id: busy_user,
+                            ..
                         } => {
-                            println!("📳 User {} is busy", busy_user);
                             let _ = app_handle.emit("call-busy", busy_user);
                         }
-                        SignalingMessage::CallCancelled { caller_id } => {
-                            println!("🚫 Call cancelled by {}", caller_id);
+                        SignalingMessage::CallCancelled { caller_id, .. } => {
                             let _ = app_handle.emit("call-cancelled", caller_id);
                         }
-                        SignalingMessage::CallUnavailable { target_id, reason } => {
-                            println!("⚠️ Call unavailable for {} ({})", target_id, reason);
+                        SignalingMessage::CallUnavailable {
+                            target_id, reason, ..
+                        } => {
                             let payload = serde_json::json!({
                                 "targetId": target_id,
                                 "reason": reason,
                             });
                             let _ = app_handle.emit("call-unavailable", payload);
                         }
-
                         _ => {}
                     }
                 }
             }
-            Ok(Message::Ping(_data)) => {
-                println!("🏓 Received ping, connection is alive");
+            Ok(Message::Ping(_)) => {
+                tracing::debug!(component = "ws", ws_state = "ready", "received ping");
             }
             Ok(Message::Close(_)) => {
-                println!("🔌 Server closed connection");
+                tracing::warn!(component = "ws", ws_state = "disconnected", "server closed websocket");
                 break;
             }
-            Err(e) => {
-                eprintln!("❌ WebSocket error: {}", e);
+            Err(err) => {
+                tracing::warn!(
+                    component = "ws",
+                    ws_state = "disconnected",
+                    trace_id = observability::trace_id(),
+                    protocol_version = protocol::PROTOCOL_VERSION,
+                    error = %err,
+                    "websocket error"
+                );
                 break;
             }
             _ => {}
@@ -227,27 +426,217 @@ async fn handle_ws_messages(
     }
 }
 
-/// Send a signaling message to a peer via the server
-pub async fn send_signal(sender: &WsSender, message: SignalingMessage) -> Result<(), String> {
-    let msg = serde_json::to_string(&message).map_err(|e| e.to_string())?;
+/// Send a signaling message to a peer via the server.
+pub async fn send_signal(sender: &WsSender, message: SignalingMessage) -> AppResult<()> {
+    let message = with_message_metadata(message);
+    if !protocol::is_supported_protocol_version(message.version()) {
+        return Err(AppError::protocol(format!(
+            "Unsupported protocol version {} for websocket message",
+            message.version()
+        )));
+    }
+
+    let payload = serde_json::to_string(&message)?;
 
     let mut guard = sender.lock().await;
     if let Some(ref mut write) = *guard {
         write
-            .send(Message::Text(msg))
+            .send(Message::Text(payload))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|err| AppError::network("Failed to send websocket message").with_details(err.to_string()))?;
         Ok(())
     } else {
-        Err("WebSocket not connected".to_string())
+        Err(AppError::network("WebSocket not connected"))
     }
 }
 
-/// Send identification message to server
-pub async fn send_identify(sender: &WsSender, user_id: &str, token: &str) -> Result<(), String> {
+/// Send identification message to server.
+pub async fn send_identify(sender: &WsSender, user_id: &str, token: &str) -> AppResult<()> {
+    {
+        let slot = identify_slot();
+        let mut guard = slot.lock().await;
+        *guard = Some(IdentifyContext {
+            user_id: user_id.to_string(),
+            token: token.to_string(),
+        });
+    }
+
     let identify = SignalingMessage::Identify {
+        version: protocol::PROTOCOL_VERSION,
+        trace_id: Some(observability::trace_id().to_string()),
         user_id: user_id.to_string(),
         token: token.to_string(),
     };
     send_signal(sender, identify).await
+}
+
+fn with_message_metadata(message: SignalingMessage) -> SignalingMessage {
+    let trace = Some(observability::trace_id().to_string());
+
+    match message {
+        SignalingMessage::Offer {
+            trace_id,
+            target_id,
+            sdp,
+            ..
+        } => SignalingMessage::Offer {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            target_id,
+            sdp,
+        },
+        SignalingMessage::Answer {
+            trace_id,
+            target_id,
+            sdp,
+            ..
+        } => SignalingMessage::Answer {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            target_id,
+            sdp,
+        },
+        SignalingMessage::Candidate {
+            trace_id,
+            target_id,
+            candidate,
+            sdp_mid,
+            sdp_m_line_index,
+            ..
+        } => SignalingMessage::Candidate {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            target_id,
+            candidate,
+            sdp_mid,
+            sdp_m_line_index,
+        },
+        SignalingMessage::Identify {
+            trace_id,
+            user_id,
+            token,
+            ..
+        } => SignalingMessage::Identify {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            user_id,
+            token,
+        },
+        SignalingMessage::CallInitiate {
+            trace_id,
+            target_id,
+            public_key,
+            ..
+        } => SignalingMessage::CallInitiate {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            target_id,
+            public_key,
+        },
+        SignalingMessage::IncomingCall {
+            trace_id,
+            caller_id,
+            caller_name,
+            public_key,
+            ..
+        } => SignalingMessage::IncomingCall {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            caller_id,
+            caller_name,
+            public_key,
+        },
+        SignalingMessage::CallAccept {
+            trace_id,
+            caller_id,
+            public_key,
+            ..
+        } => SignalingMessage::CallAccept {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            caller_id,
+            public_key,
+        },
+        SignalingMessage::CallAccepted {
+            trace_id,
+            target_id,
+            public_key,
+            ..
+        } => SignalingMessage::CallAccepted {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            target_id,
+            public_key,
+        },
+        SignalingMessage::CallDecline {
+            trace_id,
+            caller_id,
+            ..
+        } => SignalingMessage::CallDecline {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            caller_id,
+        },
+        SignalingMessage::CallDeclined {
+            trace_id,
+            target_id,
+            ..
+        } => SignalingMessage::CallDeclined {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            target_id,
+        },
+        SignalingMessage::CallEnd {
+            trace_id, peer_id, ..
+        } => SignalingMessage::CallEnd {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            peer_id,
+        },
+        SignalingMessage::CallEnded {
+            trace_id, peer_id, ..
+        } => SignalingMessage::CallEnded {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            peer_id,
+        },
+        SignalingMessage::CallBusy {
+            trace_id,
+            caller_id,
+            ..
+        } => SignalingMessage::CallBusy {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            caller_id,
+        },
+        SignalingMessage::CallCancel {
+            trace_id,
+            target_id,
+            ..
+        } => SignalingMessage::CallCancel {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            target_id,
+        },
+        SignalingMessage::CallCancelled {
+            trace_id,
+            caller_id,
+            ..
+        } => SignalingMessage::CallCancelled {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            caller_id,
+        },
+        SignalingMessage::CallUnavailable {
+            trace_id,
+            target_id,
+            reason,
+            ..
+        } => SignalingMessage::CallUnavailable {
+            version: protocol::PROTOCOL_VERSION,
+            trace_id: trace_id.or(trace.clone()),
+            target_id,
+            reason,
+        },
+    }
 }

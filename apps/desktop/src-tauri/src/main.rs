@@ -2,11 +2,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
+mod backoff;
 mod config;
+mod error;
 mod messaging;
+mod observability;
+mod protocol;
 mod signaling;
 
 use api::ApiState;
+use error::AppResult;
 use media::{AudioSettings, IceServerConfig, MediaEngine};
 use messaging::service::MessagingService;
 use shared_proto::signaling::SignalingMessage;
@@ -84,9 +89,14 @@ async fn identify_user(
     state: State<'_, AppState>,
     api_state: State<'_, ApiState>,
     user_id: String,
-) -> Result<(), String> {
-    println!("Identifying user: {}", user_id);
-    let token = api_state.get_token().await.ok_or("Not authenticated")?;
+) -> AppResult<()> {
+    tracing::info!(
+        component = "ws.identify",
+        user_id = %user_id,
+        protocol_version = protocol::PROTOCOL_VERSION,
+        "identifying websocket user"
+    );
+    let token = api_state.bearer_token().await?;
     signaling::send_identify(&state.ws_sender, &user_id, &token).await?;
     Ok(())
 }
@@ -96,8 +106,13 @@ async fn send_offer(
     state: State<'_, AppState>,
     target_id: String,
     sdp: String,
-) -> Result<(), String> {
-    let msg = SignalingMessage::Offer { target_id, sdp };
+) -> AppResult<()> {
+    let msg = SignalingMessage::Offer {
+        version: protocol::PROTOCOL_VERSION,
+        trace_id: Some(observability::trace_id().to_string()),
+        target_id,
+        sdp,
+    };
     signaling::send_signal(&state.ws_sender, msg).await
 }
 
@@ -106,8 +121,13 @@ async fn send_answer(
     state: State<'_, AppState>,
     target_id: String,
     sdp: String,
-) -> Result<(), String> {
-    let msg = SignalingMessage::Answer { target_id, sdp };
+) -> AppResult<()> {
+    let msg = SignalingMessage::Answer {
+        version: protocol::PROTOCOL_VERSION,
+        trace_id: Some(observability::trace_id().to_string()),
+        target_id,
+        sdp,
+    };
     signaling::send_signal(&state.ws_sender, msg).await
 }
 
@@ -115,7 +135,7 @@ async fn send_answer(
 
 /// Start a call to a friend - generates keypair and sends CallInitiate
 #[tauri::command]
-async fn start_call(state: State<'_, AppState>, target_id: String) -> Result<String, String> {
+async fn start_call(state: State<'_, AppState>, target_id: String) -> AppResult<String> {
     println!("📞 [CALL-DEBUG] ===== STARTING CALL =====");
     println!("📞 [CALL-DEBUG] Target ID: {}", target_id);
 
@@ -136,6 +156,8 @@ async fn start_call(state: State<'_, AppState>, target_id: String) -> Result<Str
     // Send call initiate signal
     println!("📞 [CALL-DEBUG] Sending CallInitiate signal...");
     let msg = SignalingMessage::CallInitiate {
+        version: protocol::PROTOCOL_VERSION,
+        trace_id: Some(observability::trace_id().to_string()),
         target_id: target_id.clone(),
         public_key: public_key.clone(),
     };
@@ -151,7 +173,7 @@ async fn accept_call(
     state: State<'_, AppState>,
     caller_id: String,
     caller_public_key: String,
-) -> Result<String, String> {
+) -> AppResult<String> {
     println!("✅ [CALL-DEBUG] ===== ACCEPTING CALL =====");
     println!("✅ [CALL-DEBUG] Caller ID: {}", caller_id);
     println!(
@@ -183,6 +205,8 @@ async fn accept_call(
     // Send accept signal with our public key
     println!("✅ [CALL-DEBUG] Sending CallAccept signal...");
     let msg = SignalingMessage::CallAccept {
+        version: protocol::PROTOCOL_VERSION,
+        trace_id: Some(observability::trace_id().to_string()),
         caller_id,
         public_key: public_key.clone(),
     };
@@ -197,7 +221,7 @@ async fn accept_call(
 async fn complete_call_handshake(
     state: State<'_, AppState>,
     peer_public_key: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     println!("🔐 [CALL-DEBUG] ===== COMPLETING E2EE HANDSHAKE =====");
     println!(
         "🔐 [CALL-DEBUG] Peer public key (first 30 chars): {}...",
@@ -221,7 +245,7 @@ async fn complete_call_handshake(
 
 /// Decline incoming call
 #[tauri::command]
-async fn decline_call(state: State<'_, AppState>, caller_id: String) -> Result<(), String> {
+async fn decline_call(state: State<'_, AppState>, caller_id: String) -> AppResult<()> {
     println!("❌ Declining call from {}", caller_id);
 
     // Reset media engine (may have generated keypair)
@@ -230,13 +254,17 @@ async fn decline_call(state: State<'_, AppState>, caller_id: String) -> Result<(
         engine.reset().await;
     }
 
-    let msg = SignalingMessage::CallDecline { caller_id };
+    let msg = SignalingMessage::CallDecline {
+        version: protocol::PROTOCOL_VERSION,
+        trace_id: Some(observability::trace_id().to_string()),
+        caller_id,
+    };
     signaling::send_signal(&state.ws_sender, msg).await
 }
 
 /// End active call
 #[tauri::command]
-async fn end_call(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
+async fn end_call(state: State<'_, AppState>, peer_id: String) -> AppResult<()> {
     println!("📴 Ending call with {}", peer_id);
 
     // Reset media engine for next call
@@ -245,13 +273,17 @@ async fn end_call(state: State<'_, AppState>, peer_id: String) -> Result<(), Str
         engine.reset().await;
     }
 
-    let msg = SignalingMessage::CallEnd { peer_id };
+    let msg = SignalingMessage::CallEnd {
+        version: protocol::PROTOCOL_VERSION,
+        trace_id: Some(observability::trace_id().to_string()),
+        peer_id,
+    };
     signaling::send_signal(&state.ws_sender, msg).await
 }
 
 /// Cancel outgoing call before answer
 #[tauri::command]
-async fn cancel_call(state: State<'_, AppState>, target_id: String) -> Result<(), String> {
+async fn cancel_call(state: State<'_, AppState>, target_id: String) -> AppResult<()> {
     println!("🚫 Cancelling call to {}", target_id);
 
     // Reset media engine
@@ -260,13 +292,17 @@ async fn cancel_call(state: State<'_, AppState>, target_id: String) -> Result<()
         engine.reset().await;
     }
 
-    let msg = SignalingMessage::CallCancel { target_id };
+    let msg = SignalingMessage::CallCancel {
+        version: protocol::PROTOCOL_VERSION,
+        trace_id: Some(observability::trace_id().to_string()),
+        target_id,
+    };
     signaling::send_signal(&state.ws_sender, msg).await
 }
 
 /// Reset local call media state without sending signaling
 #[tauri::command]
-async fn reset_call_media(state: State<'_, AppState>) -> Result<(), String> {
+async fn reset_call_media(state: State<'_, AppState>) -> AppResult<()> {
     let mut engine = state.media.lock().await;
     engine.reset().await;
     Ok(())
@@ -283,31 +319,35 @@ struct AudioDevice {
 
 /// List available input (microphone) devices
 #[tauri::command]
-async fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
-    MediaEngine::list_input_devices()
-        .map(|devices| {
-            devices
-                .into_iter()
-                .map(|(id, name)| AudioDevice { id, name })
-                .collect()
-        })
-        .map_err(|e| e.to_string())
+async fn list_audio_devices() -> AppResult<Vec<AudioDevice>> {
+    Ok(
+        MediaEngine::list_input_devices()
+            .map(|devices| {
+                devices
+                    .into_iter()
+                    .map(|(id, name)| AudioDevice { id, name })
+                    .collect()
+            })
+            .map_err(|e| e.to_string())?,
+    )
 }
 
 #[tauri::command]
-async fn get_default_audio_device() -> Result<AudioDevice, String> {
-    MediaEngine::default_input_device_name()
-        .map(|name| AudioDevice {
-            id: name.clone(),
-            name,
-        })
-        .map_err(|e| e.to_string())
+async fn get_default_audio_device() -> AppResult<AudioDevice> {
+    Ok(
+        MediaEngine::default_input_device_name()
+            .map(|name| AudioDevice {
+                id: name.clone(),
+                name,
+            })
+            .map_err(|e| e.to_string())?,
+    )
 }
 
 #[tauri::command]
 async fn get_selected_audio_device(
     state: State<'_, AppState>,
-) -> Result<Option<AudioDevice>, String> {
+) -> AppResult<Option<AudioDevice>> {
     let engine = state.media.lock().await;
     Ok(engine.selected_input_device().map(|name| AudioDevice {
         id: name.clone(),
@@ -316,7 +356,7 @@ async fn get_selected_audio_device(
 }
 
 #[tauri::command]
-async fn set_audio_device(state: State<'_, AppState>, device_id: String) -> Result<(), String> {
+async fn set_audio_device(state: State<'_, AppState>, device_id: String) -> AppResult<()> {
     let mut engine = state.media.lock().await;
     engine
         .set_input_device(Some(device_id.clone()))
@@ -326,31 +366,35 @@ async fn set_audio_device(state: State<'_, AppState>, device_id: String) -> Resu
 }
 
 #[tauri::command]
-async fn list_output_devices() -> Result<Vec<AudioDevice>, String> {
-    MediaEngine::list_output_devices()
-        .map(|devices| {
-            devices
-                .into_iter()
-                .map(|(id, name)| AudioDevice { id, name })
-                .collect()
-        })
-        .map_err(|e| e.to_string())
+async fn list_output_devices() -> AppResult<Vec<AudioDevice>> {
+    Ok(
+        MediaEngine::list_output_devices()
+            .map(|devices| {
+                devices
+                    .into_iter()
+                    .map(|(id, name)| AudioDevice { id, name })
+                    .collect()
+            })
+            .map_err(|e| e.to_string())?,
+    )
 }
 
 #[tauri::command]
-async fn get_default_output_device() -> Result<AudioDevice, String> {
-    MediaEngine::default_output_device_name()
-        .map(|name| AudioDevice {
-            id: name.clone(),
-            name,
-        })
-        .map_err(|e| e.to_string())
+async fn get_default_output_device() -> AppResult<AudioDevice> {
+    Ok(
+        MediaEngine::default_output_device_name()
+            .map(|name| AudioDevice {
+                id: name.clone(),
+                name,
+            })
+            .map_err(|e| e.to_string())?,
+    )
 }
 
 #[tauri::command]
 async fn get_selected_output_device(
     state: State<'_, AppState>,
-) -> Result<Option<AudioDevice>, String> {
+) -> AppResult<Option<AudioDevice>> {
     let engine = state.media.lock().await;
     Ok(engine.selected_output_device().map(|name| AudioDevice {
         id: name.clone(),
@@ -359,7 +403,7 @@ async fn get_selected_output_device(
 }
 
 #[tauri::command]
-async fn set_output_device(state: State<'_, AppState>, device_id: String) -> Result<(), String> {
+async fn set_output_device(state: State<'_, AppState>, device_id: String) -> AppResult<()> {
     let mut engine = state.media.lock().await;
     engine
         .set_output_device(Some(device_id.clone()))
@@ -369,7 +413,7 @@ async fn set_output_device(state: State<'_, AppState>, device_id: String) -> Res
 }
 
 #[tauri::command]
-async fn get_audio_settings(state: State<'_, AppState>) -> Result<AudioSettings, String> {
+async fn get_audio_settings(state: State<'_, AppState>) -> AppResult<AudioSettings> {
     let engine = state.media.lock().await;
     Ok(engine.get_audio_settings())
 }
@@ -378,21 +422,21 @@ async fn get_audio_settings(state: State<'_, AppState>) -> Result<AudioSettings,
 async fn update_audio_settings(
     state: State<'_, AppState>,
     settings: AudioSettings,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let mut engine = state.media.lock().await;
     engine.update_audio_settings(settings);
     Ok(())
 }
 
 #[tauri::command]
-async fn set_ptt_active(state: State<'_, AppState>, active: bool) -> Result<(), String> {
+async fn set_ptt_active(state: State<'_, AppState>, active: bool) -> AppResult<()> {
     let engine = state.media.lock().await;
     engine.set_ptt_active(active);
     Ok(())
 }
 
 #[tauri::command]
-async fn set_remote_user_volume(state: State<'_, AppState>, volume: f32) -> Result<(), String> {
+async fn set_remote_user_volume(state: State<'_, AppState>, volume: f32) -> AppResult<()> {
     let mut engine = state.media.lock().await;
     engine.set_remote_user_volume(volume);
     Ok(())
@@ -408,14 +452,14 @@ struct IceCandidatePayload {
 /// Start WebRTC handshake (Caller side)
 /// Initializes PC, DC, creates Offer, and sends it via WS.
 #[tauri::command]
-async fn init_audio_call(state: State<'_, AppState>, target_id: String) -> Result<(), String> {
+async fn init_audio_call(state: State<'_, AppState>, target_id: String) -> AppResult<()> {
     println!("📞 [WEBRTC] Initializing audio call to {}", target_id);
 
     // 1. Initialize WebRTC
     let mut ice_rx = {
         let mut engine = state.media.lock().await;
         if !engine.is_ready_for_audio() {
-            return Err("E2EE handshake not completed".to_string());
+            return Err("E2EE handshake not completed".to_string().into());
         }
         engine.init_webrtc().await.map_err(|e| e.to_string())?
     };
@@ -432,6 +476,8 @@ async fn init_audio_call(state: State<'_, AppState>, target_id: String) -> Resul
                 let sdp_m_line_index = parsed["sdpMLineIndex"].as_u64().map(|n| n as u16);
 
                 let msg = SignalingMessage::Candidate {
+                    version: protocol::PROTOCOL_VERSION,
+                    trace_id: Some(observability::trace_id().to_string()),
                     target_id: target_id_clone.clone(),
                     candidate,
                     sdp_mid,
@@ -459,7 +505,12 @@ async fn init_audio_call(state: State<'_, AppState>, target_id: String) -> Resul
     println!("📞 [WEBRTC] Offer created, sending...");
 
     // 5. Send Offer via WS
-    let msg = SignalingMessage::Offer { target_id, sdp };
+    let msg = SignalingMessage::Offer {
+        version: protocol::PROTOCOL_VERSION,
+        trace_id: Some(observability::trace_id().to_string()),
+        target_id,
+        sdp,
+    };
     signaling::send_signal(&state.ws_sender, msg).await
 }
 
@@ -470,7 +521,7 @@ async fn handle_audio_offer(
     state: State<'_, AppState>,
     target_id: String,
     sdp: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     println!("📞 [WEBRTC] Handling Offer from {}", target_id);
 
     // 1. Initialize WebRTC (Answerer)
@@ -491,6 +542,8 @@ async fn handle_audio_offer(
                 let sdp_m_line_index = parsed["sdpMLineIndex"].as_u64().map(|n| n as u16);
 
                 let msg = SignalingMessage::Candidate {
+                    version: protocol::PROTOCOL_VERSION,
+                    trace_id: Some(observability::trace_id().to_string()),
                     target_id: target_id_clone.clone(),
                     candidate,
                     sdp_mid,
@@ -510,6 +563,8 @@ async fn handle_audio_offer(
 
     // 4. Send Answer
     let msg = SignalingMessage::Answer {
+        version: protocol::PROTOCOL_VERSION,
+        trace_id: Some(observability::trace_id().to_string()),
         target_id,
         sdp: answer_sdp,
     };
@@ -518,7 +573,7 @@ async fn handle_audio_offer(
 
 /// Handle received Answer (Caller side)
 #[tauri::command]
-async fn handle_audio_answer(state: State<'_, AppState>, sdp: String) -> Result<(), String> {
+async fn handle_audio_answer(state: State<'_, AppState>, sdp: String) -> AppResult<()> {
     println!("📞 [WEBRTC] Handling Answer");
     let engine = state.media.lock().await;
     engine
@@ -533,7 +588,7 @@ async fn handle_audio_answer(state: State<'_, AppState>, sdp: String) -> Result<
 async fn handle_ice_candidate(
     state: State<'_, AppState>,
     payload: IceCandidatePayload,
-) -> Result<(), String> {
+) -> AppResult<()> {
     // Reconstruct valid JSON for RTCIceCandidateInit
     let json = serde_json::json!({
         "candidate": payload.candidate,
@@ -552,13 +607,13 @@ async fn handle_ice_candidate(
 
 /// Start audio capture on call (after E2EE handshake)
 #[tauri::command]
-async fn start_call_audio(state: State<'_, AppState>) -> Result<(), String> {
+async fn start_call_audio(state: State<'_, AppState>) -> AppResult<()> {
     println!("🔊 [AUDIO] Starting call audio...");
 
     let engine = state.media.lock().await;
 
     if !engine.is_ready_for_audio() {
-        return Err("E2EE key exchange not completed".to_string());
+        return Err("E2EE key exchange not completed".to_string().into());
     }
 
     // Create the audio DataChannel (Offerer side)
@@ -575,7 +630,7 @@ async fn start_call_audio(state: State<'_, AppState>) -> Result<(), String> {
 
 /// Toggle mute/unmute for audio capture
 #[tauri::command]
-async fn toggle_mute(state: State<'_, AppState>) -> Result<bool, String> {
+async fn toggle_mute(state: State<'_, AppState>) -> AppResult<bool> {
     let engine = state.media.lock().await;
     let muted = engine.toggle_mute();
     println!("🔊 [AUDIO] Mute toggled: {}", muted);
@@ -584,7 +639,7 @@ async fn toggle_mute(state: State<'_, AppState>) -> Result<bool, String> {
 
 /// Start VU meter — emits `vu-level` events to the frontend
 #[tauri::command]
-async fn start_vu_meter(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+async fn start_vu_meter(app: tauri::AppHandle, state: State<'_, AppState>) -> AppResult<()> {
     let mut rms_rx = None;
     for _ in 0..20 {
         {
@@ -620,6 +675,8 @@ async fn start_vu_meter(app: tauri::AppHandle, state: State<'_, AppState>) -> Re
 }
 
 fn main() {
+    observability::init_tracing();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())

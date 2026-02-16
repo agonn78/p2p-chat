@@ -1,4 +1,5 @@
 use crate::api::ApiState;
+use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -35,7 +36,7 @@ pub async fn api_login(
     state: State<'_, ApiState>,
     email: String,
     password: String,
-) -> Result<AuthResponse, String> {
+) -> AppResult<AuthResponse> {
     let url = format!("{}/auth/login", state.base_url);
 
     let res = state
@@ -49,7 +50,7 @@ pub async fn api_login(
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Login failed ({}): {}", status, text));
+        return Err(format!("Login failed ({}): {}", status, text).into());
     }
 
     let auth_response: AuthResponse = res
@@ -69,7 +70,7 @@ pub async fn api_register(
     username: String,
     email: String,
     password: String,
-) -> Result<AuthResponse, String> {
+) -> AppResult<AuthResponse> {
     let url = format!("{}/auth/register", state.base_url);
 
     let res = state
@@ -87,7 +88,7 @@ pub async fn api_register(
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Registration failed ({}): {}", status, text));
+        return Err(format!("Registration failed ({}): {}", status, text).into());
     }
 
     let auth_response: AuthResponse = res
@@ -102,13 +103,13 @@ pub async fn api_register(
 }
 
 #[tauri::command]
-pub async fn api_logout(state: State<'_, ApiState>) -> Result<(), String> {
+pub async fn api_logout(state: State<'_, ApiState>) -> AppResult<()> {
     state.set_token(None).await;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn api_health_check(state: State<'_, ApiState>) -> Result<bool, String> {
+pub async fn api_health_check(state: State<'_, ApiState>) -> AppResult<bool> {
     let url = format!("{}/health", state.base_url);
 
     match state.client.get(&url).send().await {

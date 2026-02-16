@@ -1,4 +1,5 @@
 use crate::api::ApiState;
+use crate::error::AppResult;
 use crate::messaging::domain::{
     ConversationKind, MessageStatus as LocalMessageStatus, PersistedMessage,
 };
@@ -140,7 +141,7 @@ fn api_to_persisted_channel_message(
 }
 
 #[tauri::command]
-pub async fn api_fetch_servers(state: State<'_, ApiState>) -> Result<Vec<Server>, String> {
+pub async fn api_fetch_servers(state: State<'_, ApiState>) -> AppResult<Vec<Server>> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/servers", state.base_url);
@@ -155,7 +156,7 @@ pub async fn api_fetch_servers(state: State<'_, ApiState>) -> Result<Vec<Server>
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to fetch servers: {}", text));
+        return Err((format!("Failed to fetch servers: {}", text)).into());
     }
 
     let servers: Vec<Server> = res
@@ -171,7 +172,7 @@ pub async fn api_create_server(
     state: State<'_, ApiState>,
     name: String,
     icon_url: Option<String>,
-) -> Result<Server, String> {
+) -> AppResult<Server> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/servers", state.base_url);
@@ -187,7 +188,7 @@ pub async fn api_create_server(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to create server: {}", text));
+        return Err((format!("Failed to create server: {}", text)).into());
     }
 
     let server: Server = res
@@ -202,7 +203,7 @@ pub async fn api_create_server(
 pub async fn api_join_server(
     state: State<'_, ApiState>,
     invite_code: String,
-) -> Result<Server, String> {
+) -> AppResult<Server> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/servers/join/{}", state.base_url, invite_code);
@@ -217,7 +218,7 @@ pub async fn api_join_server(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to join server: {}", text));
+        return Err((format!("Failed to join server: {}", text)).into());
     }
 
     let server: Server = res
@@ -229,7 +230,7 @@ pub async fn api_join_server(
 }
 
 #[tauri::command]
-pub async fn api_leave_server(state: State<'_, ApiState>, server_id: String) -> Result<(), String> {
+pub async fn api_leave_server(state: State<'_, ApiState>, server_id: String) -> AppResult<()> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/servers/{}/leave", state.base_url, server_id);
@@ -244,7 +245,7 @@ pub async fn api_leave_server(state: State<'_, ApiState>, server_id: String) -> 
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to leave server: {}", text));
+        return Err((format!("Failed to leave server: {}", text)).into());
     }
 
     Ok(())
@@ -254,7 +255,7 @@ pub async fn api_leave_server(state: State<'_, ApiState>, server_id: String) -> 
 pub async fn api_fetch_server_details(
     state: State<'_, ApiState>,
     server_id: String,
-) -> Result<ServerWithChannels, String> {
+) -> AppResult<ServerWithChannels> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/servers/{}", state.base_url, server_id);
@@ -269,7 +270,7 @@ pub async fn api_fetch_server_details(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to fetch server details: {}", text));
+        return Err((format!("Failed to fetch server details: {}", text)).into());
     }
 
     let data: ServerWithChannels = res
@@ -286,7 +287,7 @@ pub async fn api_create_channel(
     server_id: String,
     name: String,
     channel_type: Option<String>,
-) -> Result<Channel, String> {
+) -> AppResult<Channel> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/servers/{}/channels", state.base_url, server_id);
@@ -302,7 +303,7 @@ pub async fn api_create_channel(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to create channel: {}", text));
+        return Err((format!("Failed to create channel: {}", text)).into());
     }
 
     let channel: Channel = res
@@ -317,7 +318,7 @@ pub async fn api_create_channel(
 pub async fn api_fetch_server_members(
     state: State<'_, ApiState>,
     server_id: String,
-) -> Result<Vec<ServerMember>, String> {
+) -> AppResult<Vec<ServerMember>> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/servers/{}/members", state.base_url, server_id);
@@ -332,7 +333,7 @@ pub async fn api_fetch_server_members(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to fetch members: {}", text));
+        return Err((format!("Failed to fetch members: {}", text)).into());
     }
 
     let members: Vec<ServerMember> = res
@@ -351,7 +352,7 @@ pub async fn api_fetch_channel_messages(
     channel_id: String,
     before: Option<String>,
     limit: Option<i64>,
-) -> Result<Vec<ChannelMessage>, String> {
+) -> AppResult<Vec<ChannelMessage>> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let limit = limit.unwrap_or(100).clamp(1, 200);
@@ -439,7 +440,7 @@ pub async fn api_fetch_channel_messages(
                     .collect());
             }
 
-            Err(remote_error)
+            Err(remote_error.into())
         }
         Err(remote_error) => {
             let cached = messaging
@@ -460,7 +461,7 @@ pub async fn api_fetch_channel_messages(
                     .collect());
             }
 
-            Err(remote_error)
+            Err(remote_error.into())
         }
     }
 }
@@ -474,7 +475,7 @@ pub async fn api_send_channel_message(
     content: String,
     nonce: Option<String>,
     client_id: Option<String>,
-) -> Result<ChannelMessage, String> {
+) -> AppResult<ChannelMessage> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!(
@@ -524,7 +525,7 @@ pub async fn api_send_channel_message(
         {
             eprintln!("[Messaging] Failed to mark channel send failure: {}", err);
         }
-        return Err(format!("Failed to send channel message: {}", text));
+        return Err((format!("Failed to send channel message: {}", text)).into());
     }
 
     let mut message: ChannelMessage = res
@@ -574,7 +575,7 @@ pub async fn api_send_channel_typing(
     server_id: String,
     channel_id: String,
     is_typing: bool,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!(
@@ -593,7 +594,7 @@ pub async fn api_send_channel_typing(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to send channel typing: {}", text));
+        return Err((format!("Failed to send channel typing: {}", text)).into());
     }
 
     Ok(())
@@ -604,7 +605,7 @@ pub async fn api_fetch_voice_channel_presence(
     state: State<'_, ApiState>,
     server_id: String,
     channel_id: String,
-) -> Result<Vec<VoiceChannelParticipant>, String> {
+) -> AppResult<Vec<VoiceChannelParticipant>> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!(
@@ -622,7 +623,7 @@ pub async fn api_fetch_voice_channel_presence(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to fetch voice presence: {}", text));
+        return Err((format!("Failed to fetch voice presence: {}", text)).into());
     }
 
     let participants: Vec<VoiceChannelParticipant> = res
@@ -638,7 +639,7 @@ pub async fn api_join_voice_channel(
     state: State<'_, ApiState>,
     server_id: String,
     channel_id: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!(
@@ -656,7 +657,7 @@ pub async fn api_join_voice_channel(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to join voice channel: {}", text));
+        return Err((format!("Failed to join voice channel: {}", text)).into());
     }
 
     Ok(())
@@ -667,7 +668,7 @@ pub async fn api_leave_voice_channel(
     state: State<'_, ApiState>,
     server_id: String,
     channel_id: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!(
@@ -685,7 +686,7 @@ pub async fn api_leave_voice_channel(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to leave voice channel: {}", text));
+        return Err((format!("Failed to leave voice channel: {}", text)).into());
     }
 
     Ok(())
@@ -727,7 +728,7 @@ struct ReactionRequest {
 pub async fn api_delete_server(
     state: State<'_, ApiState>,
     server_id: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
     let url = format!("{}/servers/{}", state.base_url, server_id);
 
@@ -741,7 +742,7 @@ pub async fn api_delete_server(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to delete server: {}", text));
+        return Err((format!("Failed to delete server: {}", text)).into());
     }
 
     Ok(())
@@ -751,7 +752,7 @@ pub async fn api_delete_server(
 pub async fn api_regenerate_server_invite(
     state: State<'_, ApiState>,
     server_id: String,
-) -> Result<Server, String> {
+) -> AppResult<Server> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
     let url = format!("{}/servers/{}/invite/regenerate", state.base_url, server_id);
 
@@ -765,12 +766,14 @@ pub async fn api_regenerate_server_invite(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to regenerate invite: {}", text));
+        return Err((format!("Failed to regenerate invite: {}", text)).into());
     }
 
-    res.json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))
+    Ok(
+        res.json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?,
+    )
 }
 
 #[tauri::command]
@@ -779,7 +782,7 @@ pub async fn api_update_member_role(
     server_id: String,
     member_id: String,
     role: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
     let url = format!(
         "{}/servers/{}/members/{}/role",
@@ -797,7 +800,7 @@ pub async fn api_update_member_role(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to update member role: {}", text));
+        return Err((format!("Failed to update member role: {}", text)).into());
     }
 
     Ok(())
@@ -808,7 +811,7 @@ pub async fn api_kick_member(
     state: State<'_, ApiState>,
     server_id: String,
     member_id: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
     let url = format!(
         "{}/servers/{}/members/{}/kick",
@@ -825,7 +828,7 @@ pub async fn api_kick_member(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to kick member: {}", text));
+        return Err((format!("Failed to kick member: {}", text)).into());
     }
 
     Ok(())
@@ -837,7 +840,7 @@ pub async fn api_ban_member(
     server_id: String,
     member_id: String,
     reason: Option<String>,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
     let url = format!(
         "{}/servers/{}/members/{}/ban",
@@ -855,7 +858,7 @@ pub async fn api_ban_member(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to ban member: {}", text));
+        return Err((format!("Failed to ban member: {}", text)).into());
     }
 
     Ok(())
@@ -865,7 +868,7 @@ pub async fn api_ban_member(
 pub async fn api_list_server_bans(
     state: State<'_, ApiState>,
     server_id: String,
-) -> Result<Vec<ServerBanEntry>, String> {
+) -> AppResult<Vec<ServerBanEntry>> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
     let url = format!("{}/servers/{}/bans", state.base_url, server_id);
 
@@ -879,12 +882,14 @@ pub async fn api_list_server_bans(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to list bans: {}", text));
+        return Err((format!("Failed to list bans: {}", text)).into());
     }
 
-    res.json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))
+    Ok(
+        res.json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?,
+    )
 }
 
 #[tauri::command]
@@ -892,7 +897,7 @@ pub async fn api_unban_member(
     state: State<'_, ApiState>,
     server_id: String,
     member_id: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
     let url = format!(
         "{}/servers/{}/bans/{}",
@@ -909,7 +914,7 @@ pub async fn api_unban_member(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to unban member: {}", text));
+        return Err((format!("Failed to unban member: {}", text)).into());
     }
 
     Ok(())
@@ -922,7 +927,7 @@ pub async fn api_search_channel_messages(
     channel_id: String,
     query: String,
     limit: Option<i64>,
-) -> Result<Vec<ChannelMessage>, String> {
+) -> AppResult<Vec<ChannelMessage>> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
     let url = format!(
         "{}/servers/{}/channels/{}/messages/search",
@@ -945,12 +950,14 @@ pub async fn api_search_channel_messages(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to search channel messages: {}", text));
+        return Err((format!("Failed to search channel messages: {}", text)).into());
     }
 
-    res.json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))
+    Ok(
+        res.json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?,
+    )
 }
 
 #[tauri::command]
@@ -959,7 +966,7 @@ pub async fn api_fetch_channel_message_reactions(
     server_id: String,
     channel_id: String,
     message_id: String,
-) -> Result<Vec<MessageReactionSummary>, String> {
+) -> AppResult<Vec<MessageReactionSummary>> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
     let url = format!(
         "{}/servers/{}/channels/{}/messages/{}/reactions",
@@ -976,12 +983,14 @@ pub async fn api_fetch_channel_message_reactions(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to fetch reactions: {}", text));
+        return Err((format!("Failed to fetch reactions: {}", text)).into());
     }
 
-    res.json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))
+    Ok(
+        res.json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?,
+    )
 }
 
 #[tauri::command]
@@ -991,7 +1000,7 @@ pub async fn api_add_channel_message_reaction(
     channel_id: String,
     message_id: String,
     emoji: String,
-) -> Result<Vec<MessageReactionSummary>, String> {
+) -> AppResult<Vec<MessageReactionSummary>> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
     let url = format!(
         "{}/servers/{}/channels/{}/messages/{}/reactions",
@@ -1009,12 +1018,14 @@ pub async fn api_add_channel_message_reaction(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to add reaction: {}", text));
+        return Err((format!("Failed to add reaction: {}", text)).into());
     }
 
-    res.json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))
+    Ok(
+        res.json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?,
+    )
 }
 
 #[tauri::command]
@@ -1024,7 +1035,7 @@ pub async fn api_remove_channel_message_reaction(
     channel_id: String,
     message_id: String,
     emoji: String,
-) -> Result<Vec<MessageReactionSummary>, String> {
+) -> AppResult<Vec<MessageReactionSummary>> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
     let encoded_emoji: String = byte_serialize(emoji.as_bytes()).collect();
     let url = format!(
@@ -1042,12 +1053,14 @@ pub async fn api_remove_channel_message_reaction(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to remove reaction: {}", text));
+        return Err((format!("Failed to remove reaction: {}", text)).into());
     }
 
-    res.json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))
+    Ok(
+        res.json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?,
+    )
 }
 
 #[tauri::command]
@@ -1056,7 +1069,7 @@ pub async fn api_fetch_channel_thread_messages(
     server_id: String,
     channel_id: String,
     message_id: String,
-) -> Result<Vec<ChannelMessage>, String> {
+) -> AppResult<Vec<ChannelMessage>> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
     let url = format!(
         "{}/servers/{}/channels/{}/messages/{}/thread",
@@ -1073,12 +1086,14 @@ pub async fn api_fetch_channel_thread_messages(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to fetch thread messages: {}", text));
+        return Err((format!("Failed to fetch thread messages: {}", text)).into());
     }
 
-    res.json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))
+    Ok(
+        res.json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?,
+    )
 }
 
 #[tauri::command]
@@ -1090,7 +1105,7 @@ pub async fn api_send_channel_thread_message(
     content: String,
     nonce: Option<String>,
     client_id: Option<String>,
-) -> Result<ChannelMessage, String> {
+) -> AppResult<ChannelMessage> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
     let url = format!(
         "{}/servers/{}/channels/{}/messages/{}/thread",
@@ -1112,10 +1127,12 @@ pub async fn api_send_channel_thread_message(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to send thread message: {}", text));
+        return Err((format!("Failed to send thread message: {}", text)).into());
     }
 
-    res.json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))
+    Ok(
+        res.json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?,
+    )
 }

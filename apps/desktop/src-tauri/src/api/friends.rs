@@ -1,4 +1,5 @@
 use crate::api::ApiState;
+use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -17,7 +18,7 @@ struct FriendRequestPayload {
 }
 
 #[tauri::command]
-pub async fn api_fetch_friends(state: State<'_, ApiState>) -> Result<Vec<Friend>, String> {
+pub async fn api_fetch_friends(state: State<'_, ApiState>) -> AppResult<Vec<Friend>> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/friends", state.base_url);
@@ -32,7 +33,7 @@ pub async fn api_fetch_friends(state: State<'_, ApiState>) -> Result<Vec<Friend>
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to fetch friends: {}", text));
+        return Err(format!("Failed to fetch friends: {}", text).into());
     }
 
     let friends: Vec<Friend> = res
@@ -44,7 +45,7 @@ pub async fn api_fetch_friends(state: State<'_, ApiState>) -> Result<Vec<Friend>
 }
 
 #[tauri::command]
-pub async fn api_fetch_pending_requests(state: State<'_, ApiState>) -> Result<Vec<Friend>, String> {
+pub async fn api_fetch_pending_requests(state: State<'_, ApiState>) -> AppResult<Vec<Friend>> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/friends/pending", state.base_url);
@@ -59,7 +60,7 @@ pub async fn api_fetch_pending_requests(state: State<'_, ApiState>) -> Result<Ve
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to fetch pending requests: {}", text));
+        return Err(format!("Failed to fetch pending requests: {}", text).into());
     }
 
     let requests: Vec<Friend> = res
@@ -74,7 +75,7 @@ pub async fn api_fetch_pending_requests(state: State<'_, ApiState>) -> Result<Ve
 pub async fn api_send_friend_request(
     state: State<'_, ApiState>,
     username: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/friends/request", state.base_url);
@@ -90,7 +91,7 @@ pub async fn api_send_friend_request(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to send friend request: {}", text));
+        return Err(format!("Failed to send friend request: {}", text).into());
     }
 
     Ok(())
@@ -100,7 +101,7 @@ pub async fn api_send_friend_request(
 pub async fn api_accept_friend(
     state: State<'_, ApiState>,
     friend_id: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/friends/accept/{}", state.base_url, friend_id);
@@ -115,14 +116,14 @@ pub async fn api_accept_friend(
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to accept friend: {}", text));
+        return Err(format!("Failed to accept friend: {}", text).into());
     }
 
     Ok(())
 }
 
 #[tauri::command]
-pub async fn api_fetch_online_friends(state: State<'_, ApiState>) -> Result<Vec<String>, String> {
+pub async fn api_fetch_online_friends(state: State<'_, ApiState>) -> AppResult<Vec<String>> {
     let token = state.get_token().await.ok_or("Not authenticated")?;
 
     let url = format!("{}/friends/online", state.base_url);
@@ -137,7 +138,7 @@ pub async fn api_fetch_online_friends(state: State<'_, ApiState>) -> Result<Vec<
 
     if !res.status().is_success() {
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Failed to fetch online friends: {}", text));
+        return Err(format!("Failed to fetch online friends: {}", text).into());
     }
 
     let online: Vec<String> = res

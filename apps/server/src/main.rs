@@ -15,11 +15,14 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Json, Router,
 };
 use dashmap::DashMap;
 use futures::{sink::SinkExt, stream::StreamExt};
-use shared_proto::signaling::SignalingMessage;
+use serde::Serialize;
+use shared_proto::signaling::{
+    is_supported_protocol_version, SignalingMessage, LEGACY_PROTOCOL_VERSION, PROTOCOL_VERSION,
+};
 use sqlx::postgres::PgPoolOptions;
 use std::{
     env,
@@ -34,6 +37,30 @@ use tower_http::{
 use uuid::Uuid;
 
 static RATE_LIMIT_BUCKETS: LazyLock<DashMap<String, (u32, Instant)>> = LazyLock::new(DashMap::new);
+
+const HEADER_PROTOCOL_VERSION: &str = "x-protocol-version";
+const HEADER_TRACE_ID: &str = "x-trace-id";
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    db: HealthDb,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthDb {
+    ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ProtocolErrorBody {
+    code: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_id: Option<String>,
+}
 
 #[tokio::main]
 async fn main() {
@@ -111,12 +138,14 @@ async fn main() {
     // Build router
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/readiness", get(readiness_check))
         .route("/ws", get(ws_handler))
         .nest("/auth", routes::auth::router())
         .nest("/friends", routes::friends::router())
         .nest("/users", routes::users::router())
         .nest("/chat", routes::chat::router())
         .nest("/servers", routes::servers::router())
+        .layer(axum::middleware::from_fn(protocol_version_middleware))
         .layer(axum::middleware::from_fn(rate_limit_middleware))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -168,6 +197,55 @@ fn request_fingerprint(req: &Request) -> String {
         .unwrap_or_else(|| "anon".to_string());
 
     format!("{}:{}:{}", forwarded, user_agent, auth_hint)
+}
+
+fn request_trace_id(req: &Request) -> Option<String> {
+    req.headers()
+        .get(HEADER_TRACE_ID)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_protocol_header(req: &Request) -> Option<u8> {
+    req.headers()
+        .get(HEADER_PROTOCOL_VERSION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u8>().ok())
+}
+
+async fn protocol_version_middleware(req: Request, next: Next) -> Result<Response, StatusCode> {
+    if req.uri().path() == "/ws" {
+        return Ok(next.run(req).await);
+    }
+
+    if let Some(version) = parse_protocol_header(&req) {
+        if !is_supported_protocol_version(version) {
+            let trace_id = request_trace_id(&req);
+            tracing::warn!(
+                component = "protocol",
+                received_protocol_version = version,
+                supported_protocol_version = PROTOCOL_VERSION,
+                legacy_protocol_version = LEGACY_PROTOCOL_VERSION,
+                trace_id = trace_id.as_deref().unwrap_or("missing"),
+                "rejected request with unsupported protocol version"
+            );
+
+            let body = ProtocolErrorBody {
+                code: "protocol_version_mismatch",
+                message: format!(
+                    "Unsupported protocol version {version}. Supported versions: [{}, {}]",
+                    LEGACY_PROTOCOL_VERSION, PROTOCOL_VERSION
+                ),
+                details: Some("Please update client protocol version".to_string()),
+                trace_id,
+            };
+
+            return Ok((StatusCode::UPGRADE_REQUIRED, Json(body)).into_response());
+        }
+    }
+
+    Ok(next.run(req).await)
 }
 
 async fn rate_limit_middleware(req: Request, next: Next) -> Result<Response, StatusCode> {
@@ -247,8 +325,35 @@ async fn seed_test_users(pool: &sqlx::PgPool) {
     }
 }
 
-async fn health_check() -> &'static str {
-    "OK"
+async fn health_check() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        db: HealthDb { ok: true },
+    })
+}
+
+async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse {
+    match sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.db).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(HealthResponse {
+                status: "ready",
+                db: HealthDb { ok: true },
+            }),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::warn!(component = "health", error = %err, "readiness probe failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(HealthResponse {
+                    status: "not_ready",
+                    db: HealthDb { ok: false },
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -259,10 +364,13 @@ fn rewrite_offer_for_peer(
     target_id: String,
     sdp: String,
     from_id: &str,
+    trace_id: Option<String>,
 ) -> (String, SignalingMessage) {
     (
         target_id,
         SignalingMessage::Offer {
+            version: PROTOCOL_VERSION,
+            trace_id,
             target_id: from_id.to_string(),
             sdp,
         },
@@ -273,10 +381,13 @@ fn rewrite_answer_for_peer(
     target_id: String,
     sdp: String,
     from_id: &str,
+    trace_id: Option<String>,
 ) -> (String, SignalingMessage) {
     (
         target_id,
         SignalingMessage::Answer {
+            version: PROTOCOL_VERSION,
+            trace_id,
             target_id: from_id.to_string(),
             sdp,
         },
@@ -289,10 +400,13 @@ fn rewrite_candidate_for_peer(
     sdp_mid: Option<String>,
     sdp_m_line_index: Option<u16>,
     from_id: &str,
+    trace_id: Option<String>,
 ) -> (String, SignalingMessage) {
     (
         target_id,
         SignalingMessage::Candidate {
+            version: PROTOCOL_VERSION,
+            trace_id,
             target_id: from_id.to_string(),
             candidate,
             sdp_mid,
@@ -322,8 +436,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         if let Message::Text(text) = msg {
             // Attempt to parse as SignalingMessage
             if let Ok(signal) = serde_json::from_str::<SignalingMessage>(&text) {
+                if !is_supported_protocol_version(signal.version()) {
+                    tracing::warn!(
+                        component = "ws",
+                        received_protocol_version = signal.version(),
+                        supported_protocol_version = PROTOCOL_VERSION,
+                        legacy_protocol_version = LEGACY_PROTOCOL_VERSION,
+                        trace_id = signal.trace_id().unwrap_or("missing"),
+                        "dropping websocket message with unsupported protocol version"
+                    );
+                    continue;
+                }
+
                 match signal {
-                    SignalingMessage::Identify { user_id, token } => {
+                    SignalingMessage::Identify {
+                        user_id,
+                        token,
+                        trace_id,
+                        ..
+                    } => {
                         let claims = match validate_token(&token) {
                             Ok(claims) => claims,
                             Err(_) => {
@@ -344,6 +475,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         }
 
+                        tracing::info!(
+                            component = "ws",
+                            user_id = %user_id,
+                            trace_id = trace_id.as_deref().unwrap_or("missing"),
+                            "websocket identify accepted"
+                        );
+
                         println!("🆔 User {} identified on WebSocket", user_id);
                         state.peers.insert(user_id.clone(), tx.clone());
                         let peer_count = state.peers.len();
@@ -356,7 +494,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     // === WebRTC Signaling (forward to target) ===
                     // Important: when forwarding, rewrite `target_id` to the sender id
                     // so the receiver knows who to reply to.
-                    SignalingMessage::Offer { target_id, sdp } => {
+                    SignalingMessage::Offer {
+                        target_id,
+                        sdp,
+                        trace_id,
+                        ..
+                    } => {
                         let from_id = match &my_id {
                             Some(id) => id.clone(),
                             None => {
@@ -366,7 +509,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         };
 
                         let (target_id, forwarded) =
-                            rewrite_offer_for_peer(target_id, sdp, &from_id);
+                            rewrite_offer_for_peer(target_id, sdp, &from_id, trace_id);
 
                         if let Some(peer_tx) = state.peers.get(&target_id) {
                             if let Ok(msg) = serde_json::to_string(&forwarded) {
@@ -376,7 +519,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             tracing::warn!("Target peer {} not found", target_id);
                         }
                     }
-                    SignalingMessage::Answer { target_id, sdp } => {
+                    SignalingMessage::Answer {
+                        target_id,
+                        sdp,
+                        trace_id,
+                        ..
+                    } => {
                         let from_id = match &my_id {
                             Some(id) => id.clone(),
                             None => {
@@ -386,7 +534,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         };
 
                         let (target_id, forwarded) =
-                            rewrite_answer_for_peer(target_id, sdp, &from_id);
+                            rewrite_answer_for_peer(target_id, sdp, &from_id, trace_id);
 
                         if let Some(peer_tx) = state.peers.get(&target_id) {
                             if let Ok(msg) = serde_json::to_string(&forwarded) {
@@ -401,6 +549,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         candidate,
                         sdp_mid,
                         sdp_m_line_index,
+                        trace_id,
+                        ..
                     } => {
                         let from_id = match &my_id {
                             Some(id) => id.clone(),
@@ -416,6 +566,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             sdp_mid,
                             sdp_m_line_index,
                             &from_id,
+                            trace_id,
                         );
 
                         if let Some(peer_tx) = state.peers.get(&target_id) {
@@ -431,6 +582,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     SignalingMessage::CallInitiate {
                         target_id,
                         public_key,
+                        trace_id,
+                        ..
                     } => {
                         let caller_id = match &my_id {
                             Some(id) => id.clone(),
@@ -449,7 +602,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // Caller already busy (in-call or already ringing)
                         if state.is_busy(&caller_id) {
                             if let Some(caller_tx) = state.peers.get(&caller_id) {
-                                let busy = SignalingMessage::CallBusy { caller_id };
+                                let busy = SignalingMessage::CallBusy {
+                                    version: PROTOCOL_VERSION,
+                                    trace_id: trace_id.clone(),
+                                    caller_id,
+                                };
                                 let msg = serde_json::to_string(&busy).unwrap();
                                 let _ = caller_tx.send(Message::Text(msg));
                             }
@@ -463,6 +620,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 // Send busy signal back to caller
                                 if let Some(caller_tx) = state.peers.get(&caller_id) {
                                     let busy = SignalingMessage::CallBusy {
+                                        version: PROTOCOL_VERSION,
+                                        trace_id: trace_id.clone(),
                                         caller_id: target_id.clone(),
                                     };
                                     let msg = serde_json::to_string(&busy).unwrap();
@@ -474,6 +633,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                                 // Forward as IncomingCall to target
                                 let incoming = SignalingMessage::IncomingCall {
+                                    version: PROTOCOL_VERSION,
+                                    trace_id: trace_id.clone(),
                                     caller_id: caller_id.clone(),
                                     caller_name,
                                     public_key,
@@ -495,6 +656,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                             timeout_state.peers.get(&timeout_caller)
                                         {
                                             let unavailable = SignalingMessage::CallUnavailable {
+                                                version: PROTOCOL_VERSION,
+                                                trace_id: trace_id.clone(),
                                                 target_id: timeout_target,
                                                 reason: "timeout".to_string(),
                                             };
@@ -509,6 +672,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                             if let Some(caller_tx) = state.peers.get(&caller_id) {
                                 let unavailable = SignalingMessage::CallUnavailable {
+                                    version: PROTOCOL_VERSION,
+                                    trace_id: trace_id.clone(),
                                     target_id,
                                     reason: "offline".to_string(),
                                 };
@@ -521,6 +686,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     SignalingMessage::CallAccept {
                         caller_id,
                         public_key,
+                        trace_id,
+                        ..
                     } => {
                         let callee_id = match &my_id {
                             Some(id) => id.clone(),
@@ -539,6 +706,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             );
                             if let Some(callee_tx) = state.peers.get(&callee_id) {
                                 let unavailable = SignalingMessage::CallUnavailable {
+                                    version: PROTOCOL_VERSION,
+                                    trace_id: trace_id.clone(),
                                     target_id: caller_id,
                                     reason: "expired".to_string(),
                                 };
@@ -551,6 +720,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // Forward CallAccepted to caller
                         if let Some(caller_tx) = state.peers.get(&caller_id) {
                             let accepted = SignalingMessage::CallAccepted {
+                                version: PROTOCOL_VERSION,
+                                trace_id: trace_id.clone(),
                                 target_id: callee_id,
                                 public_key,
                             };
@@ -560,7 +731,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
 
-                    SignalingMessage::CallDecline { caller_id } => {
+                    SignalingMessage::CallDecline {
+                        caller_id,
+                        trace_id,
+                        ..
+                    } => {
                         let callee_id = match &my_id {
                             Some(id) => id.clone(),
                             None => {
@@ -573,6 +748,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // Forward CallDeclined to caller
                         if let Some(caller_tx) = state.peers.get(&caller_id) {
                             let declined = SignalingMessage::CallDeclined {
+                                version: PROTOCOL_VERSION,
+                                trace_id,
                                 target_id: my_id.clone().unwrap_or_default(),
                             };
                             let msg = serde_json::to_string(&declined).unwrap();
@@ -581,7 +758,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
 
-                    SignalingMessage::CallEnd { peer_id } => {
+                    SignalingMessage::CallEnd {
+                        peer_id,
+                        trace_id,
+                        ..
+                    } => {
                         let user_id = my_id.clone().unwrap_or_default();
 
                         // End the call tracking
@@ -589,14 +770,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         // Notify peer
                         if let Some(peer_tx) = state.peers.get(&peer_id) {
-                            let ended = SignalingMessage::CallEnded { peer_id: user_id };
+                            let ended = SignalingMessage::CallEnded {
+                                version: PROTOCOL_VERSION,
+                                trace_id,
+                                peer_id: user_id,
+                            };
                             let msg = serde_json::to_string(&ended).unwrap();
                             let _ = peer_tx.send(Message::Text(msg));
                             tracing::info!("📴 Call ended with {}", peer_id);
                         }
                     }
 
-                    SignalingMessage::CallCancel { target_id } => {
+                    SignalingMessage::CallCancel {
+                        target_id,
+                        trace_id,
+                        ..
+                    } => {
                         let caller_id = match &my_id {
                             Some(id) => id.clone(),
                             None => {
@@ -608,7 +797,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         // Forward CallCancelled to target (callee)
                         if let Some(peer_tx) = state.peers.get(&target_id) {
-                            let cancelled = SignalingMessage::CallCancelled { caller_id };
+                            let cancelled = SignalingMessage::CallCancelled {
+                                version: PROTOCOL_VERSION,
+                                trace_id,
+                                caller_id,
+                            };
                             let msg = serde_json::to_string(&cancelled).unwrap();
                             let _ = peer_tx.send(Message::Text(msg));
                             tracing::info!("🚫 Call cancelled to {}", target_id);
@@ -634,6 +827,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         if let Some(peer_id) = state.end_call(&id) {
             if let Some(peer_tx) = state.peers.get(&peer_id) {
                 let ended = SignalingMessage::CallEnded {
+                    version: PROTOCOL_VERSION,
+                    trace_id: None,
                     peer_id: id.clone(),
                 };
                 let msg = serde_json::to_string(&ended).unwrap();
@@ -655,6 +850,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             // If user disconnects while ringing, notify peer call is unavailable.
             if let Some(peer_tx) = state.peers.get(&peer_id) {
                 let unavailable = SignalingMessage::CallUnavailable {
+                    version: PROTOCOL_VERSION,
+                    trace_id: None,
                     target_id: id.clone(),
                     reason: "peer_disconnected".to_string(),
                 };
@@ -711,6 +908,66 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+        routing::get,
+        Router,
+    };
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn health_check_returns_expected_payload() {
+        let Json(body) = health_check().await;
+        assert_eq!(body.status, "ok");
+        assert!(body.db.ok);
+    }
+
+    #[tokio::test]
+    async fn protocol_middleware_rejects_unsupported_version() {
+        let app = Router::new()
+            .route("/test", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn(protocol_version_middleware))
+            .into_service();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header(HEADER_PROTOCOL_VERSION, "99")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "protocol_version_mismatch");
+    }
+
+    #[tokio::test]
+    async fn protocol_middleware_allows_supported_version() {
+        let app = Router::new()
+            .route("/test", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn(protocol_version_middleware))
+            .into_service();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header(HEADER_PROTOCOL_VERSION, PROTOCOL_VERSION.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 
     #[test]
     fn rewrite_offer_uses_sender_as_peer_id() {
@@ -718,11 +975,19 @@ mod tests {
             "receiver-id".to_string(),
             "offer-sdp".to_string(),
             "sender-id",
+            Some("trace-1".to_string()),
         );
 
         assert_eq!(target, "receiver-id");
         match forwarded {
-            SignalingMessage::Offer { target_id, sdp } => {
+            SignalingMessage::Offer {
+                version,
+                trace_id,
+                target_id,
+                sdp,
+            } => {
+                assert_eq!(version, PROTOCOL_VERSION);
+                assert_eq!(trace_id.as_deref(), Some("trace-1"));
                 assert_eq!(target_id, "sender-id");
                 assert_eq!(sdp, "offer-sdp");
             }
@@ -736,11 +1001,19 @@ mod tests {
             "receiver-id".to_string(),
             "answer-sdp".to_string(),
             "sender-id",
+            Some("trace-2".to_string()),
         );
 
         assert_eq!(target, "receiver-id");
         match forwarded {
-            SignalingMessage::Answer { target_id, sdp } => {
+            SignalingMessage::Answer {
+                version,
+                trace_id,
+                target_id,
+                sdp,
+            } => {
+                assert_eq!(version, PROTOCOL_VERSION);
+                assert_eq!(trace_id.as_deref(), Some("trace-2"));
                 assert_eq!(target_id, "sender-id");
                 assert_eq!(sdp, "answer-sdp");
             }
@@ -756,16 +1029,21 @@ mod tests {
             Some("0".to_string()),
             Some(1),
             "sender-id",
+            Some("trace-3".to_string()),
         );
 
         assert_eq!(target, "receiver-id");
         match forwarded {
             SignalingMessage::Candidate {
+                version,
+                trace_id,
                 target_id,
                 candidate,
                 sdp_mid,
                 sdp_m_line_index,
             } => {
+                assert_eq!(version, PROTOCOL_VERSION);
+                assert_eq!(trace_id.as_deref(), Some("trace-3"));
                 assert_eq!(target_id, "sender-id");
                 assert_eq!(candidate, "candidate-a");
                 assert_eq!(sdp_mid.as_deref(), Some("0"));

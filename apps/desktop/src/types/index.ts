@@ -1,0 +1,124 @@
+export interface User {
+    id: string;
+    username: string;
+    avatar_url?: string;
+    last_seen?: string;
+}
+
+export interface Friend extends User {
+    status: string;
+}
+
+export interface AuthResponse {
+    token: string;
+    user: User;
+}
+
+export interface Room {
+    id: string;
+    name?: string;
+    is_dm: boolean;
+}
+
+export interface Message {
+    id: string;
+    client_id?: string | null;
+    room_id: string;
+    sender_id?: string;
+    content: string;
+    nonce?: string | null;
+    created_at: string;
+    edited_at?: string | null;
+    status?: MessageStatus;
+    _decryptedContent?: string;
+    reactions?: MessageReaction[];
+}
+
+export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
+
+export interface Conversation {
+    id: string;
+    kind: 'dm' | 'channel';
+    name?: string;
+    updated_at?: string;
+}
+
+export type CallStatus = 'idle' | 'calling' | 'ringing' | 'connecting' | 'connected' | 'ended';
+
+export interface CallState {
+    status: CallStatus;
+    peerId: string | null;
+    peerName: string | null;
+    peerPublicKey: string | null;
+    isMuted: boolean;
+    startTime: number | null;
+}
+
+export interface IncomingCallPayload {
+    callerId: string;
+    callerName: string;
+    publicKey: string;
+}
+
+export interface CallAcceptedPayload {
+    peerId: string;
+    publicKey: string;
+}
+
+export interface CallUnavailablePayload {
+    targetId: string;
+    reason: string;
+}
+
+export interface Server {
+    id: string;
+    name: string;
+    icon_url: string | null;
+    owner_id: string;
+    invite_code: string;
+    created_at: string;
+}
+
+export interface Channel {
+    id: string;
+    server_id: string;
+    name: string;
+    channel_type: 'text' | 'voice';
+    position: number;
+    created_at: string;
+}
+
+export interface ServerMember {
+    user_id: string;
+    username: string;
+    avatar_url: string | null;
+    role: 'owner' | 'admin' | 'member';
+    last_seen: string | null;
+}
+
+export interface VoiceChannelParticipant {
+    user_id: string;
+    username: string;
+    joined_at?: string | null;
+}
+
+export interface ChannelMessage {
+    id: string;
+    client_id?: string | null;
+    channel_id: string;
+    sender_id?: string;
+    sender_username?: string | null;
+    content: string;
+    nonce?: string | null;
+    created_at: string;
+    edited_at?: string | null;
+    status?: MessageStatus;
+    _decryptedContent?: string;
+    reactions?: MessageReaction[];
+}
+
+export interface MessageReaction {
+    emoji: string;
+    user_ids: string[];
+    count: number;
+}
