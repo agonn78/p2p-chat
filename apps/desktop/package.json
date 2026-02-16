@@ -4,6 +4,11 @@
     "version": "0.0.0",
     "type": "module",
     "scripts": {
+        "clean": "node ../../scripts/clean.js --dry-run",
+        "clean:hard": "node ../../scripts/clean.js --clean",
+        "clean:purge": "node ../../scripts/clean.js --clean --purge-app-data",
+        "fresh:dev": "node ../../scripts/clean.js --clean --reinstall --dev",
+        "fresh:build": "node ../../scripts/clean.js --clean --reinstall --build",
         "dev": "vite",
         "build": "tsc && vite build",
         "preview": "vite preview",

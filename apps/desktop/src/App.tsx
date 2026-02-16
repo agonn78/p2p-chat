@@ -1,4 +1,5 @@
 import { useAppStore } from './store';
+import { AppUpdateNotice } from './components/AppUpdateNotice';
 import { AuthScreen } from './components/AuthScreen';
 import { AppShell } from './layouts/AppShell';
 import { AppRoutes } from './app/AppRoutes';
@@ -10,18 +11,21 @@ function App() {
 
     useAppLifecycle();
 
-    if (!isAuthenticated) {
-        return <AuthScreen />;
-    }
-
     const callOverlayResetKey = activeCall
         ? `${activeCall.status}:${activeCall.peerId ?? 'none'}`
         : 'none';
 
     return (
-        <AppShell callOverlayResetKey={callOverlayResetKey}>
-            <AppRoutes />
-        </AppShell>
+        <>
+            <AppUpdateNotice />
+            {!isAuthenticated ? (
+                <AuthScreen />
+            ) : (
+                <AppShell callOverlayResetKey={callOverlayResetKey}>
+                    <AppRoutes />
+                </AppShell>
+            )}
+        </>
     );
 }
 

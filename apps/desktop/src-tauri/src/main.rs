@@ -9,6 +9,7 @@ mod messaging;
 mod observability;
 mod protocol;
 mod signaling;
+mod updater;
 
 use api::ApiState;
 use error::AppResult;
@@ -680,8 +681,11 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| {
             let app_handle = app.handle().clone();
+
+            app.manage(updater::PendingUpdate::default());
 
             // Initialize local messaging storage (SQLite in app data dir)
             let app_data_dir = app.path().app_data_dir().map_err(|e| {
@@ -842,6 +846,9 @@ fn main() {
             api::servers::api_fetch_voice_channel_presence,
             api::servers::api_join_voice_channel,
             api::servers::api_leave_voice_channel,
+            updater::app_check_for_updates,
+            updater::app_download_and_install_update,
+            updater::app_restart_after_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

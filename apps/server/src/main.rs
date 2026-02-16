@@ -141,6 +141,7 @@ async fn main() {
         .route("/readiness", get(readiness_check))
         .route("/ws", get(ws_handler))
         .nest("/auth", routes::auth::router())
+        .nest("/app", routes::app::router())
         .nest("/friends", routes::friends::router())
         .nest("/users", routes::users::router())
         .nest("/chat", routes::chat::router())
