@@ -31,10 +31,16 @@
             "core:event:allow-listen",
             "core:event:allow-emit",
             "shell:default",
-            "dialog:default"
+            "dialog:default",
+            "updater:default"
           ]
         }
       ]
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY"
     }
   },
   "bundle": {
